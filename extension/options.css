@@ -1,0 +1,102 @@
+:root {
+  color-scheme: light dark;
+  font: 14px/1.5 system-ui, sans-serif;
+}
+
+body {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 32px 20px;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 920px;
+}
+
+h1 {
+  font-size: 24px;
+  margin: 0 0 6px;
+}
+
+header p {
+  color: GrayText;
+  margin: 0 0 24px;
+}
+
+.warning {
+  border: 1px solid #b7791f;
+  border-radius: 8px;
+  margin: 0 0 24px;
+  padding: 14px 16px;
+}
+
+.warning p {
+  margin: 6px 0 0;
+}
+
+.settings-group {
+  border-top: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  margin: 22px 0;
+  padding-top: 16px;
+}
+
+.settings-group h2 {
+  font-size: 17px;
+  margin: 0 0 14px;
+}
+
+.settings-grid {
+  display: grid;
+  gap: 14px 20px;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+}
+
+.setting {
+  display: grid;
+  gap: 5px;
+}
+
+.setting label {
+  font-weight: 600;
+}
+
+.setting p {
+  color: GrayText;
+  font-size: 12px;
+  margin: 0;
+}
+
+.setting input {
+  box-sizing: border-box;
+  min-height: 36px;
+  padding: 6px 8px;
+  width: 100%;
+}
+
+.actions {
+  border-top: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 24px;
+  padding-top: 18px;
+}
+
+button {
+  cursor: pointer;
+  min-height: 38px;
+  padding: 7px 14px;
+}
+
+.primary {
+  font-weight: 700;
+}
+
+#status {
+  min-height: 1.5em;
+}
+
+#status[data-error="true"] {
+  color: #b42318;
+}

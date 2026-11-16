@@ -1,0 +1,4 @@
+# Browser tools backed by the paired Chrome extension.
+- insert:
+    - id: dsh-plugin-chrome-controller
+      name: dsh-plugin-chrome-controller

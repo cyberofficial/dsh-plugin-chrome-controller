@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DeepSeek Harness Browser Settings</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>DeepSeek Harness Browser settings</h1>
+        <p>Adjust typing timing, cursor movement, drag duration, and sequence pacing.</p>
+      </header>
+
+      <aside class="warning" role="note">
+        <strong>Advanced settings</strong>
+        <p>These controls are for users who understand interaction timing and pointer movement. The defaults are the project's tested baseline. Changing settings may cause websites to treat activity as automated, block it, or show a CAPTCHA. No values guarantee that a website will accept an interaction. Never use these controls to bypass anti-bot checks.</p>
+      </aside>
+
+      <form id="settings-form" novalidate>
+        <div id="settings-groups"></div>
+        <div class="actions">
+          <button type="submit" class="primary">Save settings</button>
+          <button type="button" id="reset">Restore tested defaults</button>
+        </div>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>
