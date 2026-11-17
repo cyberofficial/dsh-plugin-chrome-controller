@@ -697,6 +697,15 @@ async function requestPairToken(tabId, origin) {
   return pairing.pairToken
 }
 
+/** Fetch a pairing code straight from the service worker, no page tab needed. */
+async function requestPairTokenFromWorker(origin) {
+  const result = await postJson(origin, PAIR_PATH, {})
+  if (!isRecord(result) || result.protocol !== 1 || typeof result.pairToken !== 'string') {
+    throw new Error('DSH Web returned an invalid pairing response')
+  }
+  return result.pairToken
+}
+
 async function pairWithDsh(tabId, origin) {
   await disconnect()
   const tab = await chrome.tabs.get(tabId)
