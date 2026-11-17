@@ -31,7 +31,10 @@ async function refreshStatus() {
   }
 }
 
-function dshTabInfo(tab) {
+const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
+const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
+
+function dshTabInfo(tab, origin) {
   if (tab?.id === undefined || typeof tab.url !== 'string') return undefined
   let page
   try {
@@ -39,19 +42,35 @@ function dshTabInfo(tab) {
   } catch {
     return undefined
   }
-  if ((page.protocol !== 'http:' && page.protocol !== 'https:') || page.hostname !== '127.0.0.1') return undefined
+  if (page.protocol !== 'http:' && page.protocol !== 'https:') return undefined
+  const isLoopback = page.hostname === '127.0.0.1' || page.hostname === 'localhost' || page.hostname === '[::1]'
+  if (!isLoopback) return undefined
+  // Prefer the configured DSH origin; accept any loopback DSH tab as a fallback.
+  if (origin !== undefined && page.origin !== origin) return undefined
   return { tabId: tab.id, origin: page.origin, protocol: page.protocol, hostname: page.hostname }
+}
+
+async function readConfiguredOrigin() {
+  try {
+    const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
+    const origin = stored?.[CONNECTION_SETTINGS_KEY]?.origin
+    return typeof origin === 'string' && origin !== '' ? origin : DEFAULT_DSH_ORIGIN
+  } catch {
+    return DEFAULT_DSH_ORIGIN
+  }
 }
 
 async function readActiveDshTab() {
   connectButton.disabled = true
   try {
+    const configuredOrigin = await readConfiguredOrigin()
     const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-    activeDshTab = dshTabInfo(active)
+    activeDshTab = dshTabInfo(active, configuredOrigin) ?? dshTabInfo(active)
     if (activeDshTab === undefined) {
-      // Fall back to any open DSH Web tab so the popup works from its own tab too.
+      // Prefer a tab at the configured address, then any open DSH Web tab.
       const all = await chrome.tabs.query({})
-      activeDshTab = all.map(dshTabInfo).find(info => info !== undefined)
+      activeDshTab = all.map(tab => dshTabInfo(tab, configuredOrigin)).find(info => info !== undefined)
+        ?? all.map(tab => dshTabInfo(tab)).find(info => info !== undefined)
     }
   } catch {
     activeDshTab = undefined

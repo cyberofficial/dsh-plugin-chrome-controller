@@ -1,4 +1,6 @@
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
+const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
+const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 
 const DEFAULTS = {
   baseFlightDelayMs: 110,
@@ -60,6 +62,9 @@ const GROUPS = [
 ]
 
 const form = document.querySelector('#settings-form')
+const connectionForm = document.querySelector('#connection-form')
+const originInput = document.querySelector('#dsh-origin')
+const connectionStatusNode = document.querySelector('#connection-status')
 const groupsNode = document.querySelector('#settings-groups')
 const statusNode = document.querySelector('#status')
 const resetButton = document.querySelector('#reset')
@@ -150,7 +155,48 @@ async function initialize() {
     populate(DEFAULTS)
     showStatus(error instanceof Error ? error.message : String(error), true)
   }
+  try {
+    const connection = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
+    originInput.value = connection?.[CONNECTION_SETTINGS_KEY]?.origin ?? DEFAULT_DSH_ORIGIN
+  } catch {
+    originInput.value = DEFAULT_DSH_ORIGIN
+  }
 }
+
+/** Accept only loopback HTTP(S) origins; empty resets to the default. */
+function readOrigin() {
+  const raw = originInput.value.trim()
+  if (raw === '') return DEFAULT_DSH_ORIGIN
+  let url
+  try {
+    url = new URL(raw)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+  if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return undefined
+  return url.origin
+}
+
+connectionForm.addEventListener('submit', async event => {
+  event.preventDefault()
+  const origin = readOrigin()
+  if (origin === undefined) {
+    originInput.setCustomValidity('Enter a local address such as http://127.0.0.1:3080')
+    originInput.reportValidity()
+    return
+  }
+  originInput.setCustomValidity('')
+  try {
+    await chrome.storage.local.set({ [CONNECTION_SETTINGS_KEY]: { origin } })
+    originInput.value = origin
+    connectionStatusNode.textContent = 'Connection address saved. Pair again from the extension popup.'
+    connectionStatusNode.dataset.error = 'false'
+  } catch (error) {
+    connectionStatusNode.textContent = error instanceof Error ? error.message : String(error)
+    connectionStatusNode.dataset.error = 'true'
+  }
+})
 
 form.addEventListener('submit', async event => {
   event.preventDefault()

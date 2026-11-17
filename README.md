@@ -27,11 +27,13 @@ Restart DSH Web after installation.
 3. Select **Load unpacked** and choose this package's `extension` folder. Approve HTTP and HTTPS site access when Chrome asks.
 4. Open DSH Web in the same Chrome profile.
 5. Select the extension and choose **Pair with this DSH tab**.
-Pairing uses DSH's authenticated Web connection to issue a short-lived, single-use code. The extension exchanges it for a session token in Chrome's session storage and polls DSH's local HTTP routes for browser commands. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. Pair again after a disconnect, including after Chrome or DSH Web restarts.
+Pairing uses DSH's authenticated Web connection to issue a short-lived, single-use code. The extension exchanges it for a session token in Chrome's session storage and polls DSH's local HTTP routes for browser commands. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. If the session is lost unexpectedly — DSH Web restarted, the token expired, the machine slept — the extension re-pairs by itself as soon as a tab at the configured DSH Web origin is open, retrying every 30 seconds until it succeeds. Pair manually after a Chrome restart, or use **Disconnect** to stop automatic reconnection.
 
 The extension requests access to HTTP and HTTPS websites so it can inject the virtual cursor overlay on tabs you ask it to control. Chrome warns that the debugger permission can control browser tabs and that the downloads permission can manage downloads. The overlay is cosmetic; page input is sent through Chrome's debugger API.
 
 Open the extension popup and select **Settings** to customize typing delays and key holds, longer pauses, cursor speed and arc, drag duration, and the delay between sequence steps. Each setting has a description and allowed range. The defaults are the project's tested baseline. Changing them may cause sites to flag or restrict activity; no settings guarantee a site will accept interactions.
+
+The same Settings page has a **DSH Web connection** field for the local DSH Web origin (default `http://127.0.0.1:3080`). Change it when DSH Web listens on another port or on `localhost`, save, then pair again from the popup. Only loopback HTTP(S) addresses are accepted, and automatic reconnection uses this address.
 
 Once paired, the extension keeps its Manifest V3 service worker alive on its own: a 30-second heartbeat alarm wakes the worker if Chrome suspends it, and a 25-second `chrome.runtime.getPlatformInfo()` call resets the worker's idle timer while it runs. Browser tools therefore respond without opening the extension popup. After updating the extension, reload it on `chrome://extensions` and pair again once.
 
@@ -55,7 +57,7 @@ Once paired, the extension keeps its Manifest V3 service worker alive on its own
 - `dsh_browser_mouse_move` hovers a unique CSS-selected element or moves to viewport coordinates, showing the virtual cursor and dispatching a real `mouseMoved`.
 - `dsh_browser_drag` performs a real left-button drag between two visible elements or viewport coordinates, with intermediate mouse-move events. Activate the target tab first; mouse movement can stall on background tabs.
 - `dsh_browser_scroll` brings a CSS-selected element into the viewport or scrolls the page by horizontal and vertical deltas. Selector clicks also scroll their target into view automatically.
-- `dsh_browser_fill` replaces the text in a CSS-selected field by typing it character by character. `dsh_browser_type_human` does the same into the focused or a CSS-selected field. `dsh_browser_type` inserts text in bulk into the focused field or a CSS-selected field.
+- `dsh_browser_fill` replaces the text in a CSS-selected field by typing it character by character. `dsh_browser_type_human` does the same into the focused or a CSS-selected field and types the entire supplied string in one run (up to 2000 characters). Bulk pasting-style insertion is not available: instant text injection is a banned action, so `page.type` refuses to run.
 - `dsh_browser_submit` submits a CSS-selected form with `requestSubmit()`, preserving native validation. Its result reports whether submission was attempted and the form's validity, not whether the site completed the submission.
 - `dsh_browser_keypress` presses a supported key, optionally with modifiers as a chord joined by `+` (e.g. `Ctrl+L`, `Control+Shift+ArrowRight`, `Cmd+A`). Chords that close the browser or tab (`Alt+F4`, `Ctrl+W`, `Cmd+W`, `Ctrl+Shift+Q`) are refused.
 - `dsh_browser_screenshot` captures the visible tab and returns it as an image.

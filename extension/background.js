@@ -5,6 +5,11 @@ const RESPONSE_PATH = '/dsh-browser-extension/respond'
 const DISCONNECT_PATH = '/dsh-browser-extension/disconnect'
 const SESSION_KEY = 'dshBrowserSession'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
+const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
+const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
+const RECONNECT_ALARM = 'dsh-browser-reconnect'
+const RECONNECT_ALARM_PERIOD_MINUTES = 0.5
+const RECONNECT_WANTED_KEY = 'dshBrowserReconnectWanted'
 const POLL_TIMEOUT_MS = 20_000
 // Long-poll workers. Chrome allows only ~6 concurrent connections per host
 // (HTTP/1.1), so keep the hanging-poll count well under that; each poll is
@@ -41,7 +46,6 @@ const MAX_ELEMENT_WAIT_TIMEOUT_MS = 25_000
 const MIN_ELEMENT_WAIT_POLL_INTERVAL_MS = 50
 const MAX_ELEMENT_WAIT_POLL_INTERVAL_MS = 2_000
 const MAX_EXPLICIT_WAIT_MS = 25_000
-const MAX_TYPED_TEXT_CHARS = 10_000
 const MAX_HUMAN_TEXT_CHARS = 2_000
 // Timing values are interaction defaults, not a validated human-typing model
 // and not a way to bypass site automation checks.
@@ -115,6 +119,9 @@ let pollController
 let pollTask
 let restoreTask
 let keepaliveInterval
+let reconnectWanted = false
+let reconnectTask
+let reconnectFailures = 0
 let behaviorSettingsCache = { ...DEFAULT_BEHAVIOR_SETTINGS }
 let behaviorSettingsLoaded = false
 let behaviorSettingsLoadTask
@@ -703,6 +710,7 @@ async function pairWithDsh(tabId, origin) {
   }
   activeSession = { origin, sessionToken: result.sessionToken }
   await chrome.storage.session.set({ [SESSION_KEY]: activeSession })
+  stopReconnect()
   startKeepalive()
   startPollLoop(activeSession)
 }
@@ -910,7 +918,96 @@ function logDragTrace(id, event, details = {}) {
   }))
 }
 
-async function clearSession(session) {
+/** Normalize a user-supplied DSH Web origin; only loopback HTTP(S) is allowed. */
+function normalizeDshOrigin(value) {
+  if (typeof value !== 'string' || value.trim() === '') return undefined
+  try {
+    const url = new URL(value.trim())
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return undefined
+    return url.origin
+  } catch {
+    return undefined
+  }
+}
+
+/** Read the configured DSH Web origin (defaults to http://127.0.0.1:3080). */
+async function readConnectionOrigin() {
+  try {
+    const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
+    const configured = normalizeDshOrigin(stored?.[CONNECTION_SETTINGS_KEY]?.origin)
+    if (configured !== undefined) return configured
+  } catch {
+    // fall through to the default
+  }
+  return DEFAULT_DSH_ORIGIN
+}
+
+/** Keep the reconnect alarm armed until a session exists again. */
+async function scheduleReconnect() {
+  if (activeSession !== undefined) return
+  reconnectWanted = true
+  void chrome.storage.local.set({ [RECONNECT_WANTED_KEY]: true }).catch(() => {})
+  try {
+    if (await chrome.alarms.get(RECONNECT_ALARM) === undefined) {
+      await chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES })
+    }
+  } catch {
+    // best effort
+  }
+}
+
+/** Stop automatic reconnection (explicit user disconnect or successful pair). */
+function stopReconnect() {
+  reconnectWanted = false
+  reconnectFailures = 0
+  void chrome.storage.local.remove(RECONNECT_WANTED_KEY).catch(() => {})
+  void chrome.alarms.clear(RECONNECT_ALARM).catch(() => {})
+}
+
+/**
+ * Re-pair automatically after an unexpected session loss (host restart, expired
+ * token, network drop). Uses the configured origin and an open DSH Web tab at
+ * that origin; if no such tab exists, retries continue on the alarm so the
+ * session re-establishes when the user opens DSH Web again.
+ */
+async function attemptAutoReconnect() {
+  if (activeSession !== undefined) return
+  if (!reconnectWanted) return
+  if (reconnectTask !== undefined) return reconnectTask
+  reconnectTask = (async () => {
+    const origin = await readConnectionOrigin()
+    let tabs = []
+    try {
+      tabs = await chrome.tabs.query({})
+    } catch {
+      return
+    }
+    const match = tabs.find(tab => {
+      if (!Number.isInteger(tab.id) || typeof tab.url !== 'string') return false
+      try {
+        return new URL(tab.url).origin === origin
+      } catch {
+        return false
+      }
+    })
+    if (match === undefined) {
+      reconnectFailures += 1
+      return
+    }
+    try {
+      await pairWithDsh(match.id, origin)
+      stopReconnect()
+    } catch {
+      reconnectFailures += 1
+    }
+  })().catch(() => {}).finally(() => {
+    reconnectTask = undefined
+  })
+  return reconnectTask
+}
+
+async function clearSession(session, options = {}) {
   if (activeSession?.sessionToken !== session.sessionToken) return
   activeSession = undefined
   completedCommandIds.clear()
@@ -919,6 +1016,11 @@ async function clearSession(session) {
   stopKeepalive()
   await detachAllDebuggerTargets()
   await chrome.storage.session.remove(SESSION_KEY)
+  if (options.autoReconnect !== false) {
+    await scheduleReconnect()
+    // Defer: pairWithDsh waits for the previous poll task, which is the caller here.
+    setTimeout(() => { void attemptAutoReconnect() }, 50)
+  }
 }
 
 async function disconnect() {
@@ -941,13 +1043,22 @@ async function disconnect() {
 
 async function restoreSession() {
   if (restoreTask !== undefined) return restoreTask
-  restoreTask = chrome.storage.session.get(SESSION_KEY).then(value => {
+  restoreTask = chrome.storage.session.get(SESSION_KEY).then(async value => {
     const session = value[SESSION_KEY]
     if (isRecord(session) && typeof session.origin === 'string' && typeof session.sessionToken === 'string') {
       activeSession = session
       startKeepalive()
       if (pollTask === undefined) startPollLoop(session)
-    } else stopKeepalive()
+      return
+    }
+    stopKeepalive()
+    // Resume an interrupted auto-reconnect (e.g. the worker was recycled mid-retry).
+    const wanted = await chrome.storage.local.get(RECONNECT_WANTED_KEY).catch(() => ({}))
+    if (wanted?.[RECONNECT_WANTED_KEY] === true) {
+      reconnectWanted = true
+      await scheduleReconnect()
+      void attemptAutoReconnect()
+    }
   }).catch(() => {}).finally(() => {
     restoreTask = undefined
   })
@@ -965,7 +1076,6 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
   }
   const specs = {
     click: { method: 'page.click', required: [], allowed: ['selector', 'x', 'y'] },
-    type: { method: 'page.type', required: ['text'], allowed: ['text', 'selector'] },
     type_human: { method: 'page.typeHuman', required: ['text'], allowed: ['text', 'selector', 'delayMs'] },
     fill: { method: 'page.fill', required: ['selector', 'text'], allowed: ['selector', 'text', 'delayMs'] },
     keypress: { method: 'page.keypress', required: ['key'], allowed: ['key'] },
@@ -1082,12 +1192,12 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
         throw new Error('Sequence wait_for_element step ' + String(index + 1) + ' has out-of-range timing')
       }
     }
-    if (['click', 'type', 'type_human', 'fill', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
+    if (['click', 'type_human', 'fill', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
       && stepParams.selector !== undefined) {
       requireCssSelector(stepParams.selector)
     }
-    if (['type', 'type_human', 'fill'].includes(step.action)) {
-      const max = step.action === 'type' ? MAX_TYPED_TEXT_CHARS : MAX_HUMAN_TEXT_CHARS
+    if (['type_human', 'fill'].includes(step.action)) {
+      const max = MAX_HUMAN_TEXT_CHARS
       if (stepParams.text.length > max || (step.action === 'type_human' && stepParams.text.length === 0)) {
         throw new Error('Sequence step ' + String(index + 1) + ' has text outside the supported length')
       }
@@ -1887,19 +1997,7 @@ async function executeBrowserOperationNow(method, params, signal) {
       })
     }
     case 'page.type': {
-      const tabId = requireTabId(params.tabId)
-      if (typeof params.text !== 'string' || params.text.length > MAX_TYPED_TEXT_CHARS) {
-        throw new Error('Text must be a string of at most ' + String(MAX_TYPED_TEXT_CHARS) + ' characters')
-      }
-      return withDebugger(tabId, async target => {
-        if (params.selector !== undefined) {
-          requireCssSelector(params.selector)
-          const nodeId = await querySelectorNode(target, params.selector)
-          await debuggerCommand(target, 'DOM.focus', { nodeId })
-        }
-        await debuggerCommand(target, 'Input.insertText', { text: params.text })
-        return { tabId, typedCharacters: params.text.length }
-      })
+      throw new Error('Bulk text insertion (page.type) is not allowed; use page.typeHuman / dsh_browser_type_human so text is entered per keystroke')
     }
     case 'page.typeHuman': {
       const tabId = requireTabId(params.tabId)
@@ -3657,6 +3755,11 @@ async function debuggerCommand(target, method, params = {}) {
 }
 
 chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === RECONNECT_ALARM) {
+    // Host restart or dropped session: re-pair automatically when DSH Web is open.
+    void restoreSession().then(() => attemptAutoReconnect())
+    return
+  }
   if (alarm.name !== KEEPALIVE_ALARM) return
   // Fires even when the service worker was suspended; resume polling if still paired.
   void restoreSession()
@@ -3670,6 +3773,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true
   }
   if (message?.type === 'disconnect') {
+    stopReconnect()
     void disconnect().then(() => sendResponse({ ok: true }), error => sendResponse({
       ok: false,
       error: error instanceof Error ? error.message : String(error),
