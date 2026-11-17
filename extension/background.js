@@ -1403,8 +1403,8 @@ async function executeBrowserOperationNow(method, params, signal) {
       const tabId = requireTabId(params.tabId)
       const frameId = requireFrameId(params.frameId)
       // The WOPI token is read inside the app frame but only ever handled in this service
-      // worker; the extension's host permissions allow the fetch without CORS. Only the file
-      // bytes are returned to DSH.
+      // worker; the extension's host permissions allow the fetch without CORS. The result
+      // returned to DSH contains used-range text or file bytes.
       const wopi = await runInFrame(tabId, frameId, frameWopiContextPayload, [])
       if (!isRecord(wopi)) throw new Error('The frame returned no result')
       if (typeof wopi.error === 'string') throw new Error(wopi.error)
@@ -2378,21 +2378,22 @@ async function runInFrame(tabId, frameId, func, args, world = 'ISOLATED') {
 
 /** Runs inside the target frame: snapshot payload plus a best-effort grid-cell dump. */
 function frameSnapshotPayload(maxChars) {
-  // Never echo credential-like values (e.g. WOPI access tokens embedded in hidden inputs).
+  // Mask common token patterns in returned strings; other secret formats can remain.
   const redact = value => String(value)
-    .replace(/access_token=[^&"'\s]+/gi, 'access_token=<redacted>')
-    .replace(/authorization["']?\s*[:=]\s*["']?bearer\s+[^"'\s]+/gi, 'authorization: Bearer <redacted>')
+    .replace(/(access_token(?:=|%3D))[^&"'\s]+/gi, '$1<redacted>')
+    .replace(/(["']access_token["']\s*:\s*["'])[^"']+/gi, '$1<redacted>')
+    .replace(/(authorization["']?\s*[:=]\s*["']?bearer\s+)[^"'\s]+/gi, '$1<redacted>')
   const text = redact(document.body?.innerText ?? '').slice(0, maxChars)
   const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 100).map(link => ({
-    text: (link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 240),
-    url: link.href,
+    text: redact(link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 240),
+    url: redact(link.href),
   }))
   const cells = Array.from(document.querySelectorAll('[role="gridcell"],[role="rowheader"],[role="columnheader"],[aria-rowindex]'))
     .slice(0, 2000)
     .map(el => ({
-      role: el.getAttribute('role'),
-      label: (el.getAttribute('aria-label') || '').slice(0, 200),
-      text: (el.textContent || '').trim().slice(0, 200),
+      role: el.getAttribute('role') === null ? null : redact(el.getAttribute('role')),
+      label: redact(el.getAttribute('aria-label') || '').slice(0, 200),
+      text: redact(el.textContent || '').trim().slice(0, 200),
     }))
     .filter(cell => cell.label !== '' || cell.text !== '')
   const inputs = Array.from(document.querySelectorAll('input, [contenteditable="true"]'))
@@ -2401,9 +2402,9 @@ function frameSnapshotPayload(maxChars) {
       const raw = String(el.value ?? el.textContent ?? '')
       const isJsonState = /json|context/i.test(el.id ?? '')
       return {
-        id: el.id || null,
-        cls: String(el.className).slice(0, 80),
-        label: (el.getAttribute('aria-label') || '').slice(0, 120),
+        id: el.id ? redact(el.id) : null,
+        cls: redact(el.className).slice(0, 80),
+        label: redact(el.getAttribute('aria-label') || '').slice(0, 120),
         valueLength: raw.length,
         value: redact(raw).slice(0, isJsonState ? 60_000 : 200),
       }
@@ -2431,10 +2432,10 @@ function frameSnapshotPayload(maxChars) {
   }
   const canvasRects = Array.from(document.querySelectorAll('canvas'))
     .slice(0, 8)
-    .map(c => ({ cls: String(c.className).slice(0, 60), ...rectOf(c) }))
+    .map(c => ({ cls: redact(c.className).slice(0, 60), ...rectOf(c) }))
   return {
-    title: document.title,
-    url: location.href,
+    title: redact(document.title),
+    url: redact(location.href),
     text,
     links,
     inputs,
@@ -2755,14 +2756,48 @@ const ELEMENT_WATCH_MAX_VALUE_CHARS = 500
 function frameElementWatchStartPayload(selector, labelSelector) {
   try {
     const key = String(selector) + '|' + String(labelSelector ?? '')
-    if (window.__dshElementWatch !== undefined && window.__dshElementWatch.key === key) {
+    const previousWatch = window.__dshElementWatch
+    if (previousWatch !== undefined && previousWatch.key === key && typeof previousWatch.stop === 'function') {
       return { started: false, already: true, logged: (window.__dshElementWatchLog ?? []).length }
     }
     const el = document.querySelector(String(selector))
     if (el === null) return { error: 'No element matches selector: ' + String(selector).slice(0, 120) }
     const labelEl = labelSelector ? document.querySelector(String(labelSelector)) : null
+
+    if (previousWatch !== undefined) {
+      if (typeof previousWatch.stop === 'function') previousWatch.stop()
+      else {
+        clearInterval(previousWatch.timer)
+        previousWatch.observer?.disconnect()
+        delete window.__dshElementWatch
+      }
+    }
+
     const log = []
     window.__dshElementWatchLog = log
+    const watch = {
+      key,
+      timer: null,
+      observers: [],
+      listeners: [],
+      timeouts: new Set(),
+      active: true,
+      stop: null,
+    }
+    const cleanup = () => {
+      if (!watch.active) return
+      watch.active = false
+      if (watch.timer !== null) clearInterval(watch.timer)
+      for (const observer of watch.observers) observer.disconnect()
+      for (const { target, type, listener, options } of watch.listeners) {
+        target.removeEventListener(type, listener, options)
+      }
+      for (const timeout of watch.timeouts) clearTimeout(timeout)
+      watch.timeouts.clear()
+      if (window.__dshElementWatch === watch) delete window.__dshElementWatch
+    }
+    watch.stop = cleanup
+
     const readValue = () => {
       const raw = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : el.textContent
       return String(raw ?? '').slice(0, 500)
@@ -2774,25 +2809,51 @@ function frameElementWatchStartPayload(selector, labelSelector) {
     }
     let lastKey = ''
     const record = () => {
+      if (!watch.active) return
       const value = readValue()
       const label = readLabel()
       const entryKey = label + '\n' + value
       if (entryKey === lastKey) return
       lastKey = entryKey
-      log.push({ label, value, at: Date.now() })
-      if (log.length > 5_000) log.splice(0, log.length - 5_000)
+      const currentLog = Array.isArray(window.__dshElementWatchLog)
+        ? window.__dshElementWatchLog
+        : (window.__dshElementWatchLog = [])
+      currentLog.push({ label, value, at: Date.now() })
+      if (currentLog.length > 5_000) currentLog.splice(0, currentLog.length - 5_000)
     }
-    const observer = new MutationObserver(() => record())
-    observer.observe(el, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
-    el.addEventListener('input', () => record())
-    if (labelEl !== null) {
-      new MutationObserver(() => record()).observe(labelEl, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
-      labelEl.addEventListener('input', () => record())
+
+    try {
+      const observer = new MutationObserver(() => record())
+      watch.observers.push(observer)
+      observer.observe(el, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
+      const inputListener = () => record()
+      watch.listeners.push({ target: el, type: 'input', listener: inputListener })
+      el.addEventListener('input', inputListener)
+      if (labelEl !== null) {
+        const labelObserver = new MutationObserver(() => record())
+        watch.observers.push(labelObserver)
+        labelObserver.observe(labelEl, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
+        const labelInputListener = () => record()
+        watch.listeners.push({ target: labelEl, type: 'input', listener: labelInputListener })
+        labelEl.addEventListener('input', labelInputListener)
+      }
+      const clickListener = () => {
+        const timeout = setTimeout(() => {
+          watch.timeouts.delete(timeout)
+          record()
+        }, 60)
+        watch.timeouts.add(timeout)
+      }
+      watch.listeners.push({ target: document, type: 'click', listener: clickListener, options: true })
+      document.addEventListener('click', clickListener, true)
+      watch.timer = setInterval(record, 250)
+      window.__dshElementWatch = watch
+      record()
+    } catch (error) {
+      cleanup()
+      throw error
     }
-    document.addEventListener('click', () => { setTimeout(record, 60) }, true)
-    const timer = setInterval(record, 250)
-    window.__dshElementWatch = { key, observer, timer, record }
-    record()
+
     return { started: true, logged: log.length, selector: String(selector) }
   } catch (error) {
     return { error: 'element watch start failed: ' + String(error?.message ?? error).slice(0, 240) }
@@ -2804,10 +2865,17 @@ function frameElementWatchStopPayload() {
   try {
     const watch = window.__dshElementWatch
     if (watch === undefined) return { stopped: false, wasRunning: false }
-    clearInterval(watch.timer)
-    watch.observer.disconnect()
-    delete window.__dshElementWatch
-    return { stopped: true, wasRunning: true, logged: (window.__dshElementWatchLog ?? []).length }
+    const logged = (window.__dshElementWatchLog ?? []).length
+    if (typeof watch.stop === 'function') watch.stop()
+    else {
+      clearInterval(watch.timer)
+      watch.observer?.disconnect()
+      if (Array.isArray(window.__dshElementWatchLog)) {
+        window.__dshElementWatchLog = window.__dshElementWatchLog.slice()
+      }
+      delete window.__dshElementWatch
+    }
+    return { stopped: true, wasRunning: true, logged }
   } catch (error) {
     return { error: 'element watch stop failed: ' + String(error?.message ?? error).slice(0, 240) }
   }
