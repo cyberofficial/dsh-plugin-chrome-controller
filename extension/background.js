@@ -308,17 +308,52 @@ function parseKeyChord(value) {
   }
 }
 
+/** Modifier keys, dispatched around a chord so Chromium's input tracker stays balanced. */
+const MODIFIER_KEYS = [
+  { bit: 1, key: 'Alt', code: 'AltLeft', vk: 164 },
+  { bit: 2, key: 'Control', code: 'ControlLeft', vk: 162 },
+  { bit: 4, key: 'Meta', code: 'MetaLeft', vk: 91 },
+  { bit: 8, key: 'Shift', code: 'ShiftLeft', vk: 160 },
+]
+
+async function dispatchKey(target, type, key, modifiers) {
+  await debuggerCommand(target, 'Input.dispatchKeyEvent', {
+    type, key: key.key, code: key.code, modifiers,
+    windowsVirtualKeyCode: key.vk, nativeVirtualKeyCode: key.vk,
+    ...(type === 'keyDown' && key.text !== undefined ? { text: key.text } : {}),
+  })
+}
+
+/**
+ * Press one key, dispatching the modifier keys themselves around it. A synthetic
+ * chord that only sets the `modifiers` bitmask leaves Chromium's input tracker
+ * believing a modifier is still held, which corrupts later real key events
+ * (wrong `code`, so Home arrives as F3 and browser shortcuts misfire) until the
+ * browser restarts; balanced modifier keyDown/keyUp pairs prevent that. Every
+ * keyDown is released in `finally`, so an aborted press cannot leave a key stuck.
+ */
 async function pressKey(target, key) {
   const modifiers = key.modifiers ?? 0
-  await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-    type: 'keyDown', key: key.key, code: key.code, modifiers,
-    windowsVirtualKeyCode: key.virtualKey, nativeVirtualKeyCode: key.virtualKey,
-    ...(key.text === undefined ? {} : { text: key.text }),
-  })
-  await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-    type: 'keyUp', key: key.key, code: key.code, modifiers,
-    windowsVirtualKeyCode: key.virtualKey, nativeVirtualKeyCode: key.virtualKey,
-  })
+  const modifierKeys = MODIFIER_KEYS.filter(m => (modifiers & m.bit) !== 0)
+  const pressed = []
+  let held = 0
+  try {
+    for (const m of modifierKeys) {
+      held |= m.bit
+      await dispatchKey(target, 'keyDown', { key: m.key, code: m.code, vk: m.vk }, held)
+      pressed.push({ key: m.key, code: m.code, vk: m.vk, bit: m.bit })
+    }
+    await dispatchKey(target, 'keyDown', { key: key.key, code: key.code, vk: key.virtualKey, text: key.text }, modifiers)
+    pressed.push({ key: key.key, code: key.code, vk: key.virtualKey, bit: 0 })
+    await dispatchKey(target, 'keyUp', { key: key.key, code: key.code, vk: key.virtualKey }, modifiers)
+    pressed.pop()
+  } finally {
+    while (pressed.length > 0) {
+      const k = pressed.pop()
+      held &= ~k.bit
+      await dispatchKey(target, 'keyUp', k, held).catch(() => {})
+    }
+  }
 }
 
 /** Type one character with human-like hold and flight timing. */
@@ -336,22 +371,40 @@ async function typeCharacter(target, char, prevChar, baseDelayMs, settings, sign
   }
   const shifted = mapping.shift === true
   const modifiers = shifted ? 8 : 0
-  await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-    type: 'rawKeyDown', key: mapping.key, code: mapping.code, modifiers,
-    windowsVirtualKeyCode: mapping.vk, nativeVirtualKeyCode: mapping.vk,
-  })
-  try {
-    await delay(Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs)), signal ?? new AbortController().signal)
-    signal?.throwIfAborted()
+  // Dispatch Shift itself for shifted characters; a bare modifiers bitmask
+  // leaves the browser's input tracker with Shift held, corrupting later real
+  // key events (wrong `code`) until restart. Released in the outer finally.
+  if (shifted) {
     await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-      type: 'char', key: mapping.key, code: mapping.code, modifiers,
-      text: char, unmodifiedText: mapping.unshifted ?? char,
-    })
-  } finally {
-    await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-      type: 'keyUp', key: mapping.key, code: mapping.code, modifiers,
-      windowsVirtualKeyCode: mapping.vk, nativeVirtualKeyCode: mapping.vk,
+      type: 'keyDown', key: 'Shift', code: 'ShiftLeft', modifiers,
+      windowsVirtualKeyCode: 160, nativeVirtualKeyCode: 160,
     }).catch(() => {})
+  }
+  try {
+    await debuggerCommand(target, 'Input.dispatchKeyEvent', {
+      type: 'rawKeyDown', key: mapping.key, code: mapping.code, modifiers,
+      windowsVirtualKeyCode: mapping.vk, nativeVirtualKeyCode: mapping.vk,
+    })
+    try {
+      await delay(Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs)), signal ?? new AbortController().signal)
+      signal?.throwIfAborted()
+      await debuggerCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'char', key: mapping.key, code: mapping.code, modifiers,
+        text: char, unmodifiedText: mapping.unshifted ?? char,
+      })
+    } finally {
+      await debuggerCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key: mapping.key, code: mapping.code, modifiers,
+        windowsVirtualKeyCode: mapping.vk, nativeVirtualKeyCode: mapping.vk,
+      }).catch(() => {})
+    }
+  } finally {
+    if (shifted) {
+      await debuggerCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key: 'Shift', code: 'ShiftLeft', modifiers: 0,
+        windowsVirtualKeyCode: 160, nativeVirtualKeyCode: 160,
+      }).catch(() => {})
+    }
   }
 }
 
@@ -2050,14 +2103,8 @@ async function executeBrowserOperationNow(method, params, signal) {
         const prepared = await callNodeFunction(target, nodeId, FILL_PREPARE_FUNCTION)
         if (isRecord(prepared) && prepared.selectAllByKey === true) {
           // Number inputs ignore el.select(); select all with Ctrl+A instead.
-          await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-            type: 'rawKeyDown', key: 'a', code: 'KeyA', modifiers: 2,
-            windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65,
-          })
-          await debuggerCommand(target, 'Input.dispatchKeyEvent', {
-            type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 2,
-            windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65,
-          })
+          // pressKey dispatches Control itself so the input tracker stays balanced.
+          await pressKey(target, { key: 'a', code: 'KeyA', virtualKey: 65, modifiers: 2 })
         }
         // Type the replacement character by character (the selection is replaced
         // as we type), because some fields reject paste-style bulk insertion.
