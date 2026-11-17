@@ -1,4 +1,4 @@
-const PAIR_PATH = '/api/dsh-browser-extension/pair'
+const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
 const POLL_PATH = '/dsh-browser-extension/poll'
 const RESPONSE_PATH = '/dsh-browser-extension/respond'
@@ -6,6 +6,7 @@ const DISCONNECT_PATH = '/dsh-browser-extension/disconnect'
 const SESSION_KEY = 'dshBrowserSession'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
+const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
 const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const RECONNECT_ALARM = 'dsh-browser-reconnect'
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5
@@ -121,7 +122,7 @@ let restoreTask
 let keepaliveInterval
 let reconnectWanted = false
 let reconnectTask
-let reconnectFailures = 0
+let trustedStorageTask
 let behaviorSettingsCache = { ...DEFAULT_BEHAVIOR_SETTINGS }
 let behaviorSettingsLoaded = false
 let behaviorSettingsLoadTask
@@ -671,48 +672,18 @@ async function postJson(origin, path, payload, sessionSignal, timeoutMs = 10_000
   }
 }
 
-async function requestPairToken(tabId, origin) {
-  const url = new URL(PAIR_PATH, origin)
-  const results = await chrome.scripting.executeScript({
-    target: { tabId, frameIds: [0] },
-    world: 'ISOLATED',
-    func: async pairUrl => {
-      const response = await fetch(pairUrl, {
-        method: 'POST',
-        credentials: 'same-origin',
-        cache: 'no-store',
-      })
-      const value = await response.json().catch(() => null)
-      if (!response.ok) {
-        throw new Error(typeof value?.error === 'string' ? value.error : 'DSH pairing request failed')
-      }
-      return value
-    },
-    args: [url.href],
-  })
-  const pairing = results[0]?.result
-  if (!isRecord(pairing) || pairing.protocol !== 1 || typeof pairing.pairToken !== 'string') {
-    throw new Error('DSH Web returned an invalid pairing response')
-  }
-  return pairing.pairToken
-}
-
-/** Fetch a pairing code straight from the service worker, no page tab needed. */
-async function requestPairTokenFromWorker(origin) {
-  const result = await postJson(origin, PAIR_PATH, {})
+/** Exchange the saved pairing code for a short-lived token without a page tab. */
+async function requestPairTokenFromWorker(origin, pairingCode) {
+  const result = await postJson(origin, AUTHORIZE_PATH, { pairingCode })
   if (!isRecord(result) || result.protocol !== 1 || typeof result.pairToken !== 'string') {
     throw new Error('DSH Web returned an invalid pairing response')
   }
   return result.pairToken
 }
 
-async function pairWithDsh(tabId, origin) {
+async function pairWithDsh(origin, pairingCode) {
   await disconnect()
-  const tab = await chrome.tabs.get(tabId)
-  if (typeof tab.url !== 'string' || new URL(tab.url).origin !== origin) {
-    throw new Error('The active DSH tab changed. Open DSH Web and pair again.')
-  }
-  const pairToken = await requestPairToken(tabId, origin)
+  const pairToken = await requestPairTokenFromWorker(origin, pairingCode)
   const result = await postJson(origin, CONNECT_PATH, { pairToken })
   if (!isRecord(result) || result.protocol !== 1 || typeof result.sessionToken !== 'string') {
     throw new Error('DSH Web returned an invalid browser session')
@@ -940,23 +911,29 @@ function normalizeDshOrigin(value) {
   }
 }
 
-/** Read the configured DSH Web origin (defaults to http://127.0.0.1:3080). */
-async function readConnectionOrigin() {
-  try {
-    const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
-    const configured = normalizeDshOrigin(stored?.[CONNECTION_SETTINGS_KEY]?.origin)
-    if (configured !== undefined) return configured
-  } catch {
-    // fall through to the default
+/** Read the configured origin and the persistent code supplied by the user. */
+async function readConnectionSettings() {
+  trustedStorageTask ??= chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+    .catch(error => { trustedStorageTask = undefined; throw error })
+  await trustedStorageTask
+  const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
+  const settings = stored?.[CONNECTION_SETTINGS_KEY]
+  const origin = settings?.origin === undefined ? DEFAULT_DSH_ORIGIN : normalizeDshOrigin(settings.origin)
+  if (origin === undefined) throw new Error('Set a valid local DSH Web address in Settings')
+  return {
+    origin,
+    pairingCode: typeof settings?.pairingCode === 'string' ? settings.pairingCode.trim() : '',
+    autoConnect: settings?.autoConnect !== false,
   }
-  return DEFAULT_DSH_ORIGIN
 }
 
 /** Keep the reconnect alarm armed until a session exists again. */
 async function scheduleReconnect() {
   if (activeSession !== undefined) return
   reconnectWanted = true
-  void chrome.storage.local.set({ [RECONNECT_WANTED_KEY]: true }).catch(() => {})
+  try { await chrome.storage.local.set({ [RECONNECT_WANTED_KEY]: true }) } catch {
+    // The alarm still retries while this worker is alive.
+  }
   try {
     if (await chrome.alarms.get(RECONNECT_ALARM) === undefined) {
       await chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES })
@@ -969,7 +946,6 @@ async function scheduleReconnect() {
 /** Stop automatic reconnection (explicit user disconnect or successful pair). */
 function stopReconnect() {
   reconnectWanted = false
-  reconnectFailures = 0
   void chrome.storage.local.remove(RECONNECT_WANTED_KEY).catch(() => {})
   void chrome.alarms.clear(RECONNECT_ALARM).catch(() => {})
 }
@@ -977,66 +953,24 @@ function stopReconnect() {
 /**
  * Re-pair automatically after an unexpected session loss (host restart, expired
  * token, network drop), on Chrome startup when autoConnect is enabled, or when the
- * user clicks Pair. Uses the configured origin; if no tab at that origin is open,
- * opens one and waits for it to load before pairing.
+ * user clicks Connect. Uses the saved origin and code without creating a tab.
  */
 async function attemptAutoReconnect() {
   if (activeSession !== undefined) return
   if (!reconnectWanted) return
   if (reconnectTask !== undefined) return reconnectTask
   reconnectTask = (async () => {
-    const origin = await readConnectionOrigin()
-    let match = null
+    const settings = await readConnectionSettings()
+    if (!PAIRING_CODE_PATTERN.test(settings.pairingCode)) {
+      throw new Error('Save the pairing code from DSH Web in extension Settings')
+    }
     try {
-      const tabs = await chrome.tabs.query({})
-      match = tabs.find(tab => {
-        if (!Number.isInteger(tab.id) || typeof tab.url !== 'string') return false
-        try {
-          return new URL(tab.url).origin === origin
-        } catch {
-          return false
-        }
-      }) ?? null
-    } catch {
-      return
+      await pairWithDsh(settings.origin, settings.pairingCode)
+    } catch (error) {
+      if (error?.status === 401) stopReconnect()
+      throw error
     }
-    if (match === null) {
-      // No DSH tab open: pair through a background (inactive) tab at the configured
-      // origin instead of forcing one into the user's face. The DSH Web tab created
-      // here is a hidden pairing vehicle; the user never has to open it manually.
-      try {
-        const created = await chrome.tabs.create({ url: origin, active: false })
-        match = created
-        await new Promise(resolve => {
-          const timer = setTimeout(resolve, 20_000)
-          const onUpdated = (tabId, changeInfo) => {
-            if (tabId === created.id && changeInfo.status === 'complete') {
-              clearTimeout(timer)
-              chrome.tabs.onUpdated.removeListener(onUpdated)
-              resolve()
-            }
-          }
-          chrome.tabs.onUpdated.addListener(onUpdated)
-        })
-        // Close the helper tab again after pairing; pairing needs the tab's origin
-        // only for the one-time code exchange, and the session token lives in the SW.
-        await pairWithDsh(match.id, origin)
-        stopReconnect()
-        await chrome.tabs.remove(match.id).catch(() => {})
-        return
-      } catch {
-        reconnectFailures += 1
-        return
-      }
-    }
-    if (match === null || !Number.isInteger(match.id)) return
-    try {
-      await pairWithDsh(match.id, origin)
-      stopReconnect()
-    } catch {
-      reconnectFailures += 1
-    }
-  })().catch(() => {}).finally(() => {
+  })().finally(() => {
     reconnectTask = undefined
   })
   return reconnectTask
@@ -1052,9 +986,12 @@ async function clearSession(session, options = {}) {
   await detachAllDebuggerTargets()
   await chrome.storage.session.remove(SESSION_KEY)
   if (options.autoReconnect !== false) {
-    await scheduleReconnect()
-    // Defer: pairWithDsh waits for the previous poll task, which is the caller here.
-    setTimeout(() => { void attemptAutoReconnect() }, 50)
+    const settings = await readConnectionSettings().catch(() => undefined)
+    if (settings?.autoConnect === true && PAIRING_CODE_PATTERN.test(settings.pairingCode)) {
+      await scheduleReconnect()
+      // Defer: pairWithDsh waits for the previous poll task, which is the caller here.
+      setTimeout(() => { void attemptAutoReconnect().catch(() => {}) }, 50)
+    }
   }
 }
 
@@ -1090,9 +1027,12 @@ async function restoreSession() {
     // Resume an interrupted auto-reconnect (e.g. the worker was recycled mid-retry).
     const wanted = await chrome.storage.local.get(RECONNECT_WANTED_KEY).catch(() => ({}))
     if (wanted?.[RECONNECT_WANTED_KEY] === true) {
-      reconnectWanted = true
-      await scheduleReconnect()
-      void attemptAutoReconnect()
+      const settings = await readConnectionSettings().catch(() => undefined)
+      if (settings?.autoConnect === true && PAIRING_CODE_PATTERN.test(settings.pairingCode)) {
+        reconnectWanted = true
+        await scheduleReconnect()
+        void attemptAutoReconnect().catch(() => {})
+      } else stopReconnect()
     }
   }).catch(() => {}).finally(() => {
     restoreTask = undefined
@@ -3790,25 +3730,16 @@ async function debuggerCommand(target, method, params = {}) {
 }
 
 chrome.runtime.onStartup.addListener(() => {
-  // Fresh browser window: if auto-connect is enabled, pair with the configured origin automatically.
-  void readConnectionOrigin().then(async origin => {
-    let autoConnect = true
-    try {
-      const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
-      autoConnect = stored?.[CONNECTION_SETTINGS_KEY]?.autoConnect !== false
-    } catch {
-      // default on
-    }
-    if (!autoConnect) return
+  void readConnectionSettings().then(async settings => {
+    if (!settings.autoConnect || !PAIRING_CODE_PATTERN.test(settings.pairingCode)) return
     await scheduleReconnect()
     await attemptAutoReconnect()
-  })
+  }).catch(() => {})
 })
 
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === RECONNECT_ALARM) {
-    // Host restart or dropped session: re-pair automatically when DSH Web is open.
-    void restoreSession().then(() => attemptAutoReconnect())
+    void restoreSession().then(() => attemptAutoReconnect()).catch(() => {})
     return
   }
   if (alarm.name !== KEEPALIVE_ALARM) return
@@ -3832,14 +3763,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true
   }
   if (message?.type === 'pairAuto') {
-    // Pair using the configured origin, opening a DSH Web tab at that address if none is open.
     void (async () => {
       try {
         await restoreSession()
         if (activeSession === undefined) {
+          const settings = await readConnectionSettings()
+          if (!PAIRING_CODE_PATTERN.test(settings.pairingCode)) {
+            throw new Error('Save the pairing code from DSH Web in extension Settings')
+          }
           reconnectWanted = true
-          await scheduleReconnect()
-          await attemptAutoReconnect()
+          if (settings.autoConnect) await scheduleReconnect()
+          try { await attemptAutoReconnect() } finally {
+            if (!settings.autoConnect) stopReconnect()
+          }
         }
         sendResponse({ ok: activeSession !== undefined, origin: activeSession?.origin })
       } catch (error) {
@@ -3848,14 +3784,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     })()
     return true
   }
-  if (message?.type !== 'pair' || !Number.isInteger(message.tabId) || typeof message.origin !== 'string') return false
-  void pairWithDsh(message.tabId, message.origin).then(() => {
-    sendResponse({ ok: true })
-  }, async error => {
-    await disconnect()
-    sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) })
-  })
-  return true
+  return false
 })
 
 chrome.runtime.onMessage.addListener(message => {

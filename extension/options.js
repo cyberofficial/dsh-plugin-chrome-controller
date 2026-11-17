@@ -1,6 +1,8 @@
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
 const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
+const PAIRING_SETTINGS_PATH = '/api/dsh-browser-extension/pairing'
+const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
 
 const DEFAULTS = {
   baseFlightDelayMs: 110,
@@ -64,12 +66,15 @@ const GROUPS = [
 const form = document.querySelector('#settings-form')
 const connectionForm = document.querySelector('#connection-form')
 const originInput = document.querySelector('#dsh-origin')
+const pairingCodeInput = document.querySelector('#dsh-pairing-code')
+const pairingPageNode = document.querySelector('#pairing-page-url')
 const autoConnectInput = document.querySelector('#dsh-autoconnect')
 const connectionStatusNode = document.querySelector('#connection-status')
 const groupsNode = document.querySelector('#settings-groups')
 const statusNode = document.querySelector('#status')
 const resetButton = document.querySelector('#reset')
 const inputs = new Map()
+let savedPairingCode = ''
 
 function makeField([key, title, description, min, max, step, unit]) {
   const wrapper = document.createElement('div')
@@ -150,6 +155,12 @@ function readInputs() {
 
 async function initialize() {
   try {
+    await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+  } catch (error) {
+    showStatus(error instanceof Error ? error.message : String(error), true)
+    return
+  }
+  try {
     const stored = await chrome.storage.local.get(SETTINGS_KEY)
     populate({ ...DEFAULTS, ...(stored[SETTINGS_KEY] ?? {}) })
   } catch (error) {
@@ -159,11 +170,16 @@ async function initialize() {
   try {
     const connection = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
     originInput.value = connection?.[CONNECTION_SETTINGS_KEY]?.origin ?? DEFAULT_DSH_ORIGIN
+    const code = connection?.[CONNECTION_SETTINGS_KEY]?.pairingCode
+    savedPairingCode = typeof code === 'string' ? code : ''
+    pairingCodeInput.placeholder = savedPairingCode === '' ? 'Paste the code from DSH Web' : 'Saved code (leave blank to keep)'
     autoConnectInput.checked = connection?.[CONNECTION_SETTINGS_KEY]?.autoConnect !== false
   } catch {
     originInput.value = DEFAULT_DSH_ORIGIN
+    savedPairingCode = ''
     autoConnectInput.checked = true
   }
+  updatePairingPage()
 }
 
 /** Accept only loopback HTTP(S) origins; empty resets to the default. */
@@ -181,6 +197,13 @@ function readOrigin() {
   return url.origin
 }
 
+function updatePairingPage() {
+  const origin = readOrigin()
+  pairingPageNode.textContent = origin === undefined ? 'Enter a valid local address' : origin + PAIRING_SETTINGS_PATH
+}
+
+originInput.addEventListener('input', updatePairingPage)
+
 connectionForm.addEventListener('submit', async event => {
   event.preventDefault()
   const origin = readOrigin()
@@ -190,10 +213,24 @@ connectionForm.addEventListener('submit', async event => {
     return
   }
   originInput.setCustomValidity('')
+  const pairingCode = pairingCodeInput.value.trim() || savedPairingCode
+  if (pairingCode !== '' && !PAIRING_CODE_PATTERN.test(pairingCode)) {
+    pairingCodeInput.setCustomValidity('Enter the 24-character pairing code shown in DSH Web')
+    pairingCodeInput.reportValidity()
+    return
+  }
+  pairingCodeInput.setCustomValidity('')
   try {
-    await chrome.storage.local.set({ [CONNECTION_SETTINGS_KEY]: { origin, autoConnect: autoConnectInput.checked } })
+    await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+    await chrome.storage.local.set({ [CONNECTION_SETTINGS_KEY]: { origin, pairingCode, autoConnect: autoConnectInput.checked } })
+    savedPairingCode = pairingCode
+    pairingCodeInput.value = ''
+    pairingCodeInput.placeholder = pairingCode === '' ? 'Paste the code from DSH Web' : 'Saved code (leave blank to keep)'
     originInput.value = origin
-    connectionStatusNode.textContent = 'Connection address saved. The extension connects automatically when Chrome starts; click Connect in the popup to pair now.'
+    updatePairingPage()
+    connectionStatusNode.textContent = pairingCode === ''
+      ? 'Address saved. Add the pairing code to connect.'
+      : 'Connection saved. Click Connect in the popup now. Automatic connection follows the checkbox above.'
     connectionStatusNode.dataset.error = 'false'
   } catch (error) {
     connectionStatusNode.textContent = error instanceof Error ? error.message : String(error)

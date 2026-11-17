@@ -12,7 +12,7 @@ The DSH browser tools operate the user's current Chrome tabs through the paired 
 
 Call `dsh_browser_tabs` with `action: "list"`. Choose the tab that matches the user's task and keep its `tabId` for later calls. Call `dsh_browser_snapshot` to read its title, URL, visible text, and links. Use `dsh_browser_screenshot` when layout or visual state matters.
 
-Preserve the DSH Web tab used for pairing. Identify it from its `127.0.0.1` URL and do not navigate, close, or repurpose it unless the user explicitly asks. For web research or testing, open separate tabs with `dsh_browser_tabs` and `action: "open"`, and track the new tab IDs. Before reporting, list tabs again and accurately state which tabs changed. Do not claim the original DSH tab was untouched if its URL changed.
+If a DSH Web tab is open, preserve it. Identify it from its local URL and do not navigate, close, or repurpose it unless the user explicitly asks. For web research or testing, open separate tabs with `dsh_browser_tabs` and `action: "open"`, and track the new tab IDs. Before reporting, list tabs again and accurately state which tabs changed.
 
 All live DSH sessions share the same tabs and page state. Commands to one tab run in order, but another agent can change the page between an inspection and a later action. Avoid parallel workflows in the same tab; use separate tabs when agents need to work concurrently.
 
@@ -20,7 +20,7 @@ The first debugger attachment can show Chrome's debugging notice and change the 
 
 Use only tools present in the browser tool list. Tab listing and activation are actions of `dsh_browser_tabs`; there is no separate `dsh_browser_activate` or `dsh_browser_wait_for` tool. Use the exact `dsh_browser_wait_for_element` tool name for element waits. `dsh_browser_navigate` waits for page loading. If a site renders more content afterward, inspect it with another snapshot rather than inventing a wait tool.
 
-The extension connects automatically to the DSH Web address configured in its Settings (default `http://127.0.0.1:3080`) on Chrome start and after any interruption — including on a fresh Chrome window — by pairing through a hidden background tab, so no DSH tab is ever opened for the user. If a browser tool reports that the extension is disconnected, call `dsh_browser_tabs` again after a few seconds instead of retrying immediately; the reconnect alarm fires every 30 seconds. Only if it stays disconnected, tell the user to check the DSH Web origin in the extension Settings and click **Connect** in the popup (or that DSH Web is running). Pairing uses DSH's authenticated page and a short-lived code; do not ask the user to copy tokens. Do not repeat browser operations in a tight loop while disconnected. Also re-list tabs before each browser batch — a tab can close between turns, and acting on a stale tabId fails.
+The extension connects to the DSH Web origin configured in its Settings (default `http://127.0.0.1:3080`) through its service worker. Initial setup requires the user to open authenticated DSH Web themselves and copy the code from `/api/dsh-browser-extension/pairing` into extension Settings. After that, **Connect** and automatic reconnection on Chrome start or after interruptions open no DSH tab. If a browser tool reports disconnection, wait for the 30-second reconnect alarm instead of retrying in a tight loop. If it stays disconnected, tell the user to check that DSH Web is running and that the origin and pairing code match. The code is a credential: do not ask the user to paste it into chat or a tool result. Re-list tabs before each browser batch because a tab can close between turns.
 
 ## Inspect, act, and verify
 
@@ -208,7 +208,7 @@ Use search results and AI summaries only to discover leads. Open the source page
 
 Check that the source actually matches the scope. Distinguish publication or update date from the period the data covers; verify units, definitions, geography, and methodology where they affect the result. For important, surprising, or disputed claims, check an independent source and note when sources rely on the same underlying data. Do not combine rankings or metrics that use different criteria. If sources disagree, explain the difference and keep their figures separate.
 
-Keep page reads focused. Use `maxChars` for snapshots and inspect the relevant section with `dsh_browser_get_html`; use `dsh_browser_extract` for bounded tables, links, or lists. Open separate tabs for source pages and preserve the DSH pairing tab. In the answer, put direct links near the claims they support, label ranking criteria and dates, and distinguish verified facts from inference.
+Keep page reads focused. Use `maxChars` for snapshots and inspect the relevant section with `dsh_browser_get_html`; use `dsh_browser_extract` for bounded tables, links, or lists. Open separate tabs for source pages and preserve any open DSH Web tab. In the answer, put direct links near the claims they support, label ranking criteria and dates, and distinguish verified facts from inference.
 
 ## Spreadsheet workflows
 

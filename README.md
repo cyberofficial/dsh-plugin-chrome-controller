@@ -6,9 +6,9 @@ Use a Chrome extension to give DeepSeek Harness browser tools for the Chrome win
 
 - DeepSeek Harness Web on the same computer as Chrome.
 - Chrome 116 or later.
-- DSH Web bound to `127.0.0.1` and opened in Chrome at a local URL such as `http://127.0.0.1:3080`.
+- DSH Web bound to `127.0.0.1` at a local URL such as `http://127.0.0.1:3080`. Open it once to copy the pairing code during setup.
 
-The plugin refuses to start if DSH Web is not bound to `127.0.0.1`. The first version supports DSH Web. Headless and CLI profiles do not provide the authenticated browser pairing route. The linked package has no extra runtime package dependencies to install.
+The plugin refuses to start if DSH Web is not bound to `127.0.0.1`. The first version supports DSH Web. Headless and CLI profiles do not provide the authenticated browser pairing route. The default Web profile includes the credential store; custom compositions must provide one. The linked package has no extra runtime package dependencies to install.
 
 ## Install the DSH plugin
 
@@ -25,16 +25,17 @@ Restart DSH Web after installation.
 1. Open `chrome://extensions`.
 2. Turn on Developer mode.
 3. Select **Load unpacked** and choose this package's `extension` folder. Approve HTTP and HTTPS site access when Chrome asks.
-4. Open the extension popup → **Settings** and set the **DSH Web origin** if DSH Web does not listen on `http://127.0.0.1:3080` (loopback HTTP(S) only).
-5. Click **Connect to DSH Web** in the popup — the extension pairs through a hidden background tab at the configured address, so no DSH tab is ever opened for you.
+4. Open DSH Web yourself in an authenticated browser and visit `http://127.0.0.1:3080/api/dsh-browser-extension/pairing` (use your DSH Web origin if the port differs). Copy the code shown there.
+5. Open the extension popup, choose **Settings**, enter the DSH Web origin and pairing code, and save.
+6. Click **Connect to DSH Web** in the popup. Connecting does not open a DSH tab.
 
-Pairing uses DSH's authenticated Web connection to issue a short-lived, single-use code. The extension exchanges it for a session token in Chrome's session storage and polls DSH's local HTTP routes for browser commands. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. Once connected, the extension keeps pairing on its own: with **Connect automatically** enabled (the default) it re-pairs on Chrome start, and whenever the session drops — DSH Web restarted, token expired, the machine slept — it retries every 30 seconds using a hidden background tab at the configured address (no visible tab is opened). Use **Disconnect** to stop automatic reconnection.
+DSH stores the pairing code in its credential store. The extension saves it in Chrome's local extension storage, which is restricted to trusted extension contexts but is not encrypted on disk. The service worker exchanges the code for a short-lived, single-use token, then a browser session token kept in Chrome's session storage. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. With **Connect automatically** enabled, the extension connects on Chrome start and retries after interruptions without opening a tab. Rotating the code on the DSH pairing page disconnects the extension; save the new code in extension Settings before reconnecting. **Disconnect** stops current retries. Disable automatic connection in Settings to keep it disconnected on the next Chrome start.
 
 The extension requests access to HTTP and HTTPS websites so it can inject the virtual cursor overlay on tabs you ask it to control. Chrome warns that the debugger permission can control browser tabs and that the downloads permission can manage downloads. The overlay is cosmetic; page input is sent through Chrome's debugger API.
 
 Open the extension popup and select **Settings** to customize typing delays and key holds, longer pauses, cursor speed and arc, drag duration, and the delay between sequence steps. Each setting has a description and allowed range. The defaults are the project's tested baseline. Changing them may cause sites to flag or restrict activity; no settings guarantee a site will accept interactions.
 
-The same Settings page has a **DSH Web connection** section: the local DSH Web origin (default `http://127.0.0.1:3080`, loopback HTTP(S) only — change the port here when DSH Web listens elsewhere) and an **auto-connect** toggle (on by default) that makes the extension pair on Chrome start and re-pair after interruptions without any manual step. The popup's **Connect** button uses this address and pairs through a hidden background tab — no visible tab is opened.
+The extension Settings page has a **DSH Web connection** section for the local origin, saved pairing code, and automatic connection toggle. The code field stays blank after saving; leave it blank to keep the saved code, or paste a new code after rotation. The page shows the DSH pairing page address for the current origin. The popup's **Connect** button uses these saved settings without opening a DSH tab.
 
 Once paired, the extension keeps its Manifest V3 service worker alive on its own: a 30-second heartbeat alarm wakes the worker if Chrome suspends it, and a 25-second `chrome.runtime.getPlatformInfo()` call resets the worker's idle timer while it runs. Browser tools therefore respond without opening the extension popup. After updating the extension, reload it on `chrome://extensions` and pair again once.
 

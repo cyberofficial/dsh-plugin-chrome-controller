@@ -20,9 +20,12 @@
 
       <form id="connection-form" novalidate>
         <h2>DSH Web connection</h2>
-        <p>Local DSH Web address the extension pairs with. Change the port here when DSH Web listens somewhere other than <code>http://127.0.0.1:3080</code>, save, then pair again from the extension popup. After a DSH Web restart the extension re-pairs automatically while a tab at this address is open.</p>
+        <p>For first setup, open DSH Web yourself and visit <code id="pairing-page-url"></code> in an authenticated browser to copy the pairing code. The same page rotates the code. Connect and automatic reconnection do not open a DSH tab.</p>
         <label for="dsh-origin">DSH Web origin</label>
         <input id="dsh-origin" name="dsh-origin" type="url" inputmode="url" placeholder="http://127.0.0.1:3080" spellcheck="false" autocomplete="off">
+        <label for="dsh-pairing-code">Pairing code</label>
+        <input id="dsh-pairing-code" name="dsh-pairing-code" type="password" maxlength="24" spellcheck="false" autocomplete="off" placeholder="Paste the code from DSH Web">
+        <p>Leave the pairing code blank to keep the saved code. Paste a new code here after rotating it in DSH Web.</p>
         <label class="check"><input id="dsh-autoconnect" type="checkbox"> Connect automatically when Chrome starts and after interruptions</label>
         <div class="actions">
           <button type="submit" class="primary">Save connection</button>
