@@ -18,18 +18,18 @@ From a terminal with DSH installed:
 dsh plugin --profile web install "link:C:/path/to/dsh-plugin-chrome-controller"
 ```
 
-Restart DSH Web after installation.
+Restart DSH Web and reload its page after installation or an update.
 
 ## Load the Chrome extension
 
 1. Open `chrome://extensions`.
 2. Turn on Developer mode.
 3. Select **Load unpacked** and choose this package's `extension` folder. Approve HTTP and HTTPS site access when Chrome asks.
-4. Open DSH Web yourself in an authenticated browser and visit `http://127.0.0.1:3080/api/dsh-browser-extension/pairing` (use your DSH Web origin if the port differs). Copy the code shown there.
+4. Open DSH Web yourself in an authenticated browser. Choose **Settings**, then **Chrome browser**, and copy the pairing code. The direct page is `http://127.0.0.1:3080/api/dsh-browser-extension/pairing` (use your DSH Web origin if the port differs).
 5. Open the extension popup, choose **Settings**, enter the DSH Web origin and pairing code, and save.
 6. Click **Connect to DSH Web** in the popup. Connecting does not open a DSH tab.
 
-DSH stores the pairing code in its credential store. The extension saves it in Chrome's local extension storage, which is restricted to trusted extension contexts but is not encrypted on disk. The service worker exchanges the code for a short-lived, single-use token, then a browser session token kept in Chrome's session storage. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. With **Connect automatically** enabled, the extension connects on Chrome start and retries after interruptions without opening a tab. Rotating the code on the DSH pairing page disconnects the extension; save the new code in extension Settings before reconnecting. **Disconnect** stops current retries. Disable automatic connection in Settings to keep it disconnected on the next Chrome start.
+DSH stores the pairing code in its credential store. The Chrome browser section in DSH Settings shows and rotates it. The extension saves it in Chrome's local extension storage, which is restricted to trusted extension contexts but is not encrypted on disk. The service worker exchanges the code for a short-lived, single-use token, then a browser session token kept in Chrome's session storage. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. With **Connect automatically** enabled, the extension connects on Chrome start and retries after interruptions without opening a tab. Rotating the code disconnects the extension; save the new code in extension Settings before reconnecting. **Disconnect** stops current retries. Disable automatic connection in Settings to keep it disconnected on the next Chrome start.
 
 The extension requests access to HTTP and HTTPS websites so it can inject the virtual cursor overlay on tabs you ask it to control. Chrome warns that the debugger permission can control browser tabs and that the downloads permission can manage downloads. The overlay is cosmetic; page input is sent through Chrome's debugger API.
 
