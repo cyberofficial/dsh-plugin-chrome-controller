@@ -81,14 +81,11 @@ async function readActiveDshTab() {
 
 connectButton.addEventListener('click', async () => {
   connectButton.disabled = true
-  showStatus('Pairing...')
+  showStatus('Connecting to DSH Web...')
   try {
-    if (activeDshTab === undefined) throw new Error('Open DSH Web at 127.0.0.1 in a Chrome tab before pairing')
-    const { tabId, origin } = activeDshTab
-
-    const result = await sendMessage({ type: 'pair', tabId, origin })
-    if (result?.ok !== true) throw new Error(result?.error ?? 'Pairing failed')
-    showStatus('Connected to DSH Web', true)
+    const result = await sendMessage({ type: 'pairAuto' })
+    if (result?.ok !== true) throw new Error(result?.error ?? 'Connection failed (is DSH Web running at the address in Settings?)')
+    showStatus('Connected to DSH Web' + (result?.origin ? ' at ' + result.origin : ''), true)
   } catch (error) {
     showStatus(error instanceof Error ? error.message : String(error))
   } finally {
@@ -116,7 +113,7 @@ settingsButton.addEventListener('click', () => {
 async function initialize() {
   await Promise.all([readActiveDshTab(), refreshStatus()])
   if (activeDshTab === undefined && !isConnected) {
-    statusNode.textContent = 'Open DSH Web at 127.0.0.1 in a Chrome tab before pairing.'
+    statusNode.textContent = 'Not connected. Set the DSH Web address in Settings, then click Connect.'
   }
 }
 

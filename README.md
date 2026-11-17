@@ -25,15 +25,16 @@ Restart DSH Web after installation.
 1. Open `chrome://extensions`.
 2. Turn on Developer mode.
 3. Select **Load unpacked** and choose this package's `extension` folder. Approve HTTP and HTTPS site access when Chrome asks.
-4. Open DSH Web in the same Chrome profile.
-5. Select the extension and choose **Pair with this DSH tab**.
-Pairing uses DSH's authenticated Web connection to issue a short-lived, single-use code. The extension exchanges it for a session token in Chrome's session storage and polls DSH's local HTTP routes for browser commands. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. If the session is lost unexpectedly — DSH Web restarted, the token expired, the machine slept — the extension re-pairs by itself as soon as a tab at the configured DSH Web origin is open, retrying every 30 seconds until it succeeds. Pair manually after a Chrome restart, or use **Disconnect** to stop automatic reconnection.
+4. Open the extension popup → **Settings** and set the **DSH Web origin** if DSH Web does not listen on `http://127.0.0.1:3080` (loopback HTTP(S) only).
+5. Click **Connect to DSH Web** in the popup — the extension pairs through a hidden background tab at the configured address, so no DSH tab is ever opened for you.
+
+Pairing uses DSH's authenticated Web connection to issue a short-lived, single-use code. The extension exchanges it for a session token in Chrome's session storage and polls DSH's local HTTP routes for browser commands. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. Once connected, the extension keeps pairing on its own: with **Connect automatically** enabled (the default) it re-pairs on Chrome start, and whenever the session drops — DSH Web restarted, token expired, the machine slept — it retries every 30 seconds using a hidden background tab at the configured address (no visible tab is opened). Use **Disconnect** to stop automatic reconnection.
 
 The extension requests access to HTTP and HTTPS websites so it can inject the virtual cursor overlay on tabs you ask it to control. Chrome warns that the debugger permission can control browser tabs and that the downloads permission can manage downloads. The overlay is cosmetic; page input is sent through Chrome's debugger API.
 
 Open the extension popup and select **Settings** to customize typing delays and key holds, longer pauses, cursor speed and arc, drag duration, and the delay between sequence steps. Each setting has a description and allowed range. The defaults are the project's tested baseline. Changing them may cause sites to flag or restrict activity; no settings guarantee a site will accept interactions.
 
-The same Settings page has a **DSH Web connection** field for the local DSH Web origin (default `http://127.0.0.1:3080`). Change it when DSH Web listens on another port or on `localhost`, save, then pair again from the popup. Only loopback HTTP(S) addresses are accepted, and automatic reconnection uses this address.
+The same Settings page has a **DSH Web connection** section: the local DSH Web origin (default `http://127.0.0.1:3080`, loopback HTTP(S) only — change the port here when DSH Web listens elsewhere) and an **auto-connect** toggle (on by default) that makes the extension pair on Chrome start and re-pair after interruptions without any manual step. The popup's **Connect** button uses this address and pairs through a hidden background tab — no visible tab is opened.
 
 Once paired, the extension keeps its Manifest V3 service worker alive on its own: a 30-second heartbeat alarm wakes the worker if Chrome suspends it, and a 25-second `chrome.runtime.getPlatformInfo()` call resets the worker's idle timer while it runs. Browser tools therefore respond without opening the extension popup. After updating the extension, reload it on `chrome://extensions` and pair again once.
 

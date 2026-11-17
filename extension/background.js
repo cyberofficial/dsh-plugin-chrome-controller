@@ -967,9 +967,9 @@ function stopReconnect() {
 
 /**
  * Re-pair automatically after an unexpected session loss (host restart, expired
- * token, network drop). Uses the configured origin and an open DSH Web tab at
- * that origin; if no such tab exists, retries continue on the alarm so the
- * session re-establishes when the user opens DSH Web again.
+ * token, network drop), on Chrome startup when autoConnect is enabled, or when the
+ * user clicks Pair. Uses the configured origin; if no tab at that origin is open,
+ * opens one and waits for it to load before pairing.
  */
 async function attemptAutoReconnect() {
   if (activeSession !== undefined) return
@@ -977,24 +977,50 @@ async function attemptAutoReconnect() {
   if (reconnectTask !== undefined) return reconnectTask
   reconnectTask = (async () => {
     const origin = await readConnectionOrigin()
-    let tabs = []
+    let match = null
     try {
-      tabs = await chrome.tabs.query({})
+      const tabs = await chrome.tabs.query({})
+      match = tabs.find(tab => {
+        if (!Number.isInteger(tab.id) || typeof tab.url !== 'string') return false
+        try {
+          return new URL(tab.url).origin === origin
+        } catch {
+          return false
+        }
+      }) ?? null
     } catch {
       return
     }
-    const match = tabs.find(tab => {
-      if (!Number.isInteger(tab.id) || typeof tab.url !== 'string') return false
+    if (match === null) {
+      // No DSH tab open: pair through a background (inactive) tab at the configured
+      // origin instead of forcing one into the user's face. The DSH Web tab created
+      // here is a hidden pairing vehicle; the user never has to open it manually.
       try {
-        return new URL(tab.url).origin === origin
+        const created = await chrome.tabs.create({ url: origin, active: false })
+        match = created
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, 20_000)
+          const onUpdated = (tabId, changeInfo) => {
+            if (tabId === created.id && changeInfo.status === 'complete') {
+              clearTimeout(timer)
+              chrome.tabs.onUpdated.removeListener(onUpdated)
+              resolve()
+            }
+          }
+          chrome.tabs.onUpdated.addListener(onUpdated)
+        })
+        // Close the helper tab again after pairing; pairing needs the tab's origin
+        // only for the one-time code exchange, and the session token lives in the SW.
+        await pairWithDsh(match.id, origin)
+        stopReconnect()
+        await chrome.tabs.remove(match.id).catch(() => {})
+        return
       } catch {
-        return false
+        reconnectFailures += 1
+        return
       }
-    })
-    if (match === undefined) {
-      reconnectFailures += 1
-      return
     }
+    if (match === null || !Number.isInteger(match.id)) return
     try {
       await pairWithDsh(match.id, origin)
       stopReconnect()
@@ -3754,6 +3780,22 @@ async function debuggerCommand(target, method, params = {}) {
   }
 }
 
+chrome.runtime.onStartup.addListener(() => {
+  // Fresh browser window: if auto-connect is enabled, pair with the configured origin automatically.
+  void readConnectionOrigin().then(async origin => {
+    let autoConnect = true
+    try {
+      const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
+      autoConnect = stored?.[CONNECTION_SETTINGS_KEY]?.autoConnect !== false
+    } catch {
+      // default on
+    }
+    if (!autoConnect) return
+    await scheduleReconnect()
+    await attemptAutoReconnect()
+  })
+})
+
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === RECONNECT_ALARM) {
     // Host restart or dropped session: re-pair automatically when DSH Web is open.
@@ -3778,6 +3820,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     }))
+    return true
+  }
+  if (message?.type === 'pairAuto') {
+    // Pair using the configured origin, opening a DSH Web tab at that address if none is open.
+    void (async () => {
+      try {
+        await restoreSession()
+        if (activeSession === undefined) {
+          reconnectWanted = true
+          await scheduleReconnect()
+          await attemptAutoReconnect()
+        }
+        sendResponse({ ok: activeSession !== undefined, origin: activeSession?.origin })
+      } catch (error) {
+        sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) })
+      }
+    })()
     return true
   }
   if (message?.type !== 'pair' || !Number.isInteger(message.tabId) || typeof message.origin !== 'string') return false

@@ -64,6 +64,7 @@ const GROUPS = [
 const form = document.querySelector('#settings-form')
 const connectionForm = document.querySelector('#connection-form')
 const originInput = document.querySelector('#dsh-origin')
+const autoConnectInput = document.querySelector('#dsh-autoconnect')
 const connectionStatusNode = document.querySelector('#connection-status')
 const groupsNode = document.querySelector('#settings-groups')
 const statusNode = document.querySelector('#status')
@@ -158,8 +159,10 @@ async function initialize() {
   try {
     const connection = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
     originInput.value = connection?.[CONNECTION_SETTINGS_KEY]?.origin ?? DEFAULT_DSH_ORIGIN
+    autoConnectInput.checked = connection?.[CONNECTION_SETTINGS_KEY]?.autoConnect !== false
   } catch {
     originInput.value = DEFAULT_DSH_ORIGIN
+    autoConnectInput.checked = true
   }
 }
 
@@ -188,9 +191,9 @@ connectionForm.addEventListener('submit', async event => {
   }
   originInput.setCustomValidity('')
   try {
-    await chrome.storage.local.set({ [CONNECTION_SETTINGS_KEY]: { origin } })
+    await chrome.storage.local.set({ [CONNECTION_SETTINGS_KEY]: { origin, autoConnect: autoConnectInput.checked } })
     originInput.value = origin
-    connectionStatusNode.textContent = 'Connection address saved. Pair again from the extension popup.'
+    connectionStatusNode.textContent = 'Connection address saved. The extension connects automatically when Chrome starts; click Connect in the popup to pair now.'
     connectionStatusNode.dataset.error = 'false'
   } catch (error) {
     connectionStatusNode.textContent = error instanceof Error ? error.message : String(error)
