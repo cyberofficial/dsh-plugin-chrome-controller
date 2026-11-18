@@ -1600,6 +1600,91 @@ async function executeBrowserOperationNow(method, params, signal) {
         }
       })
     }
+    case 'page.waitForChange': {
+      const tabId = requireTabId(params.tabId)
+      const { action = 'wait', watchId, afterChange = 0, mode = 'text', attribute, expectedText } = params
+      if (!['arm', 'wait', 'stop'].includes(action)) throw new Error('action must be arm, wait, or stop')
+      if (watchId !== undefined && (typeof watchId !== 'string' || !/^[a-f0-9-]{36}$/u.test(watchId))) {
+        throw new Error('watchId must be an ID returned by arm')
+      }
+      if (action === 'arm' && watchId !== undefined) throw new Error('arm does not accept watchId')
+      if (action === 'stop' && watchId === undefined) throw new Error('stop requires watchId')
+      if (watchId !== undefined && [params.selector, params.mode, attribute].some(value => value !== undefined)) {
+        throw new Error('The watchId already identifies the selector, mode, and attribute')
+      }
+      if (params.afterChange !== undefined && (action !== 'wait' || watchId === undefined
+        || !Number.isSafeInteger(afterChange) || afterChange < 0)) {
+        throw new Error('afterChange requires an armed watch and a nonnegative integer')
+      }
+      if (action !== 'wait' && (expectedText !== undefined || params.timeoutMs !== undefined)) {
+        throw new Error('expectedText and timeoutMs apply to wait')
+      }
+      const selector = watchId === undefined ? requireCssSelector(params.selector) : undefined
+      const watchLifetimeMs = 600_000
+      const timeoutMs = params.timeoutMs ?? watchLifetimeMs
+      const maxChars = 10_000
+      if (!['text', 'value', 'attribute'].includes(mode)) {
+        throw new Error('mode must be text, value, or attribute')
+      }
+      if (mode === 'attribute') {
+        if (typeof attribute !== 'string' || !/^[^\s]+$/u.test(attribute) || attribute.length > 256) {
+          throw new Error('attribute must be a non-empty attribute name of at most 256 characters')
+        }
+      } else if (attribute !== undefined) {
+        throw new Error('attribute requires attribute mode')
+      }
+      if (expectedText !== undefined && (typeof expectedText !== 'string' || expectedText.length > maxChars)) {
+        throw new Error('expectedText must be a string of at most ' + String(maxChars) + ' characters')
+      }
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > watchLifetimeMs) {
+        throw new Error('timeoutMs must be an integer between 1 and ' + String(watchLifetimeMs))
+      }
+      const query = Object.fromEntries(Object.entries({
+        action, watchId, afterChange, selector, mode, attribute, expectedText, maxChars, watchLifetimeMs,
+      }).filter(([, value]) => value !== undefined))
+      if (action === 'arm' || action === 'stop') {
+        if (action === 'arm') query.watchId = crypto.randomUUID()
+        const result = await runInFrame(tabId, 0, elementChangePayload, [query])
+        if (result?.error !== undefined) throw new Error(result.error)
+        if (result === undefined) throw new Error('Chrome returned no element watch result')
+        return { tabId, ...result }
+      }
+      const startedAt = Date.now()
+      const deadline = startedAt + timeoutMs
+      const waitSignal = signal ?? new AbortController().signal
+      let documentId
+      let previousValue
+      do {
+        waitSignal.throwIfAborted()
+        const target = documentId === undefined ? { tabId, frameIds: [0] } : { tabId, documentIds: [documentId] }
+        const [sample] = await chrome.scripting.executeScript({
+          target,
+          func: elementChangePayload,
+          args: [query],
+        })
+        waitSignal.throwIfAborted()
+        if (sample?.documentId === undefined || sample.result === undefined) {
+          throw new Error('Chrome returned no element change sample')
+        }
+        documentId = sample.documentId
+        const { value, error, change, missedChanges } = sample.result
+        if (error !== undefined) throw new Error(error)
+        const waitedMs = Date.now() - startedAt
+        if (waitedMs >= timeoutMs) break
+        if (change !== undefined) {
+          return { tabId, watchId, changed: true, ...change, missedChanges, waitedMs }
+        }
+        if (watchId === undefined && value !== undefined) {
+          if (previousValue === undefined) {
+            previousValue = value
+          } else if (value !== previousValue && (expectedText === undefined || value === expectedText)) {
+            return { tabId, selector, mode, changed: true, previousValue, value, waitedMs }
+          }
+        }
+        await delay(Math.max(0, Math.min(DEFAULT_ELEMENT_WAIT_POLL_INTERVAL_MS, deadline - Date.now())), waitSignal)
+      } while (Date.now() < deadline)
+      throw new Error('Timed out waiting for the selected element to change')
+    }
     case 'page.snapshot': {
       const tabId = requireTabId(params.tabId)
       const maxChars = Number.isInteger(params.maxChars)
@@ -2421,6 +2506,98 @@ async function runInFrame(tabId, frameId, func, args, world = 'ISOLATED') {
   const first = results[0]
   if (first === undefined) throw new Error('The frame returned no result')
   return first.result
+}
+
+/** Sample an element or manage its change history in Chrome's isolated world. */
+function elementChangePayload(query) {
+  const { action, watchId, selector, mode, attribute, maxChars, watchLifetimeMs } = query
+
+  function readValue() {
+    let matches
+    try {
+      matches = document.querySelectorAll(selector)
+    } catch {
+      return { error: 'The CSS selector is invalid' }
+    }
+    if (matches.length === 0) return {}
+    if (matches.length !== 1) return { error: 'The CSS selector matched more than one element' }
+    const element = matches[0]
+    let value
+    if (mode === 'attribute') {
+      value = element.getAttribute(attribute)
+    } else if (mode === 'value') {
+      if (typeof element.value !== 'string') return { error: 'The selected element has no string value' }
+      value = element.value
+    } else {
+      value = (element.textContent ?? '').trim()
+    }
+    if (value !== null && value.length > maxChars) {
+      return { error: 'The selected element value exceeds ' + String(maxChars) + ' characters' }
+    }
+    return { value }
+  }
+
+  if (watchId === undefined) return readValue()
+  const watches = globalThis.__dshElementChangeWatches ??= new Map()
+  const existing = watches.get(watchId)
+  if (existing !== undefined && existing.expiresAt <= Date.now()) existing.stop()
+  const watch = watches.get(watchId)
+  if (action === 'stop') {
+    watch?.stop()
+    return { watchId, stopped: watch !== undefined }
+  }
+  if (action === 'wait') {
+    if (watch === undefined) return { error: 'The element watch expired, was stopped, or its document changed. Arm a new watch.' }
+    watch.expiresAt = Date.now() + watchLifetimeMs
+    watch.record()
+    const { afterChange, expectedText } = query
+    const change = watch.history.find(entry => entry.changeNumber > afterChange
+      && (expectedText === undefined || entry.value === expectedText))
+    const oldestChange = watch.history[0]?.changeNumber ?? 1
+    if (change !== undefined) return { change, missedChanges: Math.max(0, oldestChange - afterChange - 1) }
+    return { error: watch.error }
+  }
+
+  const initial = readValue()
+  if (initial.error !== undefined) return initial
+  for (const active of watches.values()) {
+    if (active.expiresAt <= Date.now()) active.stop()
+  }
+  if (watches.size >= 8) return { error: 'This page already has 8 armed element watches. Stop one before arming another.' }
+
+  let previousValue = initial.value
+  let changeNumber = 0
+  const history = []
+  const entry = { history, expiresAt: Date.now() + watchLifetimeMs }
+  function record() {
+    if (entry.expiresAt <= Date.now()) {
+      entry.stop()
+      return
+    }
+    const { value, error } = readValue()
+    entry.error = error
+    if (value === undefined || value === previousValue) return
+    if (previousValue !== undefined) {
+      history.push({ changeNumber: ++changeNumber, previousValue, value, observedAt: Date.now() })
+      if (history.length > 30) history.shift()
+    }
+    previousValue = value
+  }
+  const observer = new MutationObserver(record)
+  observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true })
+  document.addEventListener('input', record, true)
+  document.addEventListener('change', record, true)
+  const timer = setInterval(record, 200)
+  entry.record = record
+  entry.stop = () => {
+    observer.disconnect()
+    document.removeEventListener('input', record, true)
+    document.removeEventListener('change', record, true)
+    clearInterval(timer)
+    watches.delete(watchId)
+  }
+  watches.set(watchId, entry)
+  return { watchId, armed: true, initialValue: initial.value, historyLimit: 30, idleTimeoutMs: watchLifetimeMs }
 }
 
 /** Runs inside the target frame: snapshot payload plus a best-effort grid-cell dump. */
