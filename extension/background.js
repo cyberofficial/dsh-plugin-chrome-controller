@@ -2731,7 +2731,13 @@ async function readNoteStoreForAddress(address) {
 }
 
 function requireNoteXPath(xpath) {
-  if (typeof xpath !== 'string' || !xpath.startsWith('/') || xpath.length > 4096 || /[\r\n]/u.test(xpath)) {
+  // Chained frame paths look like `/main/frame >> /in/frame/element`; every
+  // segment must be an absolute XPath evaluated in its parent document.
+  if (typeof xpath !== 'string' || xpath.length > 4096 || /[\r\n]/u.test(xpath)) {
+    throw new Error('This element does not have a supported XPath. Pick another element.')
+  }
+  const segments = xpath.split(' >> ')
+  if (!segments.every(segment => segment.startsWith('/') && segment.length > 1)) {
     throw new Error('This element does not have a supported XPath. Pick another element.')
   }
   return xpath
@@ -2776,13 +2782,22 @@ async function resumeElementNotePicker(tabId, draft) {
     const viewKey = noteViewKey(tabId)
     const pending = await chrome.storage.session.get([key, viewKey])
     if (pending[key]?.token !== draft.token || pending[viewKey]?.token !== draft.pickerToken) return false
-    const picker = { mode: 'pick', token: draft.pickerToken, address, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    const picker = { mode: 'pick', token: draft.pickerToken, address, frameId: draft.frameId ?? 0, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
     await chrome.storage.session.set({ [key]: picker, [viewKey]: picker })
+    const frameId = typeof draft.frameId === 'number' ? draft.frameId : 0
+    let frameUrl = tab.url
+    if (frameId !== 0) {
+      const frame = await chrome.webNavigation.getFrame({ tabId, frameId }).catch(() => undefined)
+      if (frame?.url !== undefined) frameUrl = frame.url
+    }
+    const target = typeof draft.documentId === 'string' && frameId === 0
+      ? { tabId, documentIds: [draft.documentId] }
+      : { tabId, frameIds: [frameId] }
     const [result] = await chrome.scripting.executeScript({
-      target: { tabId, documentIds: [draft.documentId] },
+      target,
       func: startElementNoteView,
       args: [{ mode: 'pick', token: picker.token, notes: [], lifetimeMs: ELEMENT_NOTE_DRAFT_MS,
-        corner: draft.corner, expectedUrl: tab.url }],
+        corner: draft.corner, expectedUrl: frameUrl }],
     })
     return result?.result === true
   } catch {
@@ -2806,22 +2821,258 @@ async function refreshOpenNoteLists(pageKey) {
   }))
 }
 
-async function openElementNoteView(tab, mode, useContextTarget = false) {
+/**
+ * Main-world key guard for note pick mode. While the picker host element exists
+ * in the document, arrow keys are swallowed at window-capture so apps like
+ * Excel Online cannot take them over. stopPropagation (not immediate) keeps the
+ * picker's own isolated-world handler working. Once the picker closes and its
+ * host is removed, keys flow to the page again.
+ */
+function installNoteKeyGuard() {
+  if (globalThis.__dshNoteKeyGuardInstalled === true) return
+  globalThis.__dshNoteKeyGuardInstalled = true
+  window.addEventListener('keydown', event => {
+    if (!event.isTrusted) return
+    if (document.getElementById('dsh-note-picker-host') === null) return
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+    event.preventDefault()
+    event.stopPropagation()
+  }, true)
+}
+
+/** Inject the note view into one frame of a tab. `view` carries token/mode/frame state. */
+async function startPickerInFrame(tabId, view) {
+  const frameId = view.frameId ?? 0
+  let expectedUrl
+  if (frameId === 0) {
+    expectedUrl = (await chrome.tabs.get(tabId)).url
+  } else {
+    expectedUrl = (await chrome.webNavigation.getFrame({ tabId, frameId }).catch(() => undefined))?.url
+  }
+  if (view.mode === 'pick') {
+    // Take over the arrow keys in the page's main world while picking.
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: installNoteKeyGuard,
+    }).catch(() => {})
+  }
+  const started = await runInFrame(tabId, frameId, startElementNoteView, [{
+    mode: view.mode,
+    token: view.token,
+    notes: view.mode === 'list' ? view.notes ?? [] : [],
+    lifetimeMs: ELEMENT_NOTE_DRAFT_MS,
+    expectedUrl,
+    useContextTarget: view.useContextTarget ?? false,
+    frameStack: view.frameStack ?? [],
+    parentFrameId: view.parentFrameId ?? null,
+  }])
+  if (started !== true) throw new Error('Could not open element notes on this frame')
+}
+
+/**
+ * Open note mode/list in one frame. Popup Note Mode starts in the top frame;
+ * the user drills into a highlighted iframe with ArrowRight and back out with
+ * ArrowLeft (frameStack holds one XPath segment per entered frame). A
+ * right-click on a specific frame starts the picker in that frame with the
+ * stack precomputed.
+ */
+async function openElementNoteView(tab, mode, useContextTarget = false, frameId = 0, frameStack = [], parentFrameId = null) {
   const tabId = requireTabId(tab?.id)
   const address = await elementNoteAddress(tab.url)
   if (address === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
   const token = crypto.randomUUID()
   const stored = await readNoteStoreForAddress(address)
   const notes = mode === 'list' ? collectElementNotes(stored, address) : []
-  const view = { mode, token, address, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+  const view = {
+    mode, token, address, notes, useContextTarget,
+    frameId, frameStack, parentFrameId,
+    expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+  }
   const state = { [noteViewKey(tabId)]: view }
   if (mode === 'pick') state[noteDraftKey(tabId)] = view
   await chrome.storage.session.set(state)
-  const started = await runInFrame(tabId, 0, startElementNoteView, [{
-    mode, token, notes, lifetimeMs: ELEMENT_NOTE_DRAFT_MS, expectedUrl: tab.url, useContextTarget,
-  }])
-  if (started !== true) throw new Error('Could not open element notes on this page')
+  await startPickerInFrame(tabId, view)
   return { ok: true }
+}
+
+/**
+ * Runs in a parent frame: return the absolute XPath of the <iframe> that hosts
+ * the child frame with the given URL. Matches by normalized src, then by
+ * contentDocument location for same-origin frames, then falls back to a sole
+ * iframe when the parent has exactly one.
+ */
+function matchFrameXPath(childUrl) {
+  function absoluteXPath(element) {
+    const parts = []
+    for (let node = element; node !== null; node = node.parentElement) {
+      const named = node.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        && /^[a-z][a-z0-9_-]*$/i.test(node.localName)
+      let index = 1
+      for (let sibling = node.previousElementSibling; sibling !== null; sibling = sibling.previousElementSibling) {
+        if (!named || (sibling.namespaceURI === node.namespaceURI && sibling.localName === node.localName)) index++
+      }
+      parts.unshift((named ? node.localName : '*') + '[' + index + ']')
+    }
+    return '/' + parts.join('/')
+  }
+  const normalize = url => {
+    try {
+      const u = new URL(url, location.href)
+      return u.origin + u.pathname
+    } catch {
+      return String(url)
+    }
+  }
+  const target = normalize(childUrl)
+  const frames = [...document.querySelectorAll('iframe, frame')]
+  let match = frames.find(f => {
+    const src = f.getAttribute('src')
+    return src !== null && src !== '' && normalize(src) === target
+  })
+  if (match === undefined) {
+    match = frames.find(f => {
+      try {
+        return f.contentDocument !== null && normalize(f.contentDocument.location.href) === target
+      } catch {
+        return false
+      }
+    })
+  }
+  if (match === undefined && frames.length === 1) match = frames[0]
+  return match === undefined ? null : absoluteXPath(match)
+}
+
+/**
+ * XPath segments of the frames above `frameId`, outermost first, so a picked
+ * element in that frame becomes `/seg1 >> /seg2 >> /leaf`.
+ */
+async function frameChainSegments(tabId, frameId) {
+  try {
+    if (frameId === 0) return []
+    const frames = await chrome.webNavigation.getAllFrames({ tabId })
+    const byId = new Map(frames.map(f => [f.frameId, f]))
+    const chain = []
+    let current = byId.get(frameId)
+    while (current !== undefined && current.frameId !== 0) {
+      chain.unshift(current)
+      current = byId.get(current.parentFrameId)
+    }
+    if (current === undefined || chain.length === 0) return []
+    const segments = []
+    for (const frame of chain) {
+      const xp = await runInFrame(tabId, frame.parentFrameId, matchFrameXPath, [frame.url])
+      if (typeof xp !== 'string' || !xp.startsWith('/')) return []
+      segments.push(xp)
+    }
+    return segments
+  } catch {
+    return []
+  }
+}
+
+/** Runs in a parent frame: record each child frame's URL onto its <iframe> via postMessage. */
+function noteFrameProbeListener() {
+  if (globalThis.__dshNoteProbeListener === true) return
+  globalThis.__dshNoteProbeListener = true
+  window.addEventListener('message', event => {
+    const url = event.data?.dshNoteFrameProbe
+    if (typeof url !== 'string') return
+    for (const f of document.querySelectorAll('iframe, frame')) {
+      if (f.contentWindow === event.source) f.dataset.dshChildUrl = url
+    }
+  })
+}
+
+/** Runs in a child frame: tell the parent this frame's URL (works cross-origin). */
+function noteFrameProbe() {
+  try { parent.postMessage({ dshNoteFrameProbe: location.href }, '*') } catch {}
+}
+
+/**
+ * Given an <iframe> element's XPath in `parentFrameId`, find the child frame it
+ * hosts. Child frames announce their URL via postMessage (matched by
+ * contentWindow identity, so cross-origin frames work); src and sole-child are
+ * fallbacks.
+ */
+async function resolveChildFrameId(tabId, parentFrameId, iframeXPath) {
+  const frames = await chrome.webNavigation.getAllFrames({ tabId })
+  const children = frames.filter(f => f.parentFrameId === parentFrameId)
+  if (children.length === 0) return undefined
+  await runInFrame(tabId, parentFrameId, noteFrameProbeListener, []).catch(() => {})
+  await Promise.allSettled(children.map(f => runInFrame(tabId, f.frameId, noteFrameProbe, []).catch(() => {})))
+  const normalize = url => {
+    try {
+      const u = new URL(url, 'http://placeholder.invalid/')
+      return u.origin + u.pathname
+    } catch {
+      return String(url)
+    }
+  }
+  // Probes are async; poll briefly for the dataset to appear.
+  let childUrl = null
+  let src = null
+  for (let attempt = 0; attempt < 10 && childUrl === null; attempt++) {
+    const info = await runInFrame(tabId, parentFrameId, xpath => {
+      try {
+        const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+        return el instanceof Element ? { childUrl: el.dataset.dshChildUrl ?? null, src: el.getAttribute('src') } : null
+      } catch {
+        return null
+      }
+    }, [iframeXPath]).catch(() => null)
+    if (info !== null) {
+      childUrl = info.childUrl
+      src = info.src
+    }
+    if (childUrl === null) await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  let match
+  if (typeof childUrl === 'string' && childUrl !== '') {
+    match = children.find(f => normalize(f.url) === normalize(childUrl))
+  }
+  if (match === undefined && typeof src === 'string' && src !== '') {
+    match = children.find(f => normalize(f.url) === normalize(src))
+  }
+  if (match === undefined && children.length === 1) match = children[0]
+  return match?.frameId
+}
+
+/**
+ * Drill into a highlighted iframe (ArrowRight) or back out to the parent frame
+ * (ArrowLeft) while note mode is open. Keeps the same picker token; frameStack
+ * accumulates one XPath segment per entered frame.
+ */
+async function handleFrameDrill(tabId, key, draft, sender, message) {
+  const enter = message.type === 'DSH_NOTE_ENTER_FRAME'
+  if (enter) {
+    const iframeXPath = requireNoteXPath(message.xpath)
+    const childFrameId = await resolveChildFrameId(tabId, sender.frameId, iframeXPath)
+    if (childFrameId === undefined) throw new Error('That element is not a frame, or its frame could not be found')
+    const view = {
+      ...draft,
+      frameId: childFrameId,
+      parentFrameId: sender.frameId,
+      frameStack: [...(draft.frameStack ?? []), iframeXPath],
+      expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+    }
+    await chrome.storage.session.set({ [key]: view, [noteViewKey(tabId)]: view })
+    await startPickerInFrame(tabId, view)
+    return { ok: true, frameId: childFrameId }
+  }
+  const parentFrameId = draft.parentFrameId
+  if (parentFrameId === null || parentFrameId === undefined) throw new Error('Already at the top frame')
+  const stack = (draft.frameStack ?? []).slice(0, -1)
+  const view = {
+    ...draft,
+    frameId: parentFrameId,
+    parentFrameId: parentFrameId === 0 ? null : (await chrome.webNavigation.getFrame({ tabId, frameId: parentFrameId }).catch(() => undefined))?.parentFrameId ?? null,
+    frameStack: stack,
+    expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+  }
+  await chrome.storage.session.set({ [key]: view, [noteViewKey(tabId)]: view })
+  await startPickerInFrame(tabId, view)
+  return { ok: true, frameId: parentFrameId }
 }
 
 async function handleElementNoteMessage(message, sender) {
@@ -2856,7 +3107,8 @@ async function handleElementNoteMessage(message, sender) {
   const deletingSaved = message.type === 'DSH_NOTE_DELETE_SAVED'
   const fromList = editingSaved || deletingSaved
   const fromPage = fromList || message.type === 'DSH_NOTE_SELECTED'
-  if (fromPage ? sender.frameId !== 0 || sender.tab === undefined : !fromEditor) {
+    || message.type === 'DSH_NOTE_ENTER_FRAME' || message.type === 'DSH_NOTE_LEAVE_FRAME'
+  if (fromPage ? sender.tab === undefined : !fromEditor) {
     throw new Error('Invalid note request')
   }
   const tabId = requireTabId(fromPage ? sender.tab.id : message.tabId)
@@ -2870,7 +3122,15 @@ async function handleElementNoteMessage(message, sender) {
 
   if (fromList && draft.mode !== 'list') throw new Error('Open Page Notes from the extension popup')
   if (fromPage) {
-    const xpath = requireNoteXPath(message.xpath)
+    // The picker runs in a single frame at a time; the message must come from
+    // that frame. The note stays keyed to the top page, with the entered-frame
+    // chain folded into the XPath (`/frame >> /element`).
+    if (sender.frameId !== (draft.frameId ?? 0)) throw new Error('Invalid note request')
+    if (message.type === 'DSH_NOTE_ENTER_FRAME' || message.type === 'DSH_NOTE_LEAVE_FRAME') {
+      return handleFrameDrill(tabId, key, draft, sender, message)
+    }
+    const leafXPath = requireNoteXPath(message.xpath)
+    const xpath = [...(draft.frameStack ?? []), leafXPath].join(' >> ')
     if (draft.xpath !== undefined) throw new Error('An editor is already open for this selection')
     const address = await elementNoteAddress(sender.tab.url)
     if (address?.pageKey !== draft.address.pageKey) {
@@ -2899,6 +3159,7 @@ async function handleElementNoteMessage(message, sender) {
       editorDraft.address = address
       editorDraft.pickerToken = draft.token
       editorDraft.documentId = sender.documentId
+      editorDraft.frameId = sender.frameId
       editorDraft.corner = typeof message.corner === 'string' && /^(top|bottom)-(left|right)$/u.test(message.corner)
         ? message.corner : 'top-right'
     }
@@ -2936,6 +3197,7 @@ async function handleElementNoteMessage(message, sender) {
       }, { frameId: 0 }).catch(() => {})
     }
   }
+
   const canResume = draft.pickerToken !== undefined && typeof draft.documentId === 'string'
   const resumed = canResume && await resumeElementNotePicker(tabId, draft)
   if (!resumed) {
@@ -2946,14 +3208,16 @@ async function handleElementNoteMessage(message, sender) {
 }
 
 /** Runs in Chrome's isolated world. Notes are edited in the extension window. */
-function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl, useContextTarget = false }) {
+function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl, useContextTarget = false, frameStack = [], parentFrameId = null }) {
   if (document.contentType !== 'text/html') throw new Error('Element notes require an HTML document')
-  if (expectedUrl !== undefined && location.href !== expectedUrl) return false
+  // Subframe pickers must not bail on the tab URL; only the top frame matches it.
+  if (expectedUrl !== undefined && window === window.top && location.href !== expectedUrl) return false
   globalThis.__dshStopNotePicker?.()
   const controller = new AbortController()
   const listen = { signal: controller.signal }
   const pageUrl = location.href
   const host = document.createElement('div')
+  host.id = 'dsh-note-picker-host'
   for (const [name, value] of Object.entries({
     all: 'initial', position: 'fixed', inset: '0', 'z-index': '2147483647',
     'pointer-events': 'none', overflow: 'hidden',
@@ -3082,14 +3346,39 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         if (event.isTrusted) void openSelection()
       }, listen)
     }
+    // Click-to-drill into a highlighted iframe (arrow keys can be swallowed by
+    // apps like Excel Online, so the buttons are the reliable path). While
+    // inside a frame only that frame's picker is active; Back returns up.
+    const enterFrame = makeButton('Enter frame')
+    header.insertBefore(enterFrame, close)
+    enterFrame.addEventListener('click', event => {
+      if (!event.isTrusted || selected === null) return
+      if (selected.localName !== 'iframe' && selected.localName !== 'frame') return
+      void chrome.runtime.sendMessage({ type: 'DSH_NOTE_ENTER_FRAME', token, xpath: absoluteXPath(selected) })
+        .then(result => { if (result?.ok === true) stop() }, () => {})
+    }, listen)
+    const back = parentFrameId === null || parentFrameId === undefined ? null : makeButton('Back')
+    if (back !== null) {
+      header.insertBefore(back, close)
+      back.addEventListener('click', event => {
+        if (event.isTrusted) void chrome.runtime.sendMessage({ type: 'DSH_NOTE_LEAVE_FRAME', token })
+          .then(result => { if (result?.ok === true) stop() }, () => {})
+      }, listen)
+    }
 
     function renderSelection() {
       drawOutline(outline, selected)
       const target = selected === null ? 'an element' : '<' + selected.localName + '>'
-      status.textContent = contextSelection && selected !== null
-        ? 'Selected ' + target + '. Up widens, Down narrows.'
-        : 'Click to select ' + target + '. Up widens, Down narrows.'
+      const isFrame = selected !== null && (selected.localName === 'iframe' || selected.localName === 'frame')
+      const chainNote = frameStack.length > 0 ? 'In frame ' + frameStack[frameStack.length - 1] + '. ' : ''
+      let hint = 'Up widens, Down narrows.'
+      if (isFrame) hint = 'Use "Enter frame" (or Right) to go inside it. ' + hint
+      if (back !== null) hint = 'Use "Back" (or Left) to go up a frame. ' + hint
+      status.textContent = chainNote + (contextSelection && selected !== null
+        ? 'Selected ' + target + '. ' + hint
+        : 'Click to select ' + target + '. ' + hint)
       if (useSelection !== null) useSelection.disabled = selected === null || opening
+      enterFrame.disabled = selected === null || !isFrame || opening
     }
 
     function updateHover(event) {
@@ -3101,6 +3390,9 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       try { hit = document.elementFromPoint(event.clientX, event.clientY) }
       finally { shield.style.pointerEvents = 'auto' }
       if (hit === host) hit = null
+      // Pointer over the picker UI (toolbar/dialog): keep the current selection
+      // so toolbar buttons like "Enter frame" still see it.
+      if (hit === null) return
       // Keep the keyboard choice until the pointer moves to another element.
       if (hit === hovered && selected?.isConnected !== false) return
       hovered = hit
@@ -3132,16 +3424,70 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     shield.addEventListener('pointerleave', () => {
       if (!contextSelection) outline.style.display = 'none'
     }, listen)
+    // Inline confirm when an iframe is clicked: "Go inside this frame?"
+    function askEnterFrame() {
+      if (opening || selected === null) return
+      if (selected.localName !== 'iframe' && selected.localName !== 'frame') return
+      const dialog = document.createElement('div')
+      Object.assign(dialog.style, {
+        position: 'absolute', left: '50%', top: '40%', transform: 'translate(-50%,-50%)',
+        background: '#172337', color: '#fff', borderRadius: '8px', padding: '14px',
+        boxShadow: '0 2px 12px rgba(0,0,0,.25)', font: '14px/1.4 system-ui, sans-serif',
+        pointerEvents: 'auto', textAlign: 'center', zIndex: '1',
+      })
+      const label = document.createElement('div')
+      label.textContent = 'Go inside this frame?'
+      label.style.marginBottom = '10px'
+      const row = document.createElement('div')
+      row.style.display = 'flex'
+      row.style.gap = '8px'
+      row.style.justifyContent = 'center'
+      const yes = makeButton('Enter frame')
+      const no = makeButton('Stay')
+      row.append(yes, no)
+      dialog.append(label, row)
+      shadow.appendChild(dialog)
+      const dismiss = () => dialog.remove()
+      no.addEventListener('click', event => { if (event.isTrusted) dismiss() }, listen)
+      yes.addEventListener('click', event => {
+        if (!event.isTrusted) return
+        dismiss()
+        void chrome.runtime.sendMessage({ type: 'DSH_NOTE_ENTER_FRAME', token, xpath: absoluteXPath(selected) })
+          .then(result => { if (result?.ok === true) stop() }, () => {})
+      }, listen)
+    }
+
     shield.addEventListener('click', event => {
       event.preventDefault()
       event.stopPropagation()
       if (!event.isTrusted || opening) return
       updateHover(event)
+      // Clicking an iframe asks whether to go inside instead of opening the
+      // note editor for the frame element itself.
+      if (selected !== null && (selected.localName === 'iframe' || selected.localName === 'frame')) {
+        askEnterFrame()
+        return
+      }
       void openSelection()
     }, listen)
     window.addEventListener('keydown', event => {
-      if (!event.isTrusted || event.target === host || opening || selected === null
-        || !['ArrowUp', 'ArrowDown'].includes(event.key)) return
+      if (!event.isTrusted || event.target === host || opening) return
+      if (event.key === 'ArrowRight' && selected !== null
+        && (selected.localName === 'iframe' || selected.localName === 'frame')) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        void chrome.runtime.sendMessage({ type: 'DSH_NOTE_ENTER_FRAME', token, xpath: absoluteXPath(selected) })
+          .then(result => { if (result?.ok === true) stop() }, () => {})
+        return
+      }
+      if (event.key === 'ArrowLeft' && parentFrameId !== null && parentFrameId !== undefined) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        void chrome.runtime.sendMessage({ type: 'DSH_NOTE_LEAVE_FRAME', token })
+          .then(result => { if (result?.ok === true) stop() }, () => {})
+        return
+      }
+      if (selected === null || !['ArrowUp', 'ArrowDown'].includes(event.key)) return
       event.preventDefault()
       event.stopImmediatePropagation()
       if (event.key === 'ArrowUp') {
@@ -3179,9 +3525,22 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
 
     function lookup(xpath) {
       try {
-        const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
-        const element = result.singleNodeValue
-        return element instanceof Element && element !== host ? element : null
+        // Chained frame paths (`/frame >> /element`) resolve segment by segment,
+        // descending into same-origin iframe documents; cross-origin frames are
+        // not reachable from page JS and report as not found here.
+        const segments = xpath.split(' >> ')
+        let doc = document
+        let element = null
+        for (const segment of segments) {
+          const result = doc.evaluate(segment, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+          element = result.singleNodeValue
+          if (!(element instanceof Element) || element === host) return null
+          const frameDoc = element instanceof HTMLIFrameElement || element instanceof HTMLFrameElement
+            ? element.contentDocument
+            : null
+          doc = frameDoc ?? document
+        }
+        return element
       } catch {
         return null
       }
@@ -4793,8 +5152,16 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId !== ELEMENT_NOTE_MENU_ID || tab === undefined) return
-  const useContextTarget = (info.frameId ?? 0) === 0 && (info.pageUrl === undefined || info.pageUrl === tab.url)
-  void openElementNoteView(tab, 'pick', useContextTarget).catch(() => {
+  // Open the picker in the frame the menu was invoked on, so note mode works
+  // inside iframes; the captured context target is validated per frame below.
+  const frameId = info.frameId ?? 0
+  void (async () => {
+    const tabId = requireTabId(tab.id)
+    const stack = await frameChainSegments(tabId, frameId)
+    const parent = frameId === 0 ? null
+      : (await chrome.webNavigation.getFrame({ tabId, frameId }).catch(() => undefined))?.parentFrameId ?? null
+    await openElementNoteView(tab, 'pick', true, frameId, stack, parent)
+  })().catch(() => {
     console.warn('Could not open DSH Note Mode on this page')
   })
 })
@@ -4819,7 +5186,8 @@ chrome.alarms.onAlarm.addListener(alarm => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (['DSH_NOTE_MODE', 'DSH_NOTE_LIST', 'DSH_NOTE_ALL', 'DSH_NOTE_SELECTED',
-    'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_EDITOR'].includes(message?.type)) {
+    'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_EDITOR',
+    'DSH_NOTE_ENTER_FRAME', 'DSH_NOTE_LEAVE_FRAME'].includes(message?.type)) {
     void handleElementNoteMessage(message, sender).then(sendResponse, error => sendResponse({
       ok: false,
       error: error instanceof Error ? error.message : String(error),

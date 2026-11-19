@@ -76,8 +76,11 @@
   globalThis.__dshBuildCursorPath = buildCursorPath
 
   if (typeof document === 'undefined' || typeof chrome === 'undefined' || chrome.runtime?.id === undefined) return
-  if (globalThis.__dshOverlayInstalled === true) return
-  globalThis.__dshOverlayInstalled = true
+  // The context-menu capture must run in every frame so note mode works inside
+  // iframes; the visual cursor overlay stays on the top frame only.
+  const isTopFrame = window === window.top
+  if (isTopFrame && globalThis.__dshOverlayInstalled === true) return
+  if (isTopFrame) globalThis.__dshOverlayInstalled = true
 
   window.addEventListener('pointerdown', () => { delete globalThis.__dshNoteContext }, { capture: true, passive: true })
   window.addEventListener('contextmenu', event => {
@@ -194,6 +197,11 @@
   }
 
   chrome.runtime.onMessage.addListener(message => {
+    if (message?.type === 'DSH_NOTE_STOP') {
+      globalThis.__dshStopNotePicker?.()
+      return false
+    }
+    if (!isTopFrame) return false
     if (message?.type === 'DSH_CURSOR_MOVE') {
       install()
       moveTo(
