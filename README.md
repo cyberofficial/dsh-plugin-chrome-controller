@@ -41,7 +41,7 @@ Once paired, the extension keeps its Manifest V3 service worker alive on its own
 
 ## Element notes
 
-1. Open the extension popup and click **Note Mode**.
+1. Open the extension popup and click **Note Mode**, or right-click an element and choose **DSH Note Mode**. When the right-click target is available, the picker highlights it and shows **Add note**. Otherwise, select an element with the picker.
 2. Point at an element. Press Up to select a larger container or Down to narrow the selection, then click to use the highlighted area. Use the position menu to move the controls to any corner of the viewport.
 3. Write your note and click **Save note**. Note Mode resumes so you can select another element. Click **Done** or press Escape when you're finished.
 4. In DSH, ask "Read my notes for this site" to find notes from any page on the same hostname and port, or ask for notes on this exact page.

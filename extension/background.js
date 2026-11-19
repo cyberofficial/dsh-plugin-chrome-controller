@@ -6,6 +6,7 @@ const DISCONNECT_PATH = '/dsh-browser-extension/disconnect'
 const SESSION_KEY = 'dshBrowserSession'
 const ELEMENT_NOTES_KEY = 'dshElementNotes'
 const ELEMENT_NOTE_DRAFT_MS = 10 * 60_000
+const ELEMENT_NOTE_MENU_ID = 'dsh-element-note-mode'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
@@ -2805,6 +2806,24 @@ async function refreshOpenNoteLists(pageKey) {
   }))
 }
 
+async function openElementNoteView(tab, mode, useContextTarget = false) {
+  const tabId = requireTabId(tab?.id)
+  const address = await elementNoteAddress(tab.url)
+  if (address === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
+  const token = crypto.randomUUID()
+  const stored = await readNoteStoreForAddress(address)
+  const notes = mode === 'list' ? collectElementNotes(stored, address) : []
+  const view = { mode, token, address, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+  const state = { [noteViewKey(tabId)]: view }
+  if (mode === 'pick') state[noteDraftKey(tabId)] = view
+  await chrome.storage.session.set(state)
+  const started = await runInFrame(tabId, 0, startElementNoteView, [{
+    mode, token, notes, lifetimeMs: ELEMENT_NOTE_DRAFT_MS, expectedUrl: tab.url, useContextTarget,
+  }])
+  if (started !== true) throw new Error('Could not open element notes on this page')
+  return { ok: true }
+}
+
 async function handleElementNoteMessage(message, sender) {
   if (sender.id !== chrome.runtime.id) throw new Error('Invalid note request')
   const popup = chrome.runtime.getURL('popup.html')
@@ -2830,22 +2849,7 @@ async function handleElementNoteMessage(message, sender) {
   if (message.type === 'DSH_NOTE_MODE' || message.type === 'DSH_NOTE_LIST') {
     if (sender.url !== popup) throw new Error('Open the notes from the extension popup')
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-    const tabId = requireTabId(tab?.id)
-    const address = await elementNoteAddress(tab.url)
-    if (address === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
-    const mode = message.type === 'DSH_NOTE_MODE' ? 'pick' : 'list'
-    const token = crypto.randomUUID()
-    const stored = await readNoteStoreForAddress(address)
-    const notes = mode === 'list' ? collectElementNotes(stored, address) : []
-    const view = { mode, token, address, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
-    const state = { [noteViewKey(tabId)]: view }
-    if (mode === 'pick') state[noteDraftKey(tabId)] = view
-    await chrome.storage.session.set(state)
-    const started = await runInFrame(tabId, 0, startElementNoteView, [{
-      mode, token, notes, lifetimeMs: ELEMENT_NOTE_DRAFT_MS, expectedUrl: tab.url,
-    }])
-    if (started !== true) throw new Error('Could not open element notes on this page')
-    return { ok: true }
+    return openElementNoteView(tab, message.type === 'DSH_NOTE_MODE' ? 'pick' : 'list')
   }
 
   const editingSaved = message.type === 'DSH_NOTE_OPEN_SAVED'
@@ -2942,7 +2946,7 @@ async function handleElementNoteMessage(message, sender) {
 }
 
 /** Runs in Chrome's isolated world. Notes are edited in the extension window. */
-function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl }) {
+function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl, useContextTarget = false }) {
   if (document.contentType !== 'text/html') throw new Error('Element notes require an HTML document')
   if (expectedUrl !== undefined && location.href !== expectedUrl) return false
   globalThis.__dshStopNotePicker?.()
@@ -3062,18 +3066,36 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     Object.assign(shield.style, { position: 'absolute', inset: '0', pointerEvents: 'auto', cursor: 'crosshair' })
     const outline = makeOutline()
     shadow.append(shield, outline, toolbar)
-    let hovered = null
-    let selected = null
+    const captured = useContextTarget ? globalThis.__dshNoteContext : undefined
+    delete globalThis.__dshNoteContext
+    const age = captured === undefined ? Infinity : performance.now() - captured.time
+    const target = captured?.url === pageUrl && age >= 0 && age <= 60_000 ? captured.element.deref() : undefined
+    let hovered = target?.isConnected && target.ownerDocument === document ? target : null
+    let selected = hovered
+    let contextSelection = selected !== null
     const previousChildren = []
     let opening = false
+    const useSelection = selected === null ? null : makeButton('Add note')
+    if (useSelection !== null) {
+      header.insertBefore(useSelection, close)
+      useSelection.addEventListener('click', event => {
+        if (event.isTrusted) void openSelection()
+      }, listen)
+    }
 
     function renderSelection() {
       drawOutline(outline, selected)
       const target = selected === null ? 'an element' : '<' + selected.localName + '>'
-      status.textContent = 'Click to select ' + target + '. Up widens, Down narrows.'
+      status.textContent = contextSelection && selected !== null
+        ? 'Selected ' + target + '. Up widens, Down narrows.'
+        : 'Click to select ' + target + '. Up widens, Down narrows.'
+      if (useSelection !== null) useSelection.disabled = selected === null || opening
     }
 
     function updateHover(event) {
+      // Keep the right-click selection while the pointer travels to the toolbar.
+      if (contextSelection && selected?.isConnected) return
+      contextSelection = false
       shield.style.pointerEvents = 'none'
       let hit
       try { hit = document.elementFromPoint(event.clientX, event.clientY) }
@@ -3086,20 +3108,10 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       previousChildren.length = 0
     }
 
-    renderSelection()
-    shield.addEventListener('pointermove', event => {
-      if (opening) return
-      updateHover(event)
-      renderSelection()
-    }, listen)
-    shield.addEventListener('pointerleave', () => { outline.style.display = 'none' }, listen)
-    shield.addEventListener('click', async event => {
-      event.preventDefault()
-      event.stopPropagation()
-      if (!event.isTrusted || opening) return
-      updateHover(event)
-      if (selected === null) return
+    async function openSelection() {
+      if (opening || selected === null || !selected.isConnected) return
       opening = true
+      if (useSelection !== null) useSelection.disabled = true
       status.textContent = 'Opening note editor...'
       try {
         await openEditor('DSH_NOTE_SELECTED', absoluteXPath(selected))
@@ -3107,7 +3119,25 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error)
         opening = false
+        if (useSelection !== null) useSelection.disabled = false
       }
+    }
+
+    renderSelection()
+    shield.addEventListener('pointermove', event => {
+      if (opening) return
+      updateHover(event)
+      renderSelection()
+    }, listen)
+    shield.addEventListener('pointerleave', () => {
+      if (!contextSelection) outline.style.display = 'none'
+    }, listen)
+    shield.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!event.isTrusted || opening) return
+      updateHover(event)
+      void openSelection()
     }, listen)
     window.addEventListener('keydown', event => {
       if (!event.isTrusted || event.target === host || opening || selected === null
@@ -4746,6 +4776,28 @@ async function debuggerCommand(target, method, params = {}) {
     throw error
   }
 }
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.remove(ELEMENT_NOTE_MENU_ID, () => {
+    void chrome.runtime.lastError
+    chrome.contextMenus.create({
+      id: ELEMENT_NOTE_MENU_ID,
+      title: 'DSH Note Mode',
+      contexts: ['all'],
+      documentUrlPatterns: ['http://*/*', 'https://*/*'],
+    }, () => {
+      if (chrome.runtime.lastError) console.warn('Could not register DSH Note Mode menu')
+    })
+  })
+})
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== ELEMENT_NOTE_MENU_ID || tab === undefined) return
+  const useContextTarget = (info.frameId ?? 0) === 0 && (info.pageUrl === undefined || info.pageUrl === tab.url)
+  void openElementNoteView(tab, 'pick', useContextTarget).catch(() => {
+    console.warn('Could not open DSH Note Mode on this page')
+  })
+})
 
 chrome.runtime.onStartup.addListener(() => {
   void readConnectionSettings().then(async settings => {
