@@ -43,7 +43,7 @@ Once paired, the extension keeps its Manifest V3 service worker alive on its own
 
 1. Open the extension popup and click **Note Mode**, or right-click an element and choose **DSH Note Mode**. When the right-click target is available, the picker highlights it and shows **Add note**. Otherwise, select an element with the picker.
 2. Point at an element. Press Up to select a larger container or Down to narrow the selection, then click to use the highlighted area. Use the position menu to move the controls to any corner of the viewport.
-3. Write your note and click **Save note**. Note Mode resumes so you can select another element. Click **Done** or press Escape when you're finished.
+3. Write your note and click **Save note**. The note is saved together with the element's viewport point (X,Y), so DSH can point the LLM at where to click — for example inside an iframe such as Excel Online, where X,Y identifies the element's position in that frame. Note Mode resumes so you can select another element. Click **Done** or press Escape when you're finished.
 4. In DSH, ask "Read my notes for this site" to find notes from any page on the same hostname and port, or ask for notes on this exact page.
 
 **Page Notes** lists notes from the current site and shows numbered outlines for notes on the exact page you are viewing. Use **Locate** to scroll to a marked element, or follow the page link for a note saved on another page. **All Notes** shows the source URL on each note and lets you filter, edit, and delete notes across sites. Ask DSH to "Read my master list of notes" to see that list in chat. In either list, click **Delete** twice within 200 milliseconds to remove a note.

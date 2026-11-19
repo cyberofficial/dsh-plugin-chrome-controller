@@ -123,11 +123,13 @@ Linux example using a file in Downloads:
 {"action":"start","url":"https://example.com/report.pdf"}
 ```
 
-Click a button by CSS selector, or click a point from a recent screenshot:
+Click a button by CSS selector whenever possible — target actual elements, not screen coordinates. Only use X,Y coordinates from a screenshot as a last resort when the element cannot be targeted by selector (e.g. canvas-based controls or elements with no stable selector):
 
 ```json
 {"tabId":123,"selector":"button[type='submit']"}
 ```
+
+Avoid X,Y clicks unless absolutely necessary; they are brittle and break when layout shifts:
 
 ```json
 {"tabId":123,"x":640,"y":420}
@@ -175,7 +177,13 @@ Type into a field with human-like keystrokes using `dsh_browser_type_human`:
 {"tabId":123,"selector":"input[name='q']","text":" more text","delayMs":110}
 ```
 
-Move the virtual cursor to a point (hover) with `dsh_browser_mouse_move`:
+Move the virtual cursor to an element by CSS selector whenever possible — target actual elements, not screen coordinates. Only use X,Y coordinates from a screenshot as a last resort when the element cannot be targeted by selector:
+
+```json
+{"tabId":123,"selector":"input[name='q']"}
+```
+
+Avoid X,Y hover unless absolutely necessary; they are brittle and break when layout shifts:
 
 ```json
 {"tabId":123,"x":640,"y":420}

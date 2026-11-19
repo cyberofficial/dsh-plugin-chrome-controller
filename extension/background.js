@@ -2652,8 +2652,8 @@ function collectElementNotes(stored, address, scope = 'domain') {
   return pages.flatMap(([pageKey, page]) => {
     const onCurrentPage = pageKey === address?.pageKey
     const meta = onCurrentPage ? address : page
-    return noteEntries(page).map(({ xpath, note }) => ({
-      pageKey, xpath, note, pageUrl: meta.pageUrl ?? null, canOpen: meta.canOpen === true, onCurrentPage,
+    return noteEntries(page).map(({ xpath, note, x, y }) => ({
+      pageKey, xpath, note, x, y, pageUrl: meta.pageUrl ?? null, canOpen: meta.canOpen === true, onCurrentPage,
     }))
   })
 }
@@ -2762,7 +2762,12 @@ function updateElementNote(draft, action, note) {
       if (total >= 300 && remaining.length === current.length) {
         throw new Error('The extension has 300 saved notes. Remove an existing note before adding another.')
       }
-      remaining.unshift({ xpath: draft.xpath, note })
+      const entry = { xpath: draft.xpath, note }
+      if (typeof draft.x === 'number' && typeof draft.y === 'number') {
+        entry.x = draft.x
+        entry.y = draft.y
+      }
+      remaining.unshift(entry)
     }
     if (action === 'remove' && remaining.length === current.length) return false
     if (remaining.length === 0) delete stored[draft.pageKey]
@@ -3177,7 +3182,7 @@ async function handleElementNoteMessage(message, sender) {
       }
     }
     const editorToken = crypto.randomUUID()
-    const editorDraft = { token: editorToken, pageKey, xpath, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    const editorDraft = { token: editorToken, pageKey, xpath, x: message.x, y: message.y, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
     if (editingSaved) {
       editorDraft.viewToken = draft.token
       editorDraft.viewAddress = address
@@ -3211,7 +3216,14 @@ async function handleElementNoteMessage(message, sender) {
   if (message.action === 'read') {
     const stored = await readNoteStore()
     const entry = noteEntries(stored[draft.pageKey]).find(entry => entry.xpath === draft.xpath)
-    return { ok: true, xpath: draft.xpath, note: entry?.note }
+    const x = typeof entry?.x === 'number' ? entry.x : typeof draft.x === 'number' ? draft.x : undefined
+    const y = typeof entry?.y === 'number' ? entry.y : typeof draft.y === 'number' ? draft.y : undefined
+    return {
+      ok: true,
+      xpath: draft.xpath,
+      note: entry?.note,
+      ...(typeof x === 'number' && typeof y === 'number' ? { x, y } : {}),
+    }
   }
   if (!['save', 'remove', 'cancel'].includes(message.action)) throw new Error('Unknown note action')
   const note = message.action === 'save' ? requireNoteText(message.note) : undefined
@@ -3347,8 +3359,8 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     return visible
   }
 
-  async function openEditor(type, xpath, pageKey) {
-    const result = await chrome.runtime.sendMessage({ type, token, xpath, corner, pageKey })
+  async function openEditor(type, xpath, pageKey, x, y) {
+    const result = await chrome.runtime.sendMessage({ type, token, xpath, corner, pageKey, x, y })
     if (result?.ok !== true) throw new Error(result?.error ?? 'Could not open the note editor')
   }
 
@@ -3443,7 +3455,13 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       if (useSelection !== null) useSelection.disabled = true
       status.textContent = 'Opening note editor...'
       try {
-        await openEditor('DSH_NOTE_SELECTED', absoluteXPath(selected))
+        // Capture the viewport point at which the user is placing the note, so
+        // DSH can point the LLM at where to click (e.g. inside iframes such as
+        // Excel Online where X,Y identifies the element in that frame).
+        const rect = selected.getBoundingClientRect()
+        const x = rect.left + rect.width / 2
+        const y = rect.top + rect.height / 2
+        await openEditor('DSH_NOTE_SELECTED', absoluteXPath(selected), undefined, x, y)
         stop()
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error)

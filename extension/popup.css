@@ -208,6 +208,15 @@ button.primary-button:hover:enabled {
   color: var(--muted);
 }
 
+#note-coords {
+  display: block;
+  overflow-wrap: anywhere;
+  max-height: 24px;
+  overflow: auto;
+  font: 12px/1.45 ui-monospace, monospace;
+  color: var(--muted);
+}
+
 #note-text,
 #all-notes-filter,
 #all-notes-panel textarea {
@@ -272,6 +281,15 @@ textarea {
 #all-notes-list .note-path {
   display: block;
   overflow-wrap: anywhere;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+#all-notes-list .note-coords {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
   color: var(--muted);
   margin-bottom: 8px;
 }

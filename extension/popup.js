@@ -99,6 +99,7 @@ async function initializeNoteEditor(params) {
   const save = document.querySelector('#note-save')
   const remove = document.querySelector('#note-remove')
   const cancel = document.querySelector('#note-cancel')
+  const coords = document.querySelector('#note-coords')
   const tabId = Number(params.get('noteTab'))
   const token = params.get('noteToken')
 
@@ -136,6 +137,12 @@ async function initializeNoteEditor(params) {
     const result = await request('read')
     document.querySelector('#note-xpath').textContent = result.xpath
     field.value = result.note ?? ''
+    if (coords !== null && typeof result.x === 'number' && typeof result.y === 'number') {
+      coords.textContent = Math.round(result.x) + ', ' + Math.round(result.y)
+      coords.hidden = false
+    } else {
+      coords.hidden = true
+    }
     remove.hidden = result.note === undefined
     save.disabled = false
     field.focus()
@@ -226,6 +233,14 @@ async function initializeAllNotes() {
     const path = document.createElement('code')
     path.className = 'note-path'
     path.textContent = entry.xpath
+    const coords = document.createElement('code')
+    coords.className = 'note-coords'
+    if (typeof entry.x === 'number' && typeof entry.y === 'number') {
+      coords.textContent = Math.round(entry.x) + ', ' + Math.round(entry.y)
+    } else {
+      coords.textContent = '(no coordinates saved)'
+      coords.style.color = '#8a97a8'
+    }
     const actions = document.createElement('div')
     actions.className = 'note-actions'
     const edit = makeButton('Edit')
@@ -238,7 +253,7 @@ async function initializeAllNotes() {
     field.maxLength = 2000
     field.setAttribute('aria-label', 'Note')
     actions.append(edit, remove, save, cancel)
-    row.append(source, content, path, field, actions)
+    row.append(source, content, path, coords, field, actions)
 
     function setEditing(editing, focus = false) {
       field.hidden = !editing
