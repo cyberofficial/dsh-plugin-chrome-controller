@@ -12,6 +12,8 @@ The DSH browser tools operate the user's current Chrome tabs through the paired 
 
 Call `dsh_browser_tabs` with `action: "list"`. Choose the tab that matches the user's task and keep its `tabId` for later calls. Call `dsh_browser_snapshot` to read its title, URL, visible text, and links. Use `dsh_browser_screenshot` when layout or visual state matters.
 
+**Before any other action on that tab, read the user's saved element notes with `dsh_browser_element_notes`** (see "Read the user's element notes" below). Notes may flag elements to target, verify, or avoid.
+
 If a DSH Web tab is open, preserve it. Identify it from its local URL and do not navigate, close, or repurpose it unless the user explicitly asks. For web research or testing, open separate tabs with `dsh_browser_tabs` and `action: "open"`, and track the new tab IDs. Before reporting, list tabs again and accurately state which tabs changed.
 
 All live DSH sessions share the same tabs and page state. Commands to one tab run in order, but another agent can change the page between an inspection and a later action. Avoid parallel workflows in the same tab; use separate tabs when agents need to work concurrently.
@@ -205,7 +207,9 @@ To include small textual response bodies, separately set `includeResponseBodies:
 
 ## Read the user's element notes
 
-Check for notes proactively: before doing any web work on a tab or site, call `dsh_browser_element_notes` with the `tabId` (default `scope: "domain"`) even when the user did not mention notes — the user may have marked elements in Chrome earlier and forgotten to say so. Saved notes are user context for the current task, so read them first and let them shape which elements to target, verify, or avoid.
+**Before doing any web work on a tab or site, call `dsh_browser_element_notes` first.** Saved notes are user context — they tell you which elements the user has already flagged as important, broken, or to avoid. Read them before inspecting, clicking, filling, or navigating. Even when the user does not mention notes, check proactively: the user may have marked elements in Chrome earlier and forgotten to say so.
+
+Call `dsh_browser_element_notes` with the `tabId` (default `scope: "domain"`) to read notes for the current site. When the user asks about marked elements, list tabs and call `dsh_browser_element_notes` with the matching `tabId`. Pass `scope: "page"` for notes on the tab's exact URL only, or `{"scope":"all"}` without a tab ID for the master list across every site. Use structured `notes` to see which page each XPath belongs to, and let the notes shape which elements to target, verify, or avoid.
 
 When the user asks about elements they marked in Chrome, list tabs and call `dsh_browser_element_notes` with the matching `tabId`. The default `scope: "domain"` includes notes from the current hostname and port. Pass `scope: "page"` for notes on the tab's exact URL only. For an explicit request for the master list or notes across every site, call `{"scope":"all"}` without a tab ID and keep that scope when paging. Use structured `notes` to see which page each XPath belongs to. Source URLs in tool results omit query strings and fragments. The result also includes a `notesHtml` block with the DSH note markers. If `nextOffset` is present, pass it as `offset` to read more.
 

@@ -273,9 +273,17 @@ async function initializeAllNotes() {
       const elapsed = event.timeStamp - lastClick
       if (lastClick === undefined || elapsed < 0 || elapsed > 200) {
         lastClick = event.timeStamp
+        status.textContent = 'Click Delete again within 2 seconds to remove this note'
+        setTimeout(() => {
+          if (lastClick !== undefined) {
+            lastClick = undefined
+            status.textContent = ''
+          }
+        }, 2000)
         return
       }
       lastClick = undefined
+      status.textContent = ''
       void update('remove')
     })
     edit.addEventListener('click', () => setEditing(true, true))
