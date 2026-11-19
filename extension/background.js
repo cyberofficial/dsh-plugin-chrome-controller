@@ -1102,8 +1102,8 @@ async function restoreSession() {
 
 function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETTINGS.sequenceDelayMs) {
   const tabId = requireTabId(params.tabId)
-  if (!Array.isArray(params.steps) || params.steps.length < 1 || params.steps.length > 25) {
-    throw new Error('A browser sequence must contain between 1 and 25 actions')
+  if (!Array.isArray(params.steps) || params.steps.length < 1 || params.steps.length > 32) {
+    throw new Error('A browser sequence must contain between 1 and 32 actions')
   }
   const interActionDelayMs = params.interActionDelayMs === undefined ? defaultDelayMs : params.interActionDelayMs
   if (!Number.isSafeInteger(interActionDelayMs) || interActionDelayMs < 0 || interActionDelayMs > 1000) {
