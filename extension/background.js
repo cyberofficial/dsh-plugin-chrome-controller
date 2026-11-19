@@ -2994,11 +2994,21 @@ function noteFrameProbe() {
  * hosts. Child frames announce their URL via postMessage (matched by
  * contentWindow identity, so cross-origin frames work); src and sole-child are
  * fallbacks.
+ *
+ * Excel Online and similar apps often create iframes with `about:blank` or no
+ * `src`, then populate them via JavaScript. In those cases
+ * `chrome.webNavigation.getAllFrames` may report `about:blank` while the frame's
+ * own `location.href` (delivered by the postMessage probe) is the real app URL.
+ * Matching therefore tries: probe URL, src attribute, probe URL against ALL
+ * tab frames (catches post-navigation about:blank frames), and finally the
+ * sole-child fallback.
  */
 async function resolveChildFrameId(tabId, parentFrameId, iframeXPath) {
-  const frames = await chrome.webNavigation.getAllFrames({ tabId })
+  const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => [])
   const children = frames.filter(f => f.parentFrameId === parentFrameId)
-  if (children.length === 0) return undefined
+  if (children.length === 0) {
+    throw new Error('No child frames found in this frame. The selected element may not be an <iframe>, or its frame is not yet loaded.')
+  }
   await runInFrame(tabId, parentFrameId, noteFrameProbeListener, []).catch(() => {})
   await Promise.allSettled(children.map(f => runInFrame(tabId, f.frameId, noteFrameProbe, []).catch(() => {})))
   const normalize = url => {
@@ -3028,14 +3038,31 @@ async function resolveChildFrameId(tabId, parentFrameId, iframeXPath) {
     if (childUrl === null) await new Promise(resolve => setTimeout(resolve, 100))
   }
   let match
+  // Strategy 1: match by the child frame's own location.href (postMessage probe).
   if (typeof childUrl === 'string' && childUrl !== '') {
     match = children.find(f => normalize(f.url) === normalize(childUrl))
   }
+  // Strategy 2: match by the iframe's src attribute.
   if (match === undefined && typeof src === 'string' && src !== '') {
     match = children.find(f => normalize(f.url) === normalize(src))
   }
+  // Strategy 3: about:blank / post-navigation fallback. When webNavigation still
+  // reports about:blank but the probe delivered a real URL, match that URL against
+  // every frame in the tab (not just children of this parent).
+  if (match === undefined && typeof childUrl === 'string' && childUrl !== '') {
+    const allMatch = frames.find(f => normalize(f.url) === normalize(childUrl))
+    if (allMatch !== undefined && allMatch.parentFrameId === parentFrameId) {
+      match = allMatch
+    }
+  }
+  // Strategy 4: sole-child fallback.
   if (match === undefined && children.length === 1) match = children[0]
-  return match?.frameId
+  if (match === undefined) {
+    const detail = children.map(c => `frameId=${c.frameId},url=${c.url ?? '(blank)'}`).join('; ')
+    console.error('[dsh-browser] resolveChildFrameId: no match', { tabId, parentFrameId, iframeXPath, children, childUrl, src })
+    throw new Error(`Could not match the selected iframe to a child frame. Child frames: ${detail}. For cross-origin or about:blank iframes (common in Excel Online), make sure the frame has finished loading, then try again.`)
+  }
+  return match.frameId
 }
 
 /**
@@ -3355,14 +3382,24 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       if (!event.isTrusted || selected === null) return
       if (selected.localName !== 'iframe' && selected.localName !== 'frame') return
       void chrome.runtime.sendMessage({ type: 'DSH_NOTE_ENTER_FRAME', token, xpath: absoluteXPath(selected) })
-        .then(result => { if (result?.ok === true) stop() }, () => {})
+        .then(result => {
+          if (result?.ok === true) stop()
+          else status.textContent = result?.error ?? 'Enter frame failed'
+        }, error => {
+          status.textContent = error instanceof Error ? error.message : String(error)
+        })
     }, listen)
     const back = parentFrameId === null || parentFrameId === undefined ? null : makeButton('Back')
     if (back !== null) {
       header.insertBefore(back, close)
       back.addEventListener('click', event => {
         if (event.isTrusted) void chrome.runtime.sendMessage({ type: 'DSH_NOTE_LEAVE_FRAME', token })
-          .then(result => { if (result?.ok === true) stop() }, () => {})
+          .then(result => {
+            if (result?.ok === true) stop()
+            else status.textContent = result?.error ?? 'Leave frame failed'
+          }, error => {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          })
       }, listen)
     }
 
@@ -3453,7 +3490,12 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         if (!event.isTrusted) return
         dismiss()
         void chrome.runtime.sendMessage({ type: 'DSH_NOTE_ENTER_FRAME', token, xpath: absoluteXPath(selected) })
-          .then(result => { if (result?.ok === true) stop() }, () => {})
+          .then(result => {
+            if (result?.ok === true) stop()
+            else status.textContent = result?.error ?? 'Enter frame failed'
+          }, error => {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          })
       }, listen)
     }
 
@@ -3477,14 +3519,24 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         event.preventDefault()
         event.stopImmediatePropagation()
         void chrome.runtime.sendMessage({ type: 'DSH_NOTE_ENTER_FRAME', token, xpath: absoluteXPath(selected) })
-          .then(result => { if (result?.ok === true) stop() }, () => {})
+          .then(result => {
+            if (result?.ok === true) stop()
+            else status.textContent = result?.error ?? 'Enter frame failed'
+          }, error => {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          })
         return
       }
       if (event.key === 'ArrowLeft' && parentFrameId !== null && parentFrameId !== undefined) {
         event.preventDefault()
         event.stopImmediatePropagation()
         void chrome.runtime.sendMessage({ type: 'DSH_NOTE_LEAVE_FRAME', token })
-          .then(result => { if (result?.ok === true) stop() }, () => {})
+          .then(result => {
+            if (result?.ok === true) stop()
+            else status.textContent = result?.error ?? 'Leave frame failed'
+          }, error => {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          })
         return
       }
       if (selected === null || !['ArrowUp', 'ArrowDown'].includes(event.key)) return
