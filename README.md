@@ -39,6 +39,17 @@ The extension Settings page has a **DSH Web connection** section for the local o
 
 Once paired, the extension keeps its Manifest V3 service worker alive on its own: a 30-second heartbeat alarm wakes the worker if Chrome suspends it, and a 25-second `chrome.runtime.getPlatformInfo()` call resets the worker's idle timer while it runs. Browser tools therefore respond without opening the extension popup. After updating the extension, reload it on `chrome://extensions` and click **Connect** again. The saved pairing code remains in extension Settings; copy a new one if it was rotated. Reload any page that had an element watcher running before the update.
 
+## Element notes
+
+1. Open the extension popup and click **Note Mode**.
+2. Point at an element. Press Up to select a larger container or Down to narrow the selection, then click to use the highlighted area. Use the position menu to move the controls to any corner of the viewport.
+3. Write your note and click **Save note**. Note Mode resumes so you can select another element. Click **Done** or press Escape when you're finished.
+4. In DSH, ask: "Read my notes on this tab and tell me what I marked."
+
+Click **Page Notes** in the extension popup to list notes and show numbered outlines on the page. **Locate** scrolls to a note's element. **Edit** opens the note, even if the saved element is missing. To remove a note from the list, click its **Delete** button twice within 200 milliseconds.
+
+Notes are saved in Chrome for the exact page address and are available when you return to it. The picker works on HTML pages and can select an iframe or shadow host as a whole. If the page layout changes, check that the saved XPath still identifies the intended element.
+
 ## Browser tools
 
 - `dsh_browser_tabs` lists tabs or opens, activates, and closes one.

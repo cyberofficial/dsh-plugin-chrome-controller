@@ -7,13 +7,31 @@
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main>
+    <main id="connection-panel">
       <h1>DeepSeek Harness Browser</h1>
       <p id="status" role="status">Checking connection...</p>
       <button id="connect" type="button">Connect to DSH Web</button>
       <button id="disconnect" type="button" hidden>Disconnect</button>
+      <button id="note-mode" type="button">Note Mode</button>
+      <button id="page-notes" type="button">Page Notes</button>
       <button id="settings" type="button">Settings</button>
       <p class="hint">Save the DSH Web address and pairing code in Settings. Connect opens no DSH tab. The extension reconnects after interruptions when automatic connection is enabled.</p>
+    </main>
+    <main id="note-editor" hidden>
+      <h1>Element note</h1>
+      <p class="hint">Saved notes are available to DSH when you ask it to read them.</p>
+      <label for="note-xpath">Selected element</label>
+      <output id="note-xpath"></output>
+      <form id="note-form">
+        <label for="note-text">Note</label>
+        <textarea id="note-text" rows="5" maxlength="2000" required></textarea>
+        <p id="note-status" role="status"></p>
+        <div class="note-actions">
+          <button id="note-save" type="submit" disabled>Save note</button>
+          <button id="note-remove" type="button" hidden>Remove note</button>
+          <button id="note-cancel" type="button">Cancel</button>
+        </div>
+      </form>
     </main>
     <script src="popup.js"></script>
   </body>

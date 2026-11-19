@@ -4,6 +4,8 @@ const POLL_PATH = '/dsh-browser-extension/poll'
 const RESPONSE_PATH = '/dsh-browser-extension/respond'
 const DISCONNECT_PATH = '/dsh-browser-extension/disconnect'
 const SESSION_KEY = 'dshBrowserSession'
+const ELEMENT_NOTES_KEY = 'dshElementNotes'
+const ELEMENT_NOTE_DRAFT_MS = 10 * 60_000
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
@@ -964,11 +966,15 @@ function normalizeDshOrigin(value) {
   }
 }
 
-/** Read the configured origin and the persistent code supplied by the user. */
-async function readConnectionSettings() {
+function ensureTrustedLocalStorage() {
   trustedStorageTask ??= chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
     .catch(error => { trustedStorageTask = undefined; throw error })
-  await trustedStorageTask
+  return trustedStorageTask
+}
+
+/** Read the configured origin and the persistent code supplied by the user. */
+async function readConnectionSettings() {
+  await ensureTrustedLocalStorage()
   const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
   const settings = stored?.[CONNECTION_SETTINGS_KEY]
   const origin = settings?.origin === undefined ? DEFAULT_DSH_ORIGIN : normalizeDshOrigin(settings.origin)
@@ -1685,6 +1691,8 @@ async function executeBrowserOperationNow(method, params, signal) {
       } while (Date.now() < deadline)
       throw new Error('Timed out waiting for the selected element to change')
     }
+    case 'page.elementNotes':
+      return readElementNotes(params)
     case 'page.snapshot': {
       const tabId = requireTabId(params.tabId)
       const maxChars = Number.isInteger(params.maxChars)
@@ -2598,6 +2606,585 @@ function elementChangePayload(query) {
   }
   watches.set(watchId, entry)
   return { watchId, armed: true, initialValue: initial.value, historyLimit: 30, idleTimeoutMs: watchLifetimeMs }
+}
+
+function noteDraftKey(tabId) {
+  return 'dshElementNoteDraft:' + tabId
+}
+
+function noteViewKey(tabId) {
+  return 'dshElementNoteView:' + tabId
+}
+
+async function elementNotePageKey(rawUrl) {
+  let url
+  try { url = new URL(rawUrl) } catch { return undefined }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+  url.username = ''
+  url.password = ''
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url.href))
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function readNoteStore() {
+  await ensureTrustedLocalStorage()
+  const stored = (await chrome.storage.local.get(ELEMENT_NOTES_KEY))[ELEMENT_NOTES_KEY]
+  return isRecord(stored) ? stored : {}
+}
+
+async function readElementNotes(params) {
+  const tabId = requireTabId(params.tabId)
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? 10
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error('limit must be an integer between 1 and 20')
+  const tab = await chrome.tabs.get(tabId)
+  const pageKey = await elementNotePageKey(tab.url)
+  if (pageKey === undefined) throw new Error('Element notes are available on HTTP and HTTPS pages')
+  const stored = await readNoteStore()
+  const pageNotes = stored[pageKey] ?? []
+  const notes = pageNotes.slice(offset, offset + limit)
+  const result = { tabId, total: pageNotes.length, notes, notesHtml: formatElementNotes(notes) }
+  if (offset + notes.length < pageNotes.length) result.nextOffset = offset + notes.length
+  return result
+}
+
+function formatElementNotes(notes) {
+  const escapeComment = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;').replace(/-{2,}/g, hyphens => '&#45;'.repeat(hyphens.length))
+  return [
+    '<!--- #-DSH-Chrome-Controller-Notes-# --->',
+    ...notes.map(({ xpath, note }) => '<!--- ' + escapeComment(xpath) + ' = ' + escapeComment(note) + ' --->'),
+    '<!--- ##-DSH-Chrome-Controller-Notes-## --->',
+  ].join('\n')
+}
+
+let noteWriteTail = Promise.resolve()
+
+function updateElementNote(draft, action, note) {
+  const write = noteWriteTail.then(async () => {
+    const stored = await readNoteStore()
+    const current = stored[draft.pageKey] ?? []
+    const remaining = current.filter(entry => entry.xpath !== draft.xpath)
+    if (action === 'save') {
+      if (remaining.length >= 30) throw new Error('This page has 30 notes. Remove an existing note before adding another.')
+      const total = Object.values(stored).reduce((sum, entries) => sum + entries.length, 0)
+      if (total >= 300 && remaining.length === current.length) {
+        throw new Error('The extension has 300 saved notes. Remove an existing note before adding another.')
+      }
+      remaining.unshift({ xpath: draft.xpath, note })
+    }
+    if (remaining.length === 0) delete stored[draft.pageKey]
+    else stored[draft.pageKey] = remaining
+    await chrome.storage.local.set({ [ELEMENT_NOTES_KEY]: stored })
+    return remaining
+  })
+  noteWriteTail = write.catch(() => {})
+  return write
+}
+
+async function resumeElementNotePicker(tabId, draft) {
+  const key = noteDraftKey(tabId)
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    if (await elementNotePageKey(tab.url) !== draft.pageKey) return false
+    const viewKey = noteViewKey(tabId)
+    const pending = await chrome.storage.session.get([key, viewKey])
+    if (pending[key]?.token !== draft.token || pending[viewKey]?.token !== draft.pickerToken) return false
+    const picker = { mode: 'pick', token: draft.pickerToken, pageKey: draft.pageKey, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    await chrome.storage.session.set({ [key]: picker, [viewKey]: picker })
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId, documentIds: [draft.documentId] },
+      func: startElementNoteView,
+      args: [{ mode: 'pick', token: picker.token, notes: [], lifetimeMs: ELEMENT_NOTE_DRAFT_MS,
+        corner: draft.corner, expectedUrl: tab.url }],
+    })
+    return result?.result === true
+  } catch {
+    // The note is already saved even if the tab or original document is gone.
+    return false
+  }
+}
+
+async function handleElementNoteMessage(message, sender) {
+  if (sender.id !== chrome.runtime.id) throw new Error('Invalid note request')
+  const popup = chrome.runtime.getURL('popup.html')
+  const fromEditor = sender.url?.startsWith(popup + '?') === true
+
+  if (message.type === 'DSH_NOTE_MODE' || message.type === 'DSH_NOTE_LIST') {
+    if (sender.url !== popup) throw new Error('Open the notes from the extension popup')
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    const tabId = requireTabId(tab?.id)
+    const pageKey = await elementNotePageKey(tab.url)
+    if (pageKey === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
+    const mode = message.type === 'DSH_NOTE_MODE' ? 'pick' : 'list'
+    const token = crypto.randomUUID()
+    const notes = mode === 'list' ? (await readNoteStore())[pageKey] ?? [] : []
+    const view = { mode, token, pageKey, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    const state = { [noteViewKey(tabId)]: view }
+    if (mode === 'pick') state[noteDraftKey(tabId)] = view
+    await chrome.storage.session.set(state)
+    const started = await runInFrame(tabId, 0, startElementNoteView, [{
+      mode, token, notes, lifetimeMs: ELEMENT_NOTE_DRAFT_MS, expectedUrl: tab.url,
+    }])
+    if (started !== true) throw new Error('Could not open element notes on this page')
+    return { ok: true }
+  }
+
+  const editingSaved = message.type === 'DSH_NOTE_OPEN_SAVED'
+  const deletingSaved = message.type === 'DSH_NOTE_DELETE_SAVED'
+  const fromList = editingSaved || deletingSaved
+  const fromPage = fromList || message.type === 'DSH_NOTE_SELECTED'
+  if (fromPage ? sender.frameId !== 0 || sender.tab === undefined : !fromEditor) {
+    throw new Error('Invalid note request')
+  }
+  const tabId = requireTabId(fromPage ? sender.tab.id : message.tabId)
+  const key = noteDraftKey(tabId)
+  const sourceKey = fromList ? noteViewKey(tabId) : key
+  const draft = (await chrome.storage.session.get(sourceKey))[sourceKey]
+  if (draft === undefined || typeof message.token !== 'string' || draft.token !== message.token
+    || draft.expiresAt <= Date.now()) {
+    throw new Error('This view expired. Open the notes again from the extension popup.')
+  }
+
+  if (fromList && draft.mode !== 'list') throw new Error('Open Page Notes from the extension popup')
+  if (fromPage) {
+    const xpath = message.xpath
+    if (typeof xpath !== 'string' || !xpath.startsWith('/') || xpath.length > 4096 || /[\r\n]/u.test(xpath)) {
+      throw new Error('This element does not have a supported XPath. Pick another element.')
+    }
+    if (draft.xpath !== undefined) throw new Error('An editor is already open for this selection')
+    if (await elementNotePageKey(sender.tab.url) !== draft.pageKey) {
+      throw new Error('The page changed. Open the notes again from the extension popup.')
+    }
+    if (editingSaved) {
+      const notes = (await readNoteStore())[draft.pageKey] ?? []
+      if (!notes.some(entry => entry.xpath === xpath)) throw new Error('This note has already been removed')
+    }
+    if (deletingSaved) {
+      const notes = await updateElementNote({ pageKey: draft.pageKey, xpath }, 'remove')
+      return { ok: true, notes }
+    }
+    const editorToken = crypto.randomUUID()
+    const editorDraft = { token: editorToken, pageKey: draft.pageKey, xpath, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    if (editingSaved) editorDraft.viewToken = draft.token
+    else {
+      editorDraft.pickerToken = draft.token
+      editorDraft.documentId = sender.documentId
+      editorDraft.corner = typeof message.corner === 'string' && /^(top|bottom)-(left|right)$/u.test(message.corner)
+        ? message.corner : 'top-right'
+    }
+    await chrome.storage.session.set({ [key]: editorDraft })
+    const editor = new URL(popup)
+    editor.searchParams.set('noteTab', String(tabId))
+    editor.searchParams.set('noteToken', editorToken)
+    try {
+      await chrome.windows.create({ url: editor.href, type: 'popup', focused: true, width: 480, height: 460 })
+    } catch (error) {
+      const current = (await chrome.storage.session.get(key))[key]
+      if (current?.token === editorToken) {
+        if (editingSaved) await chrome.storage.session.remove(key)
+        else await chrome.storage.session.set({ [key]: draft })
+      }
+      throw error
+    }
+    return { ok: true }
+  }
+
+  if (draft.xpath === undefined) throw new Error('No element has been selected')
+  if (message.action === 'read') {
+    const stored = await readNoteStore()
+    const entry = stored[draft.pageKey]?.find(entry => entry.xpath === draft.xpath)
+    return { ok: true, xpath: draft.xpath, note: entry?.note }
+  }
+  if (!['save', 'remove', 'cancel'].includes(message.action)) throw new Error('Unknown note action')
+  const note = typeof message.note === 'string' ? message.note.trim() : ''
+  if (message.action === 'save' && (note === '' || note.length > 2000)) {
+    throw new Error('Enter a note of 1 to 2000 characters')
+  }
+  if (message.action !== 'cancel') {
+    const notes = await updateElementNote(draft, message.action, note)
+    if (draft.viewToken !== undefined) {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'DSH_NOTE_LIST_UPDATED', token: draft.viewToken, notes,
+      }, { frameId: 0 }).catch(() => {})
+    }
+  }
+  const canResume = draft.pickerToken !== undefined && typeof draft.documentId === 'string'
+  const resumed = canResume && await resumeElementNotePicker(tabId, draft)
+  if (!resumed) {
+    const current = (await chrome.storage.session.get(key))[key]
+    if (current?.token === draft.token) await chrome.storage.session.remove(key)
+  }
+  return { ok: true, resumed }
+}
+
+/** Runs in Chrome's isolated world. Notes are edited in the extension window. */
+function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl }) {
+  if (document.contentType !== 'text/html') throw new Error('Element notes require an HTML document')
+  if (expectedUrl !== undefined && location.href !== expectedUrl) return false
+  globalThis.__dshStopNotePicker?.()
+  const controller = new AbortController()
+  const listen = { signal: controller.signal }
+  const pageUrl = location.href
+  const host = document.createElement('div')
+  for (const [name, value] of Object.entries({
+    all: 'initial', position: 'fixed', inset: '0', 'z-index': '2147483647',
+    'pointer-events': 'none', overflow: 'hidden',
+  })) host.style.setProperty(name, value, 'important')
+  const shadow = host.attachShadow({ mode: 'closed' })
+  const toolbar = document.createElement('section')
+  toolbar.setAttribute('aria-label', mode === 'pick' ? 'Note Mode' : 'Page Notes')
+  Object.assign(toolbar.style, {
+    position: 'absolute', maxWidth: 'calc(100% - 32px)',
+    boxSizing: 'border-box', pointerEvents: 'auto', padding: '12px', borderRadius: '8px',
+    background: '#172337', color: '#fff', boxShadow: '0 2px 12px rgba(0,0,0,.25)',
+    font: '14px/1.4 system-ui, sans-serif',
+  })
+  const header = document.createElement('div')
+  Object.assign(header.style, {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px',
+  })
+  const status = document.createElement('span')
+  status.setAttribute('role', 'status')
+
+  function makeButton(label) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.textContent = label
+    Object.assign(button.style, {
+      font: 'inherit', color: '#fff', background: '#293a54', border: '1px solid #73839e',
+      borderRadius: '4px', padding: '4px 8px', cursor: 'pointer',
+    })
+    return button
+  }
+
+  const position = document.createElement('select')
+  position.setAttribute('aria-label', 'Panel position')
+  Object.assign(position.style, {
+    font: 'inherit', color: '#fff', background: '#293a54', border: '1px solid #73839e',
+    borderRadius: '4px', padding: '4px',
+  })
+  for (const [value, label] of [
+    ['top-left', 'Top left'], ['top-right', 'Top right'],
+    ['bottom-left', 'Bottom left'], ['bottom-right', 'Bottom right'],
+  ]) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    position.append(option)
+  }
+  function placeToolbar(value) {
+    corner = value
+    toolbar.style.top = corner.startsWith('top-') ? '16px' : 'auto'
+    toolbar.style.bottom = corner.startsWith('bottom-') ? '16px' : 'auto'
+    toolbar.style.left = corner.endsWith('-left') ? '16px' : 'auto'
+    toolbar.style.right = corner.endsWith('-right') ? '16px' : 'auto'
+  }
+  position.value = corner
+  placeToolbar(corner)
+  position.addEventListener('change', event => {
+    if (!event.isTrusted) return
+    placeToolbar(position.value)
+    position.blur()
+  }, listen)
+  const close = makeButton(mode === 'pick' ? 'Done' : 'Close')
+  header.append(status, position, close)
+  toolbar.append(header)
+
+  let cleanup = () => {}
+  function stop() {
+    controller.abort()
+    host.remove()
+    clearTimeout(timer)
+    cleanup()
+    if (globalThis.__dshStopNotePicker === stop) delete globalThis.__dshStopNotePicker
+  }
+
+  const timer = setTimeout(stop, lifetimeMs)
+  globalThis.__dshStopNotePicker = stop
+  close.addEventListener('click', event => { if (event.isTrusted) stop() }, listen)
+  window.addEventListener('hashchange', stop, listen)
+  window.addEventListener('popstate', stop, listen)
+  window.navigation?.addEventListener('currententrychange', () => { if (location.href !== pageUrl) stop() }, listen)
+
+  function makeOutline() {
+    const outline = document.createElement('div')
+    Object.assign(outline.style, {
+      position: 'absolute', boxSizing: 'border-box', border: '2px solid #60a5fa',
+      background: 'rgba(96,165,250,.12)', pointerEvents: 'none', display: 'none',
+    })
+    return outline
+  }
+
+  function drawOutline(outline, element, active = false) {
+    const rect = element?.getBoundingClientRect()
+    const visible = rect !== undefined && rect.width > 0 && rect.height > 0
+    outline.style.display = visible ? 'block' : 'none'
+    if (visible) {
+      Object.assign(outline.style, {
+        left: rect.left + 'px', top: rect.top + 'px', width: rect.width + 'px', height: rect.height + 'px',
+        borderColor: active ? '#fbbf24' : '#60a5fa',
+      })
+    }
+    return visible
+  }
+
+  async function openEditor(type, xpath) {
+    const result = await chrome.runtime.sendMessage({ type, token, xpath, corner })
+    if (result?.ok !== true) throw new Error(result?.error ?? 'Could not open the note editor')
+  }
+
+  function showPicker() {
+    const shield = document.createElement('div')
+    Object.assign(shield.style, { position: 'absolute', inset: '0', pointerEvents: 'auto', cursor: 'crosshair' })
+    const outline = makeOutline()
+    shadow.append(shield, outline, toolbar)
+    let hovered = null
+    let selected = null
+    const previousChildren = []
+    let opening = false
+
+    function renderSelection() {
+      drawOutline(outline, selected)
+      const target = selected === null ? 'an element' : '<' + selected.localName + '>'
+      status.textContent = 'Click to select ' + target + '. Up widens, Down narrows.'
+    }
+
+    function updateHover(event) {
+      shield.style.pointerEvents = 'none'
+      let hit
+      try { hit = document.elementFromPoint(event.clientX, event.clientY) }
+      finally { shield.style.pointerEvents = 'auto' }
+      if (hit === host) hit = null
+      // Keep the keyboard choice until the pointer moves to another element.
+      if (hit === hovered && selected?.isConnected !== false) return
+      hovered = hit
+      selected = hit
+      previousChildren.length = 0
+    }
+
+    renderSelection()
+    shield.addEventListener('pointermove', event => {
+      if (opening) return
+      updateHover(event)
+      renderSelection()
+    }, listen)
+    shield.addEventListener('pointerleave', () => { outline.style.display = 'none' }, listen)
+    shield.addEventListener('click', async event => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!event.isTrusted || opening) return
+      updateHover(event)
+      if (selected === null) return
+      opening = true
+      status.textContent = 'Opening note editor...'
+      try {
+        await openEditor('DSH_NOTE_SELECTED', absoluteXPath(selected))
+        stop()
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error)
+        opening = false
+      }
+    }, listen)
+    window.addEventListener('keydown', event => {
+      if (!event.isTrusted || event.target === host || opening || selected === null
+        || !['ArrowUp', 'ArrowDown'].includes(event.key)) return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      if (event.key === 'ArrowUp') {
+        const parent = selected.parentElement
+        if (parent !== null) {
+          previousChildren.push(selected)
+          selected = parent
+        }
+      } else {
+        const child = previousChildren.pop()
+        if (child?.parentElement === selected) selected = child
+        else {
+          selected = Array.from(selected.children)
+            .find(element => element !== host && element.getClientRects().length > 0) ?? selected
+        }
+      }
+      renderSelection()
+    }, { ...listen, capture: true })
+    window.addEventListener('scroll', () => drawOutline(outline, selected), { ...listen, capture: true })
+    window.addEventListener('resize', () => drawOutline(outline, selected), listen)
+  }
+
+  function showNotes() {
+    const outlines = document.createElement('div')
+    const list = document.createElement('div')
+    toolbar.style.width = '340px'
+    Object.assign(list.style, { maxHeight: '60vh', overflow: 'auto', marginTop: '8px' })
+    toolbar.append(list)
+    shadow.append(outlines, toolbar)
+    let rows = []
+    let activeXPath
+    let animationFrame
+    let needsLookup = false
+    let opening = false
+
+    function lookup(xpath) {
+      try {
+        const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+        const element = result.singleNodeValue
+        return element instanceof Element && element !== host ? element : null
+      } catch {
+        return null
+      }
+    }
+
+    function draw(resolve) {
+      animationFrame = undefined
+      if (location.href !== pageUrl) {
+        stop()
+        return
+      }
+      for (const row of rows) {
+        if (resolve) row.element = lookup(row.xpath)
+        const visible = drawOutline(row.outline, row.element, row.xpath === activeXPath)
+        row.locate.disabled = !visible
+        row.unavailable.hidden = visible
+        row.unavailable.textContent = row.element === null ? 'Element not found' : 'Element is hidden'
+      }
+    }
+
+    function scheduleDraw(resolve = false) {
+      needsLookup ||= resolve
+      if (animationFrame !== undefined) return
+      animationFrame = requestAnimationFrame(() => {
+        const resolveNow = needsLookup
+        needsLookup = false
+        draw(resolveNow)
+      })
+    }
+
+    function render(entries) {
+      status.textContent = entries.length === 0 ? 'No notes for this page.' : 'Page Notes'
+      rows = entries.map(({ xpath, note }, index) => {
+        const number = String(index + 1)
+        const row = document.createElement('div')
+        Object.assign(row.style, { borderTop: '1px solid #53627a', padding: '8px 0' })
+        const description = document.createElement('div')
+        description.textContent = number + '. ' + note
+        Object.assign(description.style, { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginBottom: '6px' })
+        const actions = document.createElement('div')
+        Object.assign(actions.style, { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px' })
+        const locate = makeButton('Locate')
+        locate.setAttribute('aria-label', 'Locate note ' + number)
+        const edit = makeButton('Edit')
+        edit.setAttribute('aria-label', 'Edit note ' + number)
+        const remove = makeButton('Delete')
+        remove.title = 'Double-click within 200 ms to delete'
+        remove.setAttribute('aria-label', 'Delete note ' + number + ' with two clicks within 200 milliseconds')
+        const unavailable = document.createElement('span')
+        unavailable.hidden = true
+        locate.disabled = true
+        actions.append(locate, edit, remove, unavailable)
+        row.append(description, actions)
+
+        const outline = makeOutline()
+        const badge = document.createElement('span')
+        badge.textContent = number
+        Object.assign(badge.style, {
+          position: 'absolute', top: '0', left: '0', background: '#172337', color: '#fff',
+          padding: '1px 5px', borderRadius: '0 0 4px 0', font: '600 12px/1.5 system-ui, sans-serif',
+        })
+        outline.append(badge)
+        const view = { xpath, row, outline, locate, unavailable, element: null }
+        locate.addEventListener('click', event => {
+          if (!event.isTrusted) return
+          view.element = lookup(xpath)
+          view.element?.scrollIntoView({ block: 'center', inline: 'nearest' })
+          activeXPath = xpath
+          scheduleDraw(true)
+        })
+        edit.addEventListener('click', async event => {
+          if (!event.isTrusted || opening) return
+          opening = true
+          edit.disabled = true
+          try {
+            await openEditor('DSH_NOTE_OPEN_SAVED', xpath)
+          } catch (error) {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          } finally {
+            opening = false
+            edit.disabled = false
+          }
+        })
+        let firstDeleteClick
+        remove.addEventListener('click', async event => {
+          if (!event.isTrusted || event.button !== 0 || event.detail === 0 || opening) return
+          const elapsed = event.timeStamp - firstDeleteClick
+          if (firstDeleteClick === undefined || elapsed < 0 || elapsed > 200) {
+            firstDeleteClick = event.timeStamp
+            return
+          }
+          firstDeleteClick = undefined
+          opening = true
+          remove.disabled = true
+          try {
+            const result = await chrome.runtime.sendMessage({ type: 'DSH_NOTE_DELETE_SAVED', token, xpath })
+            if (result?.ok !== true) throw new Error(result?.error ?? 'Could not delete the note')
+            if (!controller.signal.aborted) render(result.notes)
+          } catch (error) {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          } finally {
+            opening = false
+            remove.disabled = false
+          }
+        })
+        return view
+      })
+      list.replaceChildren(...rows.map(row => row.row))
+      outlines.replaceChildren(...rows.map(row => row.outline))
+      scheduleDraw(true)
+    }
+
+    function onNotesUpdated(message, sender) {
+      if (sender.id === chrome.runtime.id && message?.type === 'DSH_NOTE_LIST_UPDATED'
+        && message.token === token && Array.isArray(message.notes)) render(message.notes)
+    }
+    const observer = new MutationObserver(() => scheduleDraw(true))
+    observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true })
+    chrome.runtime.onMessage.addListener(onNotesUpdated)
+    window.addEventListener('scroll', () => scheduleDraw(), { ...listen, capture: true })
+    window.addEventListener('resize', () => scheduleDraw(), listen)
+    cleanup = () => {
+      observer.disconnect()
+      chrome.runtime.onMessage.removeListener(onNotesUpdated)
+      if (animationFrame !== undefined) cancelAnimationFrame(animationFrame)
+    }
+    render(notes)
+  }
+
+  function absoluteXPath(element) {
+    const parts = []
+    for (let node = element; node !== null; node = node.parentElement) {
+      // Use positional wildcards for SVG and MathML to avoid namespace prefixes.
+      const named = node.namespaceURI === 'http://www.w3.org/1999/xhtml'
+        && /^[a-z][a-z0-9_-]*$/i.test(node.localName)
+      let index = 1
+      for (let sibling = node.previousElementSibling; sibling !== null; sibling = sibling.previousElementSibling) {
+        if (!named || (sibling.namespaceURI === node.namespaceURI && sibling.localName === node.localName)) index++
+      }
+      parts.unshift((named ? node.localName : '*') + '[' + index + ']')
+    }
+    return '/' + parts.join('/')
+  }
+
+  window.addEventListener('keydown', event => {
+    if (event.isTrusted && event.key === 'Escape') {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      stop()
+    }
+  }, { ...listen, capture: true })
+  document.documentElement.append(host)
+  if (mode === 'pick') showPicker()
+  else showNotes()
+  return true
 }
 
 /** Runs inside the target frame: snapshot payload plus a best-effort grid-cell dump. */
@@ -4039,7 +4626,15 @@ chrome.alarms.onAlarm.addListener(alarm => {
   void restoreSession()
 })
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (['DSH_NOTE_MODE', 'DSH_NOTE_LIST', 'DSH_NOTE_SELECTED',
+    'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_EDITOR'].includes(message?.type)) {
+    void handleElementNoteMessage(message, sender).then(sendResponse, error => sendResponse({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return true
+  }
   if (message?.type === 'status') {
     void restoreSession().then(() => {
       sendResponse({ connected: activeSession !== undefined, origin: activeSession?.origin })
@@ -4088,6 +4683,7 @@ chrome.runtime.onMessage.addListener(message => {
 })
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  void chrome.storage.session.remove([noteDraftKey(tabId), noteViewKey(tabId)]).catch(() => {})
   overlayTabs.delete(tabId)
   activeDebuggerTargets.delete(tabId)
 })
