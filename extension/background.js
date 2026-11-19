@@ -2616,14 +2616,52 @@ function noteViewKey(tabId) {
   return 'dshElementNoteView:' + tabId
 }
 
-async function elementNotePageKey(rawUrl) {
+async function elementNoteAddress(rawUrl) {
   let url
   try { url = new URL(rawUrl) } catch { return undefined }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
   url.username = ''
   url.password = ''
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url.href))
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+  const pageKey = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+  return {
+    pageKey,
+    site: url.host,
+    pageUrl: url.origin + url.pathname,
+    originalUrl: url.href,
+    canOpen: !url.search && !url.hash,
+  }
+}
+
+function noteEntries(page) {
+  return Array.isArray(page) ? page : page?.notes ?? []
+}
+
+function collectElementNotes(stored, address, scope = 'domain') {
+  const pages = Object.entries(stored).filter(([key, page]) => {
+    if (address === undefined) return true
+    return key === address.pageKey || (scope === 'domain' && page.site === address.site)
+  })
+  pages.sort(([aKey, a], [bKey, b]) => {
+    const aCurrent = aKey === address?.pageKey
+    const bCurrent = bKey === address?.pageKey
+    if (aCurrent !== bCurrent) return aCurrent ? -1 : 1
+    return (a.pageUrl ?? '').localeCompare(b.pageUrl ?? '') || aKey.localeCompare(bKey)
+  })
+  return pages.flatMap(([pageKey, page]) => {
+    const onCurrentPage = pageKey === address?.pageKey
+    const meta = onCurrentPage ? address : page
+    return noteEntries(page).map(({ xpath, note }) => ({
+      pageKey, xpath, note, pageUrl: meta.pageUrl ?? null, canOpen: meta.canOpen === true, onCurrentPage,
+    }))
+  })
+}
+
+function collectMasterElementNotes(stored) {
+  return collectElementNotes(stored).map(entry => {
+    const page = stored[entry.pageKey]
+    return { ...entry, site: page.site ?? null, originalUrl: page.originalUrl ?? null }
+  })
 }
 
 async function readNoteStore() {
@@ -2633,19 +2671,27 @@ async function readNoteStore() {
 }
 
 async function readElementNotes(params) {
-  const tabId = requireTabId(params.tabId)
   const offset = params.offset ?? 0
   const limit = params.limit ?? 10
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error('limit must be an integer between 1 and 20')
-  const tab = await chrome.tabs.get(tabId)
-  const pageKey = await elementNotePageKey(tab.url)
-  if (pageKey === undefined) throw new Error('Element notes are available on HTTP and HTTPS pages')
-  const stored = await readNoteStore()
-  const pageNotes = stored[pageKey] ?? []
-  const notes = pageNotes.slice(offset, offset + limit)
-  const result = { tabId, total: pageNotes.length, notes, notesHtml: formatElementNotes(notes) }
-  if (offset + notes.length < pageNotes.length) result.nextOffset = offset + notes.length
+  const scope = params.scope === undefined ? 'domain' : params.scope
+  if (!['domain', 'page', 'all'].includes(scope)) throw new Error('scope must be domain, page, or all')
+  let tabId
+  let all
+  if (scope === 'all') {
+    all = collectElementNotes(await readNoteStore())
+  } else {
+    tabId = requireTabId(params.tabId)
+    const tab = await chrome.tabs.get(tabId)
+    const address = await elementNoteAddress(tab.url)
+    if (address === undefined) throw new Error('Element notes are available on HTTP and HTTPS pages')
+    all = collectElementNotes(await readNoteStoreForAddress(address), address, scope)
+  }
+  const notes = all.slice(offset, offset + limit)
+  const result = { scope, total: all.length, notes, notesHtml: formatElementNotes(notes) }
+  if (tabId !== undefined) result.tabId = tabId
+  if (offset + notes.length < all.length) result.nextOffset = offset + notes.length
   return result
 }
 
@@ -2661,37 +2707,75 @@ function formatElementNotes(notes) {
 
 let noteWriteTail = Promise.resolve()
 
-function updateElementNote(draft, action, note) {
+function writeNoteStore(mutate) {
   const write = noteWriteTail.then(async () => {
     const stored = await readNoteStore()
-    const current = stored[draft.pageKey] ?? []
+    if (mutate(stored)) await chrome.storage.local.set({ [ELEMENT_NOTES_KEY]: stored })
+    return stored
+  })
+  noteWriteTail = write.catch(() => {})
+  return write
+}
+
+async function readNoteStoreForAddress(address) {
+  const stored = await readNoteStore()
+  const page = stored[address.pageKey]
+  if (page === undefined || page.originalUrl !== undefined) return stored
+  return writeNoteStore(current => {
+    const existing = current[address.pageKey]
+    if (existing === undefined || existing.originalUrl !== undefined) return false
+    current[address.pageKey] = { ...address, notes: noteEntries(existing) }
+    return true
+  })
+}
+
+function requireNoteXPath(xpath) {
+  if (typeof xpath !== 'string' || !xpath.startsWith('/') || xpath.length > 4096 || /[\r\n]/u.test(xpath)) {
+    throw new Error('This element does not have a supported XPath. Pick another element.')
+  }
+  return xpath
+}
+
+function requireNoteText(note) {
+  if (typeof note !== 'string' || note.trim() === '' || note.trim().length > 2000) {
+    throw new Error('Enter a note of 1 to 2000 characters')
+  }
+  return note.trim()
+}
+
+function updateElementNote(draft, action, note) {
+  return writeNoteStore(stored => {
+    const page = stored[draft.pageKey]
+    const current = noteEntries(page)
     const remaining = current.filter(entry => entry.xpath !== draft.xpath)
     if (action === 'save') {
+      if (draft.savedOnly && remaining.length === current.length) throw new Error('This note has already been removed')
       if (remaining.length >= 30) throw new Error('This page has 30 notes. Remove an existing note before adding another.')
-      const total = Object.values(stored).reduce((sum, entries) => sum + entries.length, 0)
+      const total = Object.values(stored).reduce((sum, page) => sum + noteEntries(page).length, 0)
       if (total >= 300 && remaining.length === current.length) {
         throw new Error('The extension has 300 saved notes. Remove an existing note before adding another.')
       }
       remaining.unshift({ xpath: draft.xpath, note })
     }
+    if (action === 'remove' && remaining.length === current.length) return false
     if (remaining.length === 0) delete stored[draft.pageKey]
-    else stored[draft.pageKey] = remaining
-    await chrome.storage.local.set({ [ELEMENT_NOTES_KEY]: stored })
-    return remaining
+    else if (draft.address !== undefined) stored[draft.pageKey] = { ...draft.address, notes: remaining }
+    else if (Array.isArray(page)) stored[draft.pageKey] = remaining
+    else stored[draft.pageKey] = { ...page, notes: remaining }
+    return true
   })
-  noteWriteTail = write.catch(() => {})
-  return write
 }
 
 async function resumeElementNotePicker(tabId, draft) {
   const key = noteDraftKey(tabId)
   try {
     const tab = await chrome.tabs.get(tabId)
-    if (await elementNotePageKey(tab.url) !== draft.pageKey) return false
+    const address = await elementNoteAddress(tab.url)
+    if (address?.pageKey !== draft.pageKey) return false
     const viewKey = noteViewKey(tabId)
     const pending = await chrome.storage.session.get([key, viewKey])
     if (pending[key]?.token !== draft.token || pending[viewKey]?.token !== draft.pickerToken) return false
-    const picker = { mode: 'pick', token: draft.pickerToken, pageKey: draft.pageKey, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    const picker = { mode: 'pick', token: draft.pickerToken, address, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
     await chrome.storage.session.set({ [key]: picker, [viewKey]: picker })
     const [result] = await chrome.scripting.executeScript({
       target: { tabId, documentIds: [draft.documentId] },
@@ -2706,21 +2790,54 @@ async function resumeElementNotePicker(tabId, draft) {
   }
 }
 
+async function refreshOpenNoteLists(pageKey) {
+  const state = await chrome.storage.session.get(null)
+  const stored = await readNoteStore()
+  const site = stored[pageKey]?.site
+  await Promise.allSettled(Object.entries(state).map(async ([key, view]) => {
+    if (!key.startsWith(noteViewKey('')) || view?.mode !== 'list' || view.expiresAt <= Date.now()) return
+    if (site !== undefined && view.address.site !== site) return
+    const tabId = Number(key.slice(noteViewKey('').length))
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'DSH_NOTE_LIST_UPDATED', token: view.token,
+      notes: collectElementNotes(stored, view.address),
+    }, { frameId: 0 })
+  }))
+}
+
 async function handleElementNoteMessage(message, sender) {
   if (sender.id !== chrome.runtime.id) throw new Error('Invalid note request')
   const popup = chrome.runtime.getURL('popup.html')
   const fromEditor = sender.url?.startsWith(popup + '?') === true
 
+  const manager = popup + '?allNotes=1'
+  if (message.type === 'DSH_NOTE_ALL') {
+    if (message.action === 'open' && sender.url === popup) {
+      await chrome.windows.create({ url: manager, type: 'popup', focused: true, width: 680, height: 720 })
+      return { ok: true }
+    }
+    if (sender.url !== manager) throw new Error('Open All Notes from the extension popup')
+    if (message.action === 'list') return { ok: true, notes: collectMasterElementNotes(await readNoteStore()) }
+    if (message.action !== 'save' && message.action !== 'remove') throw new Error('Unknown note action')
+    if (typeof message.pageKey !== 'string' || !/^[a-f0-9]{64}$/u.test(message.pageKey)) throw new Error('Invalid note page')
+    const xpath = requireNoteXPath(message.xpath)
+    const note = message.action === 'save' ? requireNoteText(message.note) : undefined
+    const stored = await updateElementNote({ pageKey: message.pageKey, xpath, savedOnly: true }, message.action, note)
+    void refreshOpenNoteLists(message.pageKey).catch(() => {})
+    return { ok: true, notes: collectMasterElementNotes(stored) }
+  }
+
   if (message.type === 'DSH_NOTE_MODE' || message.type === 'DSH_NOTE_LIST') {
     if (sender.url !== popup) throw new Error('Open the notes from the extension popup')
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
     const tabId = requireTabId(tab?.id)
-    const pageKey = await elementNotePageKey(tab.url)
-    if (pageKey === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
+    const address = await elementNoteAddress(tab.url)
+    if (address === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
     const mode = message.type === 'DSH_NOTE_MODE' ? 'pick' : 'list'
     const token = crypto.randomUUID()
-    const notes = mode === 'list' ? (await readNoteStore())[pageKey] ?? [] : []
-    const view = { mode, token, pageKey, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    const stored = await readNoteStoreForAddress(address)
+    const notes = mode === 'list' ? collectElementNotes(stored, address) : []
+    const view = { mode, token, address, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
     const state = { [noteViewKey(tabId)]: view }
     if (mode === 'pick') state[noteDraftKey(tabId)] = view
     await chrome.storage.session.set(state)
@@ -2749,26 +2866,33 @@ async function handleElementNoteMessage(message, sender) {
 
   if (fromList && draft.mode !== 'list') throw new Error('Open Page Notes from the extension popup')
   if (fromPage) {
-    const xpath = message.xpath
-    if (typeof xpath !== 'string' || !xpath.startsWith('/') || xpath.length > 4096 || /[\r\n]/u.test(xpath)) {
-      throw new Error('This element does not have a supported XPath. Pick another element.')
-    }
+    const xpath = requireNoteXPath(message.xpath)
     if (draft.xpath !== undefined) throw new Error('An editor is already open for this selection')
-    if (await elementNotePageKey(sender.tab.url) !== draft.pageKey) {
+    const address = await elementNoteAddress(sender.tab.url)
+    if (address?.pageKey !== draft.address.pageKey) {
       throw new Error('The page changed. Open the notes again from the extension popup.')
     }
-    if (editingSaved) {
-      const notes = (await readNoteStore())[draft.pageKey] ?? []
-      if (!notes.some(entry => entry.xpath === xpath)) throw new Error('This note has already been removed')
-    }
-    if (deletingSaved) {
-      const notes = await updateElementNote({ pageKey: draft.pageKey, xpath }, 'remove')
-      return { ok: true, notes }
+    const pageKey = fromList ? message.pageKey : address.pageKey
+    if (fromList) {
+      if (typeof pageKey !== 'string' || !/^[a-f0-9]{64}$/u.test(pageKey)) throw new Error('Invalid note page')
+      const page = (await readNoteStore())[pageKey]
+      if ((pageKey !== address.pageKey && page?.site !== address.site)
+        || !noteEntries(page).some(entry => entry.xpath === xpath)) {
+        throw new Error('This note is no longer on the list. Reopen Page Notes.')
+      }
+      if (deletingSaved) {
+        const stored = await updateElementNote({ pageKey, xpath }, 'remove')
+        return { ok: true, notes: collectElementNotes(stored, address) }
+      }
     }
     const editorToken = crypto.randomUUID()
-    const editorDraft = { token: editorToken, pageKey: draft.pageKey, xpath, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
-    if (editingSaved) editorDraft.viewToken = draft.token
-    else {
+    const editorDraft = { token: editorToken, pageKey, xpath, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    if (editingSaved) {
+      editorDraft.viewToken = draft.token
+      editorDraft.viewAddress = address
+      editorDraft.savedOnly = true
+    } else {
+      editorDraft.address = address
       editorDraft.pickerToken = draft.token
       editorDraft.documentId = sender.documentId
       editorDraft.corner = typeof message.corner === 'string' && /^(top|bottom)-(left|right)$/u.test(message.corner)
@@ -2794,19 +2918,17 @@ async function handleElementNoteMessage(message, sender) {
   if (draft.xpath === undefined) throw new Error('No element has been selected')
   if (message.action === 'read') {
     const stored = await readNoteStore()
-    const entry = stored[draft.pageKey]?.find(entry => entry.xpath === draft.xpath)
+    const entry = noteEntries(stored[draft.pageKey]).find(entry => entry.xpath === draft.xpath)
     return { ok: true, xpath: draft.xpath, note: entry?.note }
   }
   if (!['save', 'remove', 'cancel'].includes(message.action)) throw new Error('Unknown note action')
-  const note = typeof message.note === 'string' ? message.note.trim() : ''
-  if (message.action === 'save' && (note === '' || note.length > 2000)) {
-    throw new Error('Enter a note of 1 to 2000 characters')
-  }
+  const note = message.action === 'save' ? requireNoteText(message.note) : undefined
   if (message.action !== 'cancel') {
-    const notes = await updateElementNote(draft, message.action, note)
+    const stored = await updateElementNote(draft, message.action, note)
     if (draft.viewToken !== undefined) {
       await chrome.tabs.sendMessage(tabId, {
-        type: 'DSH_NOTE_LIST_UPDATED', token: draft.viewToken, notes,
+        type: 'DSH_NOTE_LIST_UPDATED', token: draft.viewToken,
+        notes: collectElementNotes(stored, draft.viewAddress),
       }, { frameId: 0 }).catch(() => {})
     }
   }
@@ -2930,8 +3052,8 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     return visible
   }
 
-  async function openEditor(type, xpath) {
-    const result = await chrome.runtime.sendMessage({ type, token, xpath, corner })
+  async function openEditor(type, xpath, pageKey) {
+    const result = await chrome.runtime.sendMessage({ type, token, xpath, corner, pageKey })
     if (result?.ok !== true) throw new Error(result?.error ?? 'Could not open the note editor')
   }
 
@@ -3042,6 +3164,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         return
       }
       for (const row of rows) {
+        if (!row.onCurrentPage) continue
         if (resolve) row.element = lookup(row.xpath)
         const visible = drawOutline(row.outline, row.element, row.xpath === activeXPath)
         row.locate.disabled = !visible
@@ -3061,11 +3184,26 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     }
 
     function render(entries) {
-      status.textContent = entries.length === 0 ? 'No notes for this page.' : 'Page Notes'
-      rows = entries.map(({ xpath, note }, index) => {
+      status.textContent = entries.length === 0 ? 'No notes for this site.' : 'Notes on this site'
+      rows = entries.map(({ xpath, note, pageKey, pageUrl, canOpen, onCurrentPage }, index) => {
         const number = String(index + 1)
         const row = document.createElement('div')
         Object.assign(row.style, { borderTop: '1px solid #53627a', padding: '8px 0' })
+        const source = document.createElement('div')
+        Object.assign(source.style, { fontSize: '12px', color: '#c6d2e4', overflowWrap: 'anywhere' })
+        if (onCurrentPage) {
+          source.textContent = 'This page'
+        } else if (canOpen) {
+          const link = document.createElement('a')
+          link.href = pageUrl
+          link.target = '_blank'
+          link.rel = 'noopener noreferrer'
+          link.textContent = pageUrl
+          link.style.color = '#bfdbfe'
+          source.append(link)
+        } else {
+          source.textContent = pageUrl + ' (page variant)'
+        }
         const description = document.createElement('div')
         description.textContent = number + '. ' + note
         Object.assign(description.style, { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginBottom: '6px' })
@@ -3081,8 +3219,9 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         const unavailable = document.createElement('span')
         unavailable.hidden = true
         locate.disabled = true
-        actions.append(locate, edit, remove, unavailable)
-        row.append(description, actions)
+        if (onCurrentPage) actions.append(locate)
+        actions.append(edit, remove, unavailable)
+        row.append(source, description, actions)
 
         const outline = makeOutline()
         const badge = document.createElement('span')
@@ -3092,7 +3231,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
           padding: '1px 5px', borderRadius: '0 0 4px 0', font: '600 12px/1.5 system-ui, sans-serif',
         })
         outline.append(badge)
-        const view = { xpath, row, outline, locate, unavailable, element: null }
+        const view = { xpath, onCurrentPage, row, outline, locate, unavailable, element: null }
         locate.addEventListener('click', event => {
           if (!event.isTrusted) return
           view.element = lookup(xpath)
@@ -3105,7 +3244,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
           opening = true
           edit.disabled = true
           try {
-            await openEditor('DSH_NOTE_OPEN_SAVED', xpath)
+            await openEditor('DSH_NOTE_OPEN_SAVED', xpath, pageKey)
           } catch (error) {
             status.textContent = error instanceof Error ? error.message : String(error)
           } finally {
@@ -3125,7 +3264,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
           opening = true
           remove.disabled = true
           try {
-            const result = await chrome.runtime.sendMessage({ type: 'DSH_NOTE_DELETE_SAVED', token, xpath })
+            const result = await chrome.runtime.sendMessage({ type: 'DSH_NOTE_DELETE_SAVED', token, xpath, pageKey })
             if (result?.ok !== true) throw new Error(result?.error ?? 'Could not delete the note')
             if (!controller.signal.aborted) render(result.notes)
           } catch (error) {
@@ -3138,7 +3277,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         return view
       })
       list.replaceChildren(...rows.map(row => row.row))
-      outlines.replaceChildren(...rows.map(row => row.outline))
+      outlines.replaceChildren(...rows.filter(row => row.onCurrentPage).map(row => row.outline))
       scheduleDraw(true)
     }
 
@@ -4627,7 +4766,7 @@ chrome.alarms.onAlarm.addListener(alarm => {
 })
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (['DSH_NOTE_MODE', 'DSH_NOTE_LIST', 'DSH_NOTE_SELECTED',
+  if (['DSH_NOTE_MODE', 'DSH_NOTE_LIST', 'DSH_NOTE_ALL', 'DSH_NOTE_SELECTED',
     'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_EDITOR'].includes(message?.type)) {
     void handleElementNoteMessage(message, sender).then(sendResponse, error => sendResponse({
       ok: false,

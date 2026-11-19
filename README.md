@@ -44,11 +44,13 @@ Once paired, the extension keeps its Manifest V3 service worker alive on its own
 1. Open the extension popup and click **Note Mode**.
 2. Point at an element. Press Up to select a larger container or Down to narrow the selection, then click to use the highlighted area. Use the position menu to move the controls to any corner of the viewport.
 3. Write your note and click **Save note**. Note Mode resumes so you can select another element. Click **Done** or press Escape when you're finished.
-4. In DSH, ask: "Read my notes on this tab and tell me what I marked."
+4. In DSH, ask "Read my notes for this site" to find notes from any page on the same hostname and port, or ask for notes on this exact page.
 
-Click **Page Notes** in the extension popup to list notes and show numbered outlines on the page. **Locate** scrolls to a note's element. **Edit** opens the note, even if the saved element is missing. To remove a note from the list, click its **Delete** button twice within 200 milliseconds.
+**Page Notes** lists notes from the current site and shows numbered outlines for notes on the exact page you are viewing. Use **Locate** to scroll to a marked element, or follow the page link for a note saved on another page. **All Notes** shows the source URL on each note and lets you filter, edit, and delete notes across sites. Ask DSH to "Read my master list of notes" to see that list in chat. In either list, click **Delete** twice within 200 milliseconds to remove a note.
 
-Notes are saved in Chrome for the exact page address and are available when you return to it. The picker works on HTML pages and can select an iframe or shadow host as a whole. If the page layout changes, check that the saved XPath still identifies the intended element.
+Older notes are listed under **Unknown page** until you open the original page in Note Mode or Page Notes, or ask DSH to read notes from that exact page. You can edit or delete those notes from All Notes at any time. All Notes shows the original address when Chrome has recorded it. Page Notes and the DSH tool show source addresses without query strings or fragments.
+
+The picker works on HTML pages and can select an iframe or shadow host as a whole. If the page layout changes, check that the XPath still identifies the intended element.
 
 ## Browser tools
 
