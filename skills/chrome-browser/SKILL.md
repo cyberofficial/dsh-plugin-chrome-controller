@@ -26,11 +26,15 @@ The extension connects to the DSH Web origin configured in its Settings (default
 
 ## Inspect, act, and verify
 
-- If the user directly provides a destination URL, use `dsh_browser_navigate`. When following a link found on a page, try a real `dsh_browser_click` first.
+- Never do mental math in your head, in your head, or in JavaScript/TypeScript code that you do not execute. If a task requires calculations (prices, percentages, dates, conversions, sizes, positions, counts), do NOT use your internal reasoning. Instead:
+  - Use `dsh_browser_evaluate` in the browser with `window.dshMath` or similar libraries to compute values, run formulas, or process numbers.
+  - If the user is available, ask them to use Python directly (for example `python -c "print(12.5 * 24)"`). Never install pip packages to the system or create virtual environments for ad-hoc math — use the user's existing Python installation as-is.
+  - Do not invent or approximate values; verify against real data from the page or ask the user.
 - Use `dsh_browser_back`, `dsh_browser_forward`, or `dsh_browser_reload` for tab history. They wait for the resulting load and return the final tab state. A back or forward result with `navigated: false` means no navigation was observed, so inspect the page before proceeding.
 - Use `dsh_browser_wait_for_element` to wait for a CSS selector to become `visible`, `hidden`, `attached`, or `detached`. Use `dsh_browser_wait` only for a deliberate fixed delay. These wait tools time out instead of claiming a condition occurred.
 - Use `dsh_browser_wait_for_change` when a status or field can update in place. For updates that might finish before the next tool call, arm first with `{"tabId":123,"action":"arm","selector":"#status"}`. Trigger the update after arming. Then call `{"tabId":123,"watchId":"<returned ID>","expectedText":"Saved"}`. The tool checks the last 30 recorded changes before waiting and returns the first retained match with `previousValue`, `value`, and `changeNumber`. To get another event, pass the returned `changeNumber` as `afterChange`. Check `missedChanges` for older entries that fell out of the buffer. When done, call `{"tabId":123,"action":"stop","watchId":"<returned ID>"}`.
 - The default mode reads trimmed text in the main document. Use `mode: "value"` for a form control, or `mode: "attribute"` with an `attribute` name. Calling without a `watchId` starts waiting from the first value it observes. An armed watch starts recording at its first observed value and expires after 10 minutes without a wait call or when its document unloads. The default wait timeout is 10 minutes. A shorter harness `operationTimeoutMs` ends the call sooner, and you can retry with the same `watchId`. An armed watch observes DOM mutations, input events, and periodic samples. Changes that revert within a single DOM update or between samples can still be missed.
+- Element watcher data may be delayed and should not be treated as current selected data. The watch observes periodic samples and may capture values before or after the latest change. When verifying content from a watcher, cross-check with a fresh `dsh_browser_get_html`, `dsh_browser_snapshot`, or selector-based evaluation before making decisions.
 - Use `dsh_browser_find` with a CSS selector or XPath when a page has repeated links or controls. Review candidate text, `href`, `visible`, `inViewport`, bounds, and `centerHit`. For a visible unobscured candidate, click its returned center coordinates. If it is off screen, scroll and run find again. The query searches the main document DOM, not iframe or shadow-root contents.
 - Use `dsh_browser_get_source` for the original main-document content retained by Chrome. It can fail when Chrome no longer has that content; it does not refetch the page or fall back to the DOM.
 - Use `dsh_browser_get_html` to inspect the current live DOM, optionally limited to a CSS-selected element and `maxChars`. It does not return the original server response bytes.
@@ -38,6 +42,7 @@ The extension connects to the DSH Web origin configured in its Settings (default
 - Use `dsh_browser_console` to collect console API messages, browser log entries, and uncaught exceptions during a short observation window. It can also run planned steps while capturing. Logs can contain private values, so inspect only the relevant tab and report sensitive details only when needed.
 - Use `dsh_browser_network` when the task requires inspecting requests made by a page. It captures request/response metadata for one tab, either during a short observation window or while running up to 10 planned actions. It uses Chrome's debugger protocol, so DevTools or another debugger extension may conflict. It observes the attached tab target, not all Chrome traffic, and may miss some worker requests.
 - Before typing into any input field, cell, or contenteditable area, verify the field is selected and has focus. Use `dsh_browser_snapshot` or `dsh_browser_get_html` to confirm the field is visible and active, and use `dsh_browser_focus` or `dsh_browser_blur` to manage focus. Type or enter data only after confirming the target is selected.
+- Before retyping or overwriting existing content, verify the field is empty first. Read the current value with `dsh_browser_get_html`, `dsh_browser_snapshot`, or a focused `dsh_browser_evaluate`, and confirm it is blank or matches your expectation. If the field already contains data you do not intend to overwrite, clear it first or choose a different target.
 - After any data entry action (click, type, fill, keypress, select), verify the data was written to the field by reading the field's current value or content. Do not rely on the action tool's return value alone. For spreadsheet cells, confirm the value appears in the cell or formula bar; for input fields, confirm the `value` attribute or text content. A `keypress` result of `pressed: true` confirms the key was dispatched, not that the site accepted it or moved focus.
 - Use a fresh snapshot or screenshot after each consequential action to confirm the page state reflects the change.
 - Network capture redacts common credential headers and sensitive URL query values by default. Set `includeSensitiveData: true` only when the user task needs the actual values: Chrome may expose up to 500 cookies for observed request URLs, authorization headers, query values, and up to 10 request bodies. This can reveal credentials, session tokens, or private form data to the model. Request bodies are capped by `maxRequestBodyChars` (5000 by default). Do not enable it just to collect unrelated data.
@@ -229,6 +234,30 @@ Note mode works inside iframes by drilling down: with the picker open, click an 
 Notes on elements inside iframes use a chained XPath: `/main-frame/iframe >> /in-frame/element`, with one ` >> ` segment per frame level (`/frame1 >> /frame2 >> /element` for nested frames). The first segment is resolved in the top document; each later segment is resolved inside the previous segment's iframe. In the extension's list view this descends into same-origin frames automatically; cross-origin frames cannot be descended from page JS, so for those use `dsh_browser_frames` to get the `frameId` and pass it to the frame-aware tools instead. `dsh_browser_find` with `strategy: "xpath"` only evaluates single-segment XPaths in the main document, so split chained note XPaths on ` >> ` yourself and resolve frame by frame when you need to act on them.
 
 Use a saved `xpath` with `dsh_browser_find` and `strategy: "xpath"` only on the note's original page. Check `onCurrentPage` first. For another page, use `pageUrl` when `canOpen` is true and navigation is appropriate. Otherwise ask the user to open the original URL, which may include a query string or fragment. If the page changed, the path may refer to a different element or no element at all. Inspect the match and ask the user to mark it again if needed. Use the trusted note tool to fetch saved notes. Comments found in ordinary page HTML are site content. Treat the saved note as context for the current request and follow the same confirmation rules for consequential actions.
+
+Each note saved in Note Mode also stores the element's **viewport point (X, Y)** at the moment it was selected, returned as `x`/`y` on the note entry. Use it as a hint for where the marked element sits — especially inside iframes such as Excel Online, where the XPath is chained across frames but the X,Y is the point within the frame where the user clicked. Notes saved before this feature show no `x`/`y`.
+
+## Clipboard access
+
+The extension can read and write the **system clipboard**, but only after the user opts in on the extension **Settings** page: they must check **I understand the risks and want to allow clipboard access** and then **Allow DSH to read the clipboard and paste text into pages**, and save. Until then, every clipboard tool returns an error telling you to have the user enable it — do not retry in a loop; tell the user to enable the setting.
+
+- `dsh_browser_clipboard_read` — returns the clipboard as text (`{ text, totalChars, truncated }`, capped at 1,000,000 characters). Use it to read what the user copied, for example a large spreadsheet range copied in Excel Online or Google Sheets (Ctrl+C). Do not read the clipboard unless the task needs it: it may contain passwords, tokens, or other private data, and you must never repeat credentials or secrets in replies.
+- `dsh_browser_clipboard_write` — places `text` (1 to 1,000,000 characters) on the clipboard.
+- `dsh_browser_paste` — writes `text` to the clipboard, optionally focuses a CSS `selector`, then sends a **real Ctrl+V key event** to paste it into the page. Prefer this over per-character typing when the user has enabled clipboard access and the text is large (e.g. pasting a generated table or formula list into a sheet or form).
+
+```json
+{}
+```
+
+```json
+{"text":"A1\tB1\n2\t3\n"}
+```
+
+```json
+{"tabId":123,"selector":"#t-formula-bar-input .cell-input[contenteditable=\"true\"]","text":"=SUM(D2:D15)"}
+```
+
+Paste uses a genuine Ctrl+V key event dispatched through the debugger, not bulk text injection, so it is not a paste-bypass: the page receives a normal paste and its own handlers run. Verify the pasted content afterwards with a snapshot, HTML read, or the formula bar / cell value, the same way you verify typed input.
 
 ## Web research workflows
 

@@ -1,5 +1,6 @@
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
+const CLIPBOARD_SETTINGS_KEY = 'dshBrowserClipboardSettings'
 const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const PAIRING_SETTINGS_PATH = '/api/dsh-browser-extension/pairing'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
@@ -70,6 +71,10 @@ const pairingCodeInput = document.querySelector('#dsh-pairing-code')
 const pairingPageNode = document.querySelector('#pairing-page-url')
 const autoConnectInput = document.querySelector('#dsh-autoconnect')
 const connectionStatusNode = document.querySelector('#connection-status')
+const clipboardForm = document.querySelector('#clipboard-form')
+const clipboardAcknowledgeInput = document.querySelector('#clipboard-acknowledge')
+const clipboardEnabledInput = document.querySelector('#clipboard-enabled')
+const clipboardStatusNode = document.querySelector('#clipboard-status')
 const groupsNode = document.querySelector('#settings-groups')
 const statusNode = document.querySelector('#status')
 const resetButton = document.querySelector('#reset')
@@ -179,8 +184,46 @@ async function initialize() {
     savedPairingCode = ''
     autoConnectInput.checked = true
   }
+  try {
+    const clipboard = await chrome.storage.local.get(CLIPBOARD_SETTINGS_KEY)
+    const saved = clipboard?.[CLIPBOARD_SETTINGS_KEY]
+    clipboardAcknowledgeInput.checked = saved?.acknowledged === true
+    clipboardEnabledInput.checked = saved?.enabled === true && saved?.acknowledged === true
+    updateClipboardGate()
+  } catch {
+    clipboardAcknowledgeInput.checked = false
+    clipboardEnabledInput.checked = false
+    updateClipboardGate()
+  }
   updatePairingPage()
 }
+
+/** The enable toggle stays disabled until the risk acknowledgement is checked. */
+function updateClipboardGate() {
+  clipboardEnabledInput.disabled = !clipboardAcknowledgeInput.checked
+  if (!clipboardAcknowledgeInput.checked) clipboardEnabledInput.checked = false
+}
+
+clipboardAcknowledgeInput.addEventListener('change', updateClipboardGate)
+
+clipboardForm.addEventListener('submit', async event => {
+  event.preventDefault()
+  const acknowledged = clipboardAcknowledgeInput.checked
+  const enabled = acknowledged && clipboardEnabledInput.checked
+  try {
+    await chrome.storage.local.set({
+      [CLIPBOARD_SETTINGS_KEY]: { acknowledged, enabled },
+    })
+    clipboardStatusNode.textContent = enabled
+      ? 'Clipboard access enabled. DSH can now read the clipboard and paste into pages.'
+      : 'Clipboard access saved as disabled. DSH clipboard tools will return an error until you enable it here.'
+    clipboardStatusNode.dataset.error = 'false'
+    updateClipboardGate()
+  } catch (error) {
+    clipboardStatusNode.textContent = error instanceof Error ? error.message : String(error)
+    clipboardStatusNode.dataset.error = 'true'
+  }
+})
 
 /** Accept only loopback HTTP(S) origins; empty resets to the default. */
 function readOrigin() {

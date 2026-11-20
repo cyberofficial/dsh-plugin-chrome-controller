@@ -9,6 +9,8 @@ const ELEMENT_NOTE_DRAFT_MS = 10 * 60_000
 const ELEMENT_NOTE_MENU_ID = 'dsh-element-note-mode'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
+const CLIPBOARD_SETTINGS_KEY = 'dshBrowserClipboardSettings'
+const MAX_CLIPBOARD_TEXT_CHARS = 1_000_000
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
 const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const RECONNECT_ALARM = 'dsh-browser-reconnect'
@@ -1264,6 +1266,52 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
   return { tabId, steps, interActionDelayMs }
 }
 
+/**
+ * Clipboard access is opt-in: the user must both acknowledge the risks and
+ * enable the toggle in extension Settings. Both flags are required so a stray
+ * "enabled" write without acknowledgement cannot silently turn it on.
+ */
+async function clipboardAccessAllowed() {
+  const stored = (await chrome.storage.local.get(CLIPBOARD_SETTINGS_KEY))[CLIPBOARD_SETTINGS_KEY]
+  return isRecord(stored) && stored.enabled === true && stored.acknowledged === true
+}
+
+/** Create the offscreen clipboard bridge once; recreate after worker recycling. */
+async function ensureClipboardOffscreen() {
+  if (typeof chrome.offscreen === 'undefined') {
+    throw new Error('This Chrome version does not support the offscreen document API required for clipboard access')
+  }
+  if (await chrome.offscreen.hasDocument()) return
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['CLIPBOARD'],
+    justification: 'Read or write the system clipboard for DSH browser tools when the user enabled clipboard access in extension Settings.',
+  })
+}
+
+/** Relay one clipboard operation to the offscreen document, gated by the Settings toggle. */
+async function clipboardOperation(action, text) {
+  if (!(await clipboardAccessAllowed())) {
+    throw new Error('Clipboard access is disabled. Enable it in the extension Settings page after acknowledging the risks.')
+  }
+  await ensureClipboardOffscreen()
+  const response = await chrome.runtime.sendMessage({ dshClipboard: true, action, text })
+  if (!isRecord(response) || response.ok !== true) {
+    throw new Error(typeof response?.error === 'string' ? response.error : 'The clipboard operation failed')
+  }
+  return response
+}
+
+function requireClipboardText(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('text must be a non-empty string')
+  }
+  if (value.length > MAX_CLIPBOARD_TEXT_CHARS) {
+    throw new Error('text must be at most ' + String(MAX_CLIPBOARD_TEXT_CHARS) + ' characters')
+  }
+  return value
+}
+
 function executeBrowserOperation(method, params, signal) {
   const tabId = Number.isSafeInteger(params?.tabId) ? params.tabId : undefined
   if (tabId === undefined) return executeBrowserOperationNow(method, params, signal)
@@ -1694,6 +1742,41 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.elementNotes':
       return readElementNotes(params)
+    case 'page.clipboardRead': {
+      const response = await clipboardOperation('read')
+      let text = typeof response.text === 'string' ? response.text : ''
+      const totalChars = typeof response.totalChars === 'number' ? response.totalChars : text.length
+      const truncated = totalChars > MAX_CLIPBOARD_TEXT_CHARS
+      if (truncated) text = text.slice(0, MAX_CLIPBOARD_TEXT_CHARS)
+      return { text, totalChars, truncated }
+    }
+    case 'page.clipboardWrite': {
+      const text = requireClipboardText(params.text)
+      await clipboardOperation('write', text)
+      return { written: true, chars: text.length }
+    }
+    case 'page.paste': {
+      const tabId = requireTabId(params.tabId)
+      const text = requireClipboardText(params.text)
+      if (params.selector !== undefined) requireCssSelector(params.selector, 'The paste CSS selector')
+      // Gate + place the text on the clipboard first, then send a real Ctrl+V.
+      await clipboardOperation('write', text)
+      return withDebugger(tabId, async target => {
+        if (params.selector !== undefined) {
+          const nodeId = await querySelectorNode(target, params.selector)
+          await debuggerCommand(target, 'DOM.focus', { nodeId })
+        }
+        const chord = parseKeyChord('Control+V')
+        if (chord === undefined) throw new Error('Could not build the paste key chord')
+        await pressKey(target, chord)
+        return {
+          tabId,
+          pasted: true,
+          chars: text.length,
+          ...(params.selector !== undefined ? { selector: params.selector } : {}),
+        }
+      })
+    }
     case 'page.snapshot': {
       const tabId = requireTabId(params.tabId)
       const maxChars = Number.isInteger(params.maxChars)

@@ -33,6 +33,20 @@
       </form>
       <p id="connection-status" role="status" aria-live="polite"></p>
 
+      <form id="clipboard-form" novalidate>
+        <h2>Clipboard access</h2>
+        <aside class="warning" role="note">
+          <strong>Risk warning</strong>
+          <p>When enabled, DSH can <em>read everything currently on your system clipboard</em> — which may include passwords, tokens, account numbers, or other private data — and can <em>place text on the clipboard</em> and paste it into pages with a real Ctrl+V. Only enable this if you understand and accept these risks. Keep it off unless you need it.</p>
+        </aside>
+        <label class="check"><input id="clipboard-acknowledge" type="checkbox"> I understand the risks and want to allow clipboard access</label>
+        <label class="check"><input id="clipboard-enabled" type="checkbox"> Allow DSH to read the clipboard and paste text into pages</label>
+        <div class="actions">
+          <button type="submit" class="primary">Save clipboard setting</button>
+        </div>
+      </form>
+      <p id="clipboard-status" role="status" aria-live="polite"></p>
+
       <form id="settings-form" novalidate>
         <div id="settings-groups"></div>
         <div class="actions">

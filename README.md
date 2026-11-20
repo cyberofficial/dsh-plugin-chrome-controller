@@ -52,6 +52,18 @@ Older notes are listed under **Unknown page** until you open the original page i
 
 The picker works on HTML pages and can select an iframe or shadow host as a whole. If the page layout changes, check that the XPath still identifies the intended element.
 
+## Clipboard access
+
+The extension can read and write the system clipboard, but **only after you opt in** on the extension Settings page: first check **I understand the risks and want to allow clipboard access**, then check **Allow DSH to read the clipboard and paste text into pages**, and save. Both checkboxes must be on; unchecking the acknowledgement also turns the toggle off. While disabled, every clipboard tool returns an error.
+
+**Risk:** with clipboard access enabled, DSH can read everything currently on your clipboard (which may contain passwords, tokens, or other private data) and can place text on the clipboard and paste it into pages with a real Ctrl+V. Keep it off unless you need it, and never let the model read the clipboard unless the task requires it.
+
+- `dsh_browser_clipboard_read` returns the clipboard as text (capped at 1,000,000 characters). Use it to read what the user copied, for example a large spreadsheet selection copied in Excel or Google Sheets.
+- `dsh_browser_clipboard_write` places text on the clipboard (1 to 1,000,000 characters).
+- `dsh_browser_paste` writes `text` to the clipboard, optionally focuses a CSS `selector`, and sends a real Ctrl+V key event to paste it into the page field.
+
+The clipboard operations run in a dedicated offscreen document (Chrome's `clipboardRead`, `clipboardWrite`, and `offscreen` permissions), which Chrome warns about when the extension is loaded.
+
 ## Browser tools
 
 - `dsh_browser_tabs` lists tabs or opens, activates, and closes one.
@@ -84,6 +96,8 @@ The picker works on HTML pages and can select an iframe or shadow host as a whol
 - `dsh_browser_focus`, `dsh_browser_blur`, and `dsh_browser_select` control standard page focus and native select elements. Selection dispatches input and change events but does not submit the form.
 - `dsh_browser_upload` attaches user-authorized local files to a file input. The site's change handler may upload immediately; the tool does not submit the form.
 - `dsh_browser_download` starts a download, reports its status, or cancels it. Starting defaults to Chrome's Save As dialog.
+- `dsh_browser_element_notes` reads the user's saved element notes (see above), now including each note's stored viewport point (X,Y).
+- `dsh_browser_clipboard_read`, `dsh_browser_clipboard_write`, and `dsh_browser_paste` use the system clipboard — see **Clipboard access** above. They fail with a clear error until the user enables the setting in extension Settings.
 - `dsh_browser_wait_user` marks a human handoff. The model should tell the user what to do and stop browser actions until the user replies.
 
 For spreadsheet work, use the application's name box to jump to distant cells or ranges, then use keyboard navigation and a sequence of type and keypress actions to enter a row or formula. In Excel Online, commit a cell edit with Enter or the OK button (`#m_excelWebRenderer_ewaCtl_okboxButton`) and abandon it with the cancel button (`#m_excelWebRenderer_ewaCtl_cancelboxButton`); both live in the app frame. To read many cells at once, start `dsh_browser_element_watch` on the formula bar (labelled by the name box), navigate the range, then read the log once. In Google Sheets, the name box and formula bar selectors can change; inspect the current DOM before relying on selectors. Canvas grids (Excel Online, Google Sheets) only render visible cells — scroll the region into view first, and if the data's location is unknown, ask the user where it is. The `chrome-browser` skill includes the full step-by-step spreadsheet guide, including the current Google Sheets selectors.
