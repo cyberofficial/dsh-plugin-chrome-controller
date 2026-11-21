@@ -421,6 +421,79 @@ async function typeCharacter(target, char, prevChar, baseDelayMs, settings, sign
   }
 }
 
+// Zeroed timing profile for hyper mode: every character is still a real
+// rawKeyDown/char/keyUp sequence (never bulk insertion), just back-to-back.
+const FAST_TYPE_SETTINGS = Object.freeze({
+  ...DEFAULT_BEHAVIOR_SETTINGS,
+  baseFlightDelayMs: 0,
+  keyHoldMinMs: 0,
+  keyHoldVariationMs: 0,
+  thinkingPauseChancePercent: 0,
+})
+
+/** Type `text` as fast as possible (per-keystroke, ~1ms/char) into the target. */
+async function typeFastIntoTarget(target, text, signal) {
+  let prevChar = ''
+  for (const char of text) {
+    signal?.throwIfAborted()
+    await typeCharacter(target, char, prevChar, 0, FAST_TYPE_SETTINGS, signal)
+    prevChar = char
+  }
+}
+
+/**
+ * Read the current text of the target field: the selector's element when given,
+ * else the focused element. Returns `{ tag, value, text }` via CDP.
+ */
+async function readFieldText(target, selector) {
+  if (selector !== undefined) {
+    const nodeId = await querySelectorNode(target, selector)
+    return callNodeFunction(target, nodeId, 'function () { return { tag: this.tagName, value: typeof this.value === "string" ? this.value : null, text: this.textContent ?? null } }')
+  }
+  const response = await debuggerCommand(target, 'Runtime.evaluate', {
+    expression: `(() => {
+      // Descend into the focused iframe chain (same-origin) so editors like
+      // TinyMCE inside an <iframe> are read correctly.
+      let el = document.activeElement
+      while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME') && el.contentDocument) {
+        el = el.contentDocument.activeElement ?? el.contentDocument.body
+      }
+      return { tag: el ? el.tagName : null, value: el && typeof el.value === 'string' ? el.value : null, text: el ? el.textContent : null }
+    })()`,
+    returnByValue: true,
+  })
+  return response.result?.value
+}
+
+/** Best-effort text of a field read result. */
+function fieldTextOf(field) {
+  if (!isRecord(field)) return ''
+  return typeof field.value === 'string' ? field.value : typeof field.text === 'string' ? field.text : ''
+}
+
+/** Clear a field (input/textarea value + input event; contenteditable textContent). */
+async function clearField(target, selector) {
+  const clearFn = 'function () { if (typeof this.value === "string") { this.value = ""; this.dispatchEvent(new Event("input", { bubbles: true })) } else if (this.isContentEditable) { this.textContent = ""; this.dispatchEvent(new Event("input", { bubbles: true })) } return true }'
+  if (selector !== undefined) {
+    const nodeId = await querySelectorNode(target, selector)
+    await callNodeFunction(target, nodeId, clearFn)
+    return
+  }
+  await debuggerCommand(target, 'Runtime.evaluate', {
+    expression: `(() => {
+      let el = document.activeElement
+      while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME') && el.contentDocument) {
+        el = el.contentDocument.activeElement ?? el.contentDocument.body
+      }
+      if (!el) return false
+      if (typeof el.value === 'string') { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })) }
+      else if (el.isContentEditable) { el.textContent = ''; el.dispatchEvent(new Event('input', { bubbles: true })) }
+      return true
+    })()`,
+    returnByValue: true,
+  })
+}
+
 /** Virtual cursor overlay state (cosmetic; real input always goes via CDP). */
 const overlayTabs = new Set()
 let cursorMoveSequence = 0
@@ -1119,6 +1192,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
   const specs = {
     click: { method: 'page.click', required: [], allowed: ['selector', 'x', 'y'] },
     type_human: { method: 'page.typeHuman', required: ['text'], allowed: ['text', 'selector', 'delayMs'] },
+    type_fast: { method: 'page.typeFast', required: ['text'], allowed: ['text', 'selector'] },
     fill: { method: 'page.fill', required: ['selector', 'text'], allowed: ['selector', 'text', 'delayMs'] },
     paste: { method: 'page.paste', required: ['text'], allowed: ['text', 'selector'] },
     keypress: { method: 'page.keypress', required: ['key'], allowed: ['key'] },
@@ -1235,13 +1309,13 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
         throw new Error('Sequence wait_for_element step ' + String(index + 1) + ' has out-of-range timing')
       }
     }
-    if (['click', 'type_human', 'fill', 'paste', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
+    if (['click', 'type_human', 'type_fast', 'fill', 'paste', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
       && stepParams.selector !== undefined) {
       requireCssSelector(stepParams.selector)
     }
-    if (['type_human', 'fill'].includes(step.action)) {
-      const max = MAX_HUMAN_TEXT_CHARS
-      if (stepParams.text.length > max || (step.action === 'type_human' && stepParams.text.length === 0)) {
+    if (['type_human', 'type_fast', 'fill'].includes(step.action)) {
+      const max = step.action === 'type_fast' ? MAX_CLIPBOARD_TEXT_CHARS : MAX_HUMAN_TEXT_CHARS
+      if (stepParams.text.length > max || (step.action !== 'type_fast' && stepParams.text.length === 0)) {
         throw new Error('Sequence step ' + String(index + 1) + ' has text outside the supported length')
       }
       if (step.action === 'fill' && /[\r\n\t]/u.test(stepParams.text)) {
@@ -1299,10 +1373,57 @@ async function ensureClipboardOffscreen() {
 }
 
 /** Relay one clipboard operation to the offscreen document, gated by the Settings toggle. */
+/**
+ * Read the system clipboard from the active tab. The Async Clipboard API cannot
+ * run in the offscreen document (it can never be focused, so readText always
+ * throws "Document is not focused" there) or in the service worker, so the read
+ * runs in the active tab: readText when the document is focused, with an
+ * execCommand('paste') fallback into a hidden textarea.
+ */
+async function readClipboardFromActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  if (tab?.id === undefined) throw new Error('No active tab to read the clipboard from')
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: async () => {
+      const hasFocus = document.hasFocus()
+      let text = ''
+      let usedFallback = false
+      try {
+        text = await navigator.clipboard.readText()
+      } catch {
+        const ta = document.createElement('textarea')
+        ta.setAttribute('readonly', '')
+        ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none'
+        document.body.appendChild(ta)
+        ta.focus()
+        ta.select()
+        try {
+          if (document.execCommand('paste')) text = ta.value
+        } catch {
+          // reported via hasFocus below
+        }
+        ta.remove()
+        usedFallback = true
+      }
+      return { text, hasFocus, usedFallback }
+    },
+  })
+  const value = result?.result
+  if (!isRecord(value)) throw new Error('Could not read the clipboard from the active tab')
+  if (value.text === '' && value.hasFocus === false) {
+    throw new Error('The active tab document is not focused; focus the Chrome window and retry')
+  }
+  return { ok: true, text: value.text, totalChars: value.text.length, fallback: value.usedFallback }
+}
+
 async function clipboardOperation(action, text) {
   if (!(await clipboardAccessAllowed())) {
     throw new Error('Clipboard access is disabled. Enable it in the extension Settings page after acknowledging the risks.')
   }
+  // Reads must run in a focused document; the offscreen document can never be
+  // focused, so readText there always fails with "Document is not focused".
+  if (action === 'read') return readClipboardFromActiveTab()
   await ensureClipboardOffscreen()
   const response = await chrome.runtime.sendMessage({ dshClipboard: true, action, text })
   if (!isRecord(response) || response.ok !== true) {
@@ -1772,22 +1893,73 @@ async function executeBrowserOperationNow(method, params, signal) {
       const tabId = requireTabId(params.tabId)
       const text = requireClipboardText(params.text)
       if (params.selector !== undefined) requireCssSelector(params.selector, 'The paste CSS selector')
-      // Gate + place the text on the clipboard first, then send a real Ctrl+V.
-      await clipboardOperation('write', text)
+      // Preload: decide the clipboard path up front. When clipboard access is
+      // disabled in Settings, skip the clipboard entirely and hyper-type.
+      const clipboardEnabled = await clipboardAccessAllowed()
+      let clipboardError
+      if (clipboardEnabled) {
+        try {
+          await clipboardOperation('write', text)
+        } catch (error) {
+          clipboardError = error instanceof Error ? error.message : String(error)
+        }
+      } else {
+        clipboardError = 'disabled'
+      }
+      return withDebugger(tabId, async target => {
+        const focusTarget = async () => {
+          if (params.selector !== undefined) {
+            const nodeId = await querySelectorNode(target, params.selector)
+            await debuggerCommand(target, 'DOM.focus', { nodeId })
+          }
+        }
+        const resultBase = { tabId, chars: text.length, ...(params.selector !== undefined ? { selector: params.selector } : {}) }
+        // Try the real Ctrl+V when the clipboard write succeeded; verify by reading the field back.
+        if (clipboardEnabled && clipboardError === undefined) {
+          await focusTarget()
+          const chord = parseKeyChord('Control+V')
+          if (chord === undefined) throw new Error('Could not build the paste key chord')
+          await pressKey(target, chord)
+          const after = await readFieldText(target, params.selector)
+          if (fieldTextOf(after).includes(text)) {
+            return { ...resultBase, pasted: true, hyper: false, verified: true }
+          }
+          clipboardError = 'paste did not change the field'
+        }
+        // Hyper fallback: type the preloaded text as fast as possible (per-keystroke),
+        // then verify the written text and retry once after clearing on mismatch.
+        await focusTarget()
+        await typeFastIntoTarget(target, text, signal)
+        let verified = fieldTextOf(await readFieldText(target, params.selector)).includes(text)
+        if (!verified) {
+          await clearField(target, params.selector)
+          await focusTarget()
+          await typeFastIntoTarget(target, text, signal)
+          verified = fieldTextOf(await readFieldText(target, params.selector)).includes(text)
+        }
+        return {
+          ...resultBase,
+          pasted: false,
+          hyper: true,
+          verified,
+          clipboard: clipboardError === 'disabled' ? 'disabled' : 'failed',
+          ...(clipboardError !== 'disabled' ? { clipboardError } : {}),
+        }
+      })
+    }
+    case 'page.typeFast': {
+      const tabId = requireTabId(params.tabId)
+      if (typeof params.text !== 'string' || params.text.length === 0 || params.text.length > MAX_CLIPBOARD_TEXT_CHARS) {
+        throw new Error('Text must be a non-empty string of at most ' + String(MAX_CLIPBOARD_TEXT_CHARS) + ' characters')
+      }
+      if (params.selector !== undefined) requireCssSelector(params.selector, 'The type_fast CSS selector')
       return withDebugger(tabId, async target => {
         if (params.selector !== undefined) {
           const nodeId = await querySelectorNode(target, params.selector)
           await debuggerCommand(target, 'DOM.focus', { nodeId })
         }
-        const chord = parseKeyChord('Control+V')
-        if (chord === undefined) throw new Error('Could not build the paste key chord')
-        await pressKey(target, chord)
-        return {
-          tabId,
-          pasted: true,
-          chars: text.length,
-          ...(params.selector !== undefined ? { selector: params.selector } : {}),
-        }
+        await typeFastIntoTarget(target, params.text, signal)
+        return { tabId, typedCharacters: params.text.length, hyper: true, ...(params.selector !== undefined ? { selector: params.selector } : {}) }
       })
     }
     case 'page.snapshot': {
