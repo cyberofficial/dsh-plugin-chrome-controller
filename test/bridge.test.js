@@ -1,0 +1,294 @@
+import assert from 'node:assert/strict'
+import { Readable } from 'node:stream'
+import { afterEach, beforeEach, describe, it, mock } from 'node:test'
+import { BrowserExtensionBridge } from '../lib/bridge.js'
+
+const EXTENSION_ORIGIN = 'chrome-extension://' + 'a'.repeat(32)
+const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
+const TRUSTED_HOST = 'dsh.example.ts.net'
+
+/** Minimal plugin context: captures routes and models DSH's /api Host fence. */
+function fakeContext({ bindHost = '127.0.0.1', rejection } = {}) {
+  const routes = new Map()
+  const fetchRoutes = new Map()
+  const records = new Map()
+  const handlers = new Map()
+  const context = {
+    routes,
+    fetchRoutes,
+    webServer: {
+      host: bindHost,
+      register(route) {
+        routes.set(route.path, route.handler)
+        return () => routes.delete(route.path)
+      },
+    },
+    connection: {
+      fetch: {
+        register(route) {
+          fetchRoutes.set(route.path, route.fetch)
+          return () => fetchRoutes.delete(route.path)
+        },
+      },
+      requestRejection: rejection ?? (request => {
+        const host = request.headers.host
+        if (host === TRUSTED_HOST || host === 'localhost:3080' || host === '127.0.0.1:3080') return 401
+        return 403
+      }),
+    },
+    credentials: {
+      async readRecord(key) { return records.get(key) },
+      async modifyRecord(key, update) {
+        const next = await update(records.get(key))
+        if (next !== undefined) records.set(key, next)
+        return records.get(key)
+      },
+    },
+    handlers,
+    on(event, handler) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler])
+      return () => handlers.delete(event)
+    },
+    effect: () => {},
+  }
+  return context
+}
+
+/** Drive one extension route with a fake node:http exchange. */
+async function call(context, path, { method = 'POST', host = TRUSTED_HOST, origin = EXTENSION_ORIGIN, remoteAddress = '100.64.0.7', body } = {}) {
+  const request = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))])
+  request.method = method
+  request.headers = { host, ...(origin === null ? {} : { origin }) }
+  request.socket = { remoteAddress }
+  let status
+  let headers = {}
+  let text = ''
+  const listeners = new Map()
+  const response = {
+    destroyed: false,
+    writeHead(code, values) { status = code; headers = values ?? {} },
+    end(chunk) { if (chunk !== undefined) text += String(chunk) },
+    once(event, listener) { listeners.set(event, listener) },
+    removeListener(event) { listeners.delete(event) },
+  }
+  const handler = context.routes.get('/dsh-browser-extension/' + path)
+  assert.ok(handler, 'route ' + path + ' is registered')
+  await handler(request, response)
+  return { status, headers, json: text === '' ? undefined : JSON.parse(text) }
+}
+
+async function pairingCode(context) {
+  return (await context.credentials.readRecord(PAIRING_KEY)).key
+}
+
+async function connect(context, options = {}) {
+  const code = await pairingCode(context)
+  const authorized = await call(context, 'authorize', { ...options, body: { pairingCode: code } })
+  assert.equal(authorized.status, 200)
+  const connected = await call(context, 'connect', { ...options, body: { pairToken: authorized.json.pairToken } })
+  assert.equal(connected.status, 200)
+  return connected.json.sessionToken
+}
+
+describe('BrowserExtensionBridge authority admission', () => {
+  let bridge
+  afterEach(async () => { await bridge?.close(); bridge = undefined })
+
+  it('keeps loopback pairing working', async () => {
+    const context = fakeContext({ rejection: () => 403 })
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const loopback = { host: '127.0.0.1:3080', remoteAddress: '127.0.0.1' }
+    const preflight = await call(context, 'authorize', { ...loopback, method: 'OPTIONS' })
+    assert.equal(preflight.status, 204)
+    assert.equal(preflight.headers['access-control-allow-origin'], EXTENSION_ORIGIN)
+    await connect(context, loopback)
+  })
+
+  it('accepts a Host that DSH Web trusts from a remote peer and completes a command round trip', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 5000 })
+    assert.equal((await call(context, 'authorize', { method: 'OPTIONS' })).status, 204)
+    const sessionToken = await connect(context)
+    const result = bridge.request('tabs.list', { a: 1 })
+    const polled = await call(context, 'poll', { body: { sessionToken } })
+    assert.equal(polled.status, 200)
+    assert.equal(polled.json.commands.length, 1)
+    const [command] = polled.json.commands
+    assert.equal(command.method, 'tabs.list')
+    const responded = await call(context, 'respond', { body: { sessionToken, id: command.id, ok: true, result: { tabs: [] } } })
+    assert.equal(responded.status, 200)
+    assert.deepEqual(await result, { tabs: [] })
+  })
+
+  it('rejects a Host that DSH Web does not trust', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    assert.equal((await call(context, 'authorize', { method: 'OPTIONS', host: 'evil.example' })).status, 403)
+    const code = await pairingCode(context)
+    const denied = await call(context, 'authorize', { host: 'evil.example', body: { pairingCode: code } })
+    assert.equal(denied.status, 403)
+    assert.equal(denied.headers['access-control-allow-origin'], undefined)
+  })
+
+  it('rejects a trusted Host when the Origin is not a Chrome extension', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const code = await pairingCode(context)
+    for (const origin of ['https://evil.example', null]) {
+      const denied = await call(context, 'authorize', { origin, body: { pairingCode: code } })
+      assert.equal(denied.status, 403)
+    }
+  })
+
+  it('still rejects a loopback Host from a remote peer when DSH Web does not trust it', async () => {
+    const context = fakeContext({ rejection: () => 403 })
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const denied = await call(context, 'authorize', { method: 'OPTIONS', host: '127.0.0.1:3080', remoteAddress: '172.19.0.9' })
+    assert.equal(denied.status, 403)
+  })
+
+  it('lets the webserver/authorize hook admit only trusted extension requests', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const [hook] = context.handlers.get('webserver/authorize')
+    const request = ({ host = TRUSTED_HOST, origin = EXTENSION_ORIGIN, method = 'POST', pathname = '/dsh-browser-extension/connect', remoteAddress = '100.64.0.7' } = {}) => ({
+      transport: 'http', method, url: { pathname }, headers: { host, origin }, socket: { remoteAddress },
+    })
+    assert.deepEqual(hook(request(), 'anonymous'), { kind: 'allow' })
+    assert.deepEqual(hook(request({ method: 'OPTIONS' }), 'anonymous'), { kind: 'allow' })
+    assert.deepEqual(hook(request({ host: '127.0.0.1:3080', remoteAddress: '127.0.0.1' }), 'anonymous'), { kind: 'allow' })
+    assert.equal(hook(request({ host: 'evil.example' }), 'anonymous'), undefined)
+    assert.equal(hook(request({ origin: 'https://evil.example' }), 'anonymous'), undefined)
+    assert.equal(hook(request({ pathname: '/api/other' }), 'anonymous'), undefined)
+    assert.equal(hook(request({ method: 'GET' }), 'anonymous'), undefined)
+    assert.equal(hook(request(), 'session'), undefined)
+    await bridge.close()
+    assert.equal(hook(request(), 'anonymous'), undefined)
+  })
+
+  it('preflights, admits and rejects on every extension route', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const sessionToken = await connect(context)
+    for (const path of ['authorize', 'connect', 'poll', 'respond', 'disconnect']) {
+      assert.equal((await call(context, path, { method: 'OPTIONS' })).status, 204, path + ' preflight')
+      assert.equal((await call(context, path, { method: 'OPTIONS', host: 'evil.example' })).status, 403, path + ' untrusted preflight')
+      assert.equal((await call(context, path, { host: 'evil.example', body: {} })).status, 403, path + ' untrusted host')
+      assert.equal((await call(context, path, { origin: 'https://evil.example', body: {} })).status, 403, path + ' web origin')
+      assert.equal((await call(context, path, { method: 'GET' })).status, 405, path + ' method')
+    }
+    const disconnected = await call(context, 'disconnect', { body: { sessionToken } })
+    assert.equal(disconnected.status, 200)
+    assert.equal((await call(context, 'poll', { body: { sessionToken } })).status, 401)
+  })
+
+  it('fails closed when the Host fence throws', async () => {
+    const context = fakeContext({ rejection: () => { throw new Error('boom') } })
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    assert.equal((await call(context, 'authorize', { method: 'OPTIONS' })).status, 403)
+  })
+
+  it('fails closed on an unexpected fence status', async () => {
+    for (const status of [400, 429, 500]) {
+      const context = fakeContext({ rejection: () => status })
+      const local = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+      const result = await call(context, 'authorize', { method: 'OPTIONS' })
+      await local.close()
+      assert.equal(result.status, 403, `status ${status}`)
+    }
+  })
+
+  it('starts when DSH Web binds an address other than 127.0.0.1', async () => {
+    const context = fakeContext({ bindHost: '172.19.0.4' })
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    assert.ok(context.routes.has('/dsh-browser-extension/connect'))
+  })
+})
+
+describe('BrowserExtensionBridge pairing failure limit', () => {
+  let bridge
+  beforeEach(() => mock.timers.enable({ apis: ['Date'], now: 1_000_000 }))
+  afterEach(async () => {
+    await bridge?.close()
+    bridge = undefined
+    mock.timers.reset()
+  })
+
+  it('refuses every attempt after 10 wrong codes in a minute, then recovers', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const wrong = { body: { pairingCode: 'x'.repeat(24) } }
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      assert.equal((await call(context, 'authorize', wrong)).status, 401)
+    }
+    const limited = await call(context, 'authorize', wrong)
+    assert.equal(limited.status, 429)
+    assert.match(limited.json.error, /wait a minute/u)
+    const code = await pairingCode(context)
+    assert.equal((await call(context, 'authorize', { body: { pairingCode: code } })).status, 429)
+    mock.timers.tick(60_001)
+    assert.equal((await call(context, 'authorize', { body: { pairingCode: code } })).status, 200)
+  })
+
+  it('resets the failure count after a successful pairing', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const wrong = { body: { pairingCode: 'x'.repeat(24) } }
+    for (let attempt = 0; attempt < 9; attempt += 1) await call(context, 'authorize', wrong)
+    const code = await pairingCode(context)
+    assert.equal((await call(context, 'authorize', { body: { pairingCode: code } })).status, 200)
+    for (let attempt = 0; attempt < 9; attempt += 1) {
+      assert.equal((await call(context, 'authorize', wrong)).status, 401)
+    }
+  })
+})
+
+describe('pairing settings page', () => {
+  it('shows the escaped origin the user browsed to', async () => {
+    const context = fakeContext()
+    const bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    try {
+      const page = await context.fetchRoutes.get('/api/dsh-browser-extension/pairing')(new Request('http://x/api/dsh-browser-extension/pairing', {
+        headers: { host: 'dsh.example.ts.net"><b', 'x-forwarded-proto': 'https' },
+      }))
+      const html = await page.text()
+      assert.match(html, /value="https:\/\/dsh\.example\.ts\.net&#34;&#62;&#60;b"/u)
+    } finally {
+      await bridge.close()
+    }
+  })
+})
+
+describe('pairing page HTTPS hint', () => {
+  async function pageFor(headers) {
+    const context = fakeContext()
+    const bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    try {
+      const page = await context.fetchRoutes.get('/api/dsh-browser-extension/pairing')(new Request('http://x/api/dsh-browser-extension/pairing', { headers }))
+      return await page.text()
+    } finally {
+      await bridge.close()
+    }
+  }
+
+  it('warns when the shown remote origin is plain HTTP', async () => {
+    assert.match(await pageFor({ host: TRUSTED_HOST }), /enter the <code>https:\/\/<\/code> form/u)
+  })
+
+  it('stays quiet for HTTPS remote origins and loopback origins', async () => {
+    assert.doesNotMatch(await pageFor({ host: TRUSTED_HOST, 'x-forwarded-proto': 'https' }), /form of this address/u)
+    assert.doesNotMatch(await pageFor({ host: '127.0.0.1:3080' }), /form of this address/u)
+  })
+})
+
+describe('extension origin rule', () => {
+  it('allows loopback over HTTP or HTTPS and remote hosts only over HTTPS', async () => {
+    const { normalizeDshOrigin } = await import('../extension/origin.js')
+    assert.equal(normalizeDshOrigin('http://127.0.0.1:3080/x'), 'http://127.0.0.1:3080')
+    assert.equal(normalizeDshOrigin('https://localhost:3080'), 'https://localhost:3080')
+    assert.equal(normalizeDshOrigin('https://dsh.example.com'), 'https://dsh.example.com')
+    assert.equal(normalizeDshOrigin('http://dsh.example.com'), undefined)
+    assert.equal(normalizeDshOrigin('ftp://127.0.0.1'), undefined)
+    assert.equal(normalizeDshOrigin(''), undefined)
+  })
+})

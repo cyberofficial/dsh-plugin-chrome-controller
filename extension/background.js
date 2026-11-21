@@ -1,3 +1,5 @@
+import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
 const POLL_PATH = '/dsh-browser-extension/poll'
@@ -10,7 +12,6 @@ const ELEMENT_NOTE_MENU_ID = 'dsh-element-note-mode'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
-const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const RECONNECT_ALARM = 'dsh-browser-reconnect'
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5
 const RECONNECT_WANTED_KEY = 'dshBrowserReconnectWanted'
@@ -971,19 +972,6 @@ function logDragTrace(id, event, details = {}) {
   }))
 }
 
-/** Normalize a user-supplied DSH Web origin; only loopback HTTP(S) is allowed. */
-function normalizeDshOrigin(value) {
-  if (typeof value !== 'string' || value.trim() === '') return undefined
-  try {
-    const url = new URL(value.trim())
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-    if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return undefined
-    return url.origin
-  } catch {
-    return undefined
-  }
-}
-
 function ensureTrustedLocalStorage() {
   trustedStorageTask ??= chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
     .catch(error => { trustedStorageTask = undefined; throw error })
@@ -996,7 +984,7 @@ async function readConnectionSettings() {
   const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
   const settings = stored?.[CONNECTION_SETTINGS_KEY]
   const origin = settings?.origin === undefined ? DEFAULT_DSH_ORIGIN : normalizeDshOrigin(settings.origin)
-  if (origin === undefined) throw new Error('Set a valid local DSH Web address in Settings')
+  if (origin === undefined) throw new Error('Set a loopback or HTTPS DSH Web address in Settings')
   return {
     origin,
     pairingCode: typeof settings?.pairingCode === 'string' ? settings.pairingCode.trim() : '',
