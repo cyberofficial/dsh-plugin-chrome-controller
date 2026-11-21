@@ -1,7 +1,8 @@
+import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
 const CLIPBOARD_SETTINGS_KEY = 'dshBrowserClipboardSettings'
-const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const PAIRING_SETTINGS_PATH = '/api/dsh-browser-extension/pairing'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
 
@@ -225,24 +226,15 @@ clipboardForm.addEventListener('submit', async event => {
   }
 })
 
-/** Accept only loopback HTTP(S) origins; empty resets to the default. */
+/** Normalize the origin field; empty resets to the default. */
 function readOrigin() {
   const raw = originInput.value.trim()
-  if (raw === '') return DEFAULT_DSH_ORIGIN
-  let url
-  try {
-    url = new URL(raw)
-  } catch {
-    return undefined
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-  if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return undefined
-  return url.origin
+  return raw === '' ? DEFAULT_DSH_ORIGIN : normalizeDshOrigin(raw)
 }
 
 function updatePairingPage() {
   const origin = readOrigin()
-  pairingPageNode.textContent = origin === undefined ? 'Enter a valid local address' : origin + PAIRING_SETTINGS_PATH
+  pairingPageNode.textContent = origin === undefined ? 'Enter a loopback or HTTPS address' : origin + PAIRING_SETTINGS_PATH
 }
 
 originInput.addEventListener('input', updatePairingPage)
@@ -251,7 +243,7 @@ connectionForm.addEventListener('submit', async event => {
   event.preventDefault()
   const origin = readOrigin()
   if (origin === undefined) {
-    originInput.setCustomValidity('Enter a local address such as http://127.0.0.1:3080')
+    originInput.setCustomValidity('Enter a loopback address such as http://127.0.0.1:3080, or an HTTPS address such as https://dsh.example.com')
     originInput.reportValidity()
     return
   }
