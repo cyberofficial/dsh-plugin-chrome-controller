@@ -1120,6 +1120,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     click: { method: 'page.click', required: [], allowed: ['selector', 'x', 'y'] },
     type_human: { method: 'page.typeHuman', required: ['text'], allowed: ['text', 'selector', 'delayMs'] },
     fill: { method: 'page.fill', required: ['selector', 'text'], allowed: ['selector', 'text', 'delayMs'] },
+    paste: { method: 'page.paste', required: ['text'], allowed: ['text', 'selector'] },
     keypress: { method: 'page.keypress', required: ['key'], allowed: ['key'] },
     mouse_move: { method: 'page.mouseMove', required: [], allowed: ['selector', 'x', 'y'] },
     drag: { method: 'page.drag', required: [], allowed: ['fromSelector', 'toSelector', 'fromX', 'fromY', 'toX', 'toY', 'durationMs'] },
@@ -1234,7 +1235,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
         throw new Error('Sequence wait_for_element step ' + String(index + 1) + ' has out-of-range timing')
       }
     }
-    if (['click', 'type_human', 'fill', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
+    if (['click', 'type_human', 'fill', 'paste', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
       && stepParams.selector !== undefined) {
       requireCssSelector(stepParams.selector)
     }
@@ -1246,6 +1247,9 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
       if (step.action === 'fill' && /[\r\n\t]/u.test(stepParams.text)) {
         throw new Error('Sequence fill step ' + String(index + 1) + ' cannot contain tabs or line breaks')
       }
+    }
+    if (step.action === 'paste' && (stepParams.text.length === 0 || stepParams.text.length > MAX_CLIPBOARD_TEXT_CHARS)) {
+      throw new Error('Sequence step ' + String(index + 1) + ' has text outside the supported length')
     }
     if (step.action === 'keypress' && KEYS[stepParams.key] === undefined && parseKeyChord(stepParams.key) === undefined) {
       throw new Error('Sequence step ' + String(index + 1) + ' has an unsupported key')
