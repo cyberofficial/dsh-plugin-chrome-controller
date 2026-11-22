@@ -4812,6 +4812,9 @@ function downloadUrl(value) {
  * page path (fetchFileWithTabSession) uses this; retries keep using downloadUrl.
  */
 function fileSourceUrl(value) {
+  if (typeof value === 'string' && /^data:/iu.test(value.trim())) {
+    throw new Error('data: URLs are not supported. Turn it into a blob: URL in the page with fetch(dataUrl).then(r => r.blob()).then(b => URL.createObjectURL(b)), then pass that blob: URL.')
+  }
   if (typeof value === 'string' && /^blob:/iu.test(value.trim())) {
     let url
     let inner

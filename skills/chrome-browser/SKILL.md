@@ -138,7 +138,7 @@ window.__u = URL.createObjectURL(new Blob([window.__bytes], { type: 'application
 {"tabId":123,"url":"blob:https://example.com/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11","filename":"invoice.pdf"}
 ```
 
-The blob is read inside that tab and frame only (pass the `frameId` if the page that created it is an iframe), needs no approval, and fails with an explicit error if it was revoked or belongs to another tab.
+If the page gives you a `data:` URL instead (an `<a href="data:…">` or an image source), do not pass it to the tool or copy it out of the page: convert it in place with `dsh_browser_evaluate`, `fetch(dataUrl).then(r => r.blob()).then(b => { window.__u = URL.createObjectURL(b) })`, then save `window.__u`. The blob is read inside that tab and frame only (pass the `frameId` if the page that created it is an iframe), needs no approval, and fails with an explicit error if it was revoked or belongs to another tab.
 
 Click a button by CSS selector, or click a point from a recent screenshot:
 

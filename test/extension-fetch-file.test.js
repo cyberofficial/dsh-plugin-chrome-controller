@@ -190,6 +190,11 @@ describe('blob: URLs', () => {
     }
   })
 
+  it('fileSourceUrl refuses data: URLs with a hint to convert them to a blob', () => {
+    const { fileSourceUrl } = loadRetryFlow({ pagePayload: {} })
+    assert.throws(() => fileSourceUrl('data:application/pdf;base64,JVBERg=='), /data: URLs are not supported.*URL\.createObjectURL/u)
+  })
+
   it('the page path returns a blob: payload and never asks for an approval', async () => {
     const payload = { via: 'page', finalUrl: blobUrl, bytes: 4, base64: 'JVBERg==', contentType: 'application/pdf' }
     const flow = loadRetryFlow({ pagePayload: payload })
