@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -116,6 +117,63 @@ describe('dsh_browser_save_file', () => {
     assert.equal(result.finalOrigin, 'https://shop.test')
     assert.equal(result.base64, undefined)
     assert.deepEqual(await readFile(join(root, '.tmp', 'downloads', 'Invoice-1.pdf')), pdf)
+    assert.deepEqual(context.services.approval.asked, [])
+  })
+
+  it('saves a blob: URL read by the page, without leaking the blob URL', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const blobUrl = 'blob:https://www.shop.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+    const pdf = Buffer.from('%PDF-1.4 test')
+    const answer = await pairAndAnswer(context, () => ({
+      tabId: 7, frameId: 0, via: 'page', finalUrl: blobUrl, status: 200,
+      contentType: 'application/pdf', contentDisposition: '', bytes: pdf.length, base64: pdf.toString('base64'),
+    }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: blobUrl, filename: 'blob-test.pdf' }, exec())
+    const command = await answer()
+    assert.deepEqual(command.params, { tabId: 7, url: blobUrl })
+    const result = await pending
+    assert.equal(result.relativePath, '.tmp/downloads/blob-test.pdf')
+    assert.equal(result.fetchedBy, 'page')
+    assert.equal(result.bytes, pdf.length)
+    assert.equal(result.finalOrigin, 'https://www.shop.test')
+    assert.equal(result.sha256, createHash('sha256').update(pdf).digest('hex'))
+    assert.ok(!JSON.stringify(result).includes('blob:'))
+    assert.deepEqual(await readFile(join(root, '.tmp', 'downloads', 'blob-test.pdf')), pdf)
+    assert.deepEqual(context.services.approval.asked, [])
+  })
+
+  it('derives the name of a blob: save from the content, and never from the UUID', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const blobUrl = 'blob:https://www.shop.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+    const pdf = Buffer.from('%PDF-1.4 test')
+    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: blobUrl, contentType: 'application/pdf', bytes: pdf.length, base64: pdf.toString('base64') }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: blobUrl }, exec())
+    await answer()
+    assert.equal((await pending).relativePath, '.tmp/downloads/download.pdf')
+  })
+
+  it('asks for a filename when a blob: save has no recognisable content, and writes nothing', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const blobUrl = 'blob:https://www.shop.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+    const data = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x99, 0xfe])
+    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: blobUrl, contentType: 'application/octet-stream', bytes: data.length, base64: data.toString('base64') }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: blobUrl }, exec())
+    await answer()
+    await assert.rejects(pending, /Pass a filename with an extension/u)
+    await assert.rejects(readdir(join(root, '.tmp', 'downloads')), { code: 'ENOENT' })
+  })
+
+  it('never offers an approval prompt for a blob: URL, even if the extension asks for one', async () => {
+    context = fakePluginContext({ root, approvals: ['allowed-once'] })
+    await apply(context)
+    const blobUrl = 'blob:https://www.shop.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+    const answer = await pairAndAnswer(context, () => ({ tabId: 7, needsApproval: 'cors-retry', url: blobUrl, retryToken: 'token-1' }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: blobUrl, filename: 'a.pdf' }, exec())
+    await answer()
+    await assert.rejects(pending, /could not be read from this tab/u)
     assert.deepEqual(context.services.approval.asked, [])
   })
 

@@ -39,6 +39,8 @@ describe('file name selection', () => {
     assert.equal(chooseFileName({ url: 'https://e.test/docs/y%20z.pdf?sig=1' }), 'y z.pdf')
     assert.equal(chooseFileName({ url: 'https://e.test/' }), 'download')
     assert.equal(chooseFileName({ url: 'https://e.test/invoice' }), 'invoice')
+    assert.equal(chooseFileName({ url: 'blob:https://e.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11' }), 'download')
+    assert.equal(chooseFileName({ requested: 'mine.pdf', url: 'blob:https://e.test/3f1c2b7e' }), 'mine.pdf')
   })
 })
 

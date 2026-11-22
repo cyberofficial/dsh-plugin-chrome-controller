@@ -43,8 +43,8 @@ function loadRetryFlow({ pagePayload, redirects = [] }) {
     'const FETCH_RETRY_TOKEN_TTL_MS = 60000',
     'const MAX_FETCH_RETRY_TOKENS = 20',
     'const fetchRetryTokens = new Map()',
-    ...['fetchFileWithTabSession', 'fetchFileApprovedRetry', 'downloadUrl', 'issueFetchRetryToken', 'consumeFetchRetryToken', 'fetchFileAsBase64'].map(extractFunction),
-    'return { fetchFileWithTabSession, fetchFileApprovedRetry, listeners: () => 0 }',
+    ...['fetchFileWithTabSession', 'fetchFileApprovedRetry', 'downloadUrl', 'fileSourceUrl', 'issueFetchRetryToken', 'consumeFetchRetryToken', 'fetchFileAsBase64'].map(extractFunction),
+    'return { fetchFileWithTabSession, fetchFileApprovedRetry, fileSourceUrl, listeners: () => 0 }',
   ].join('\n')
   const api = new Function('chrome', 'self', 'requireTabId', 'requireFrameId', 'isRecord', 'httpUrl', 'runInFrame', body)(
     chrome, self, helpers.requireTabId, helpers.requireFrameId, helpers.isRecord, helpers.httpUrl, helpers.runInFrame)
@@ -172,5 +172,67 @@ describe('extension approved retry', () => {
     globalThis.fetch = async () => { flow.emitRedirects(); return { type: 'opaqueredirect', ok: false, status: 0 } }
     const first = await flow.fetchFileWithTabSession({ tabId: 7, url: 'https://shop.test/dl' })
     await assert.rejects(flow.fetchFileApprovedRetry({ tabId: 7, url: 'https://shop.test/dl', retryToken: first.retryToken }), /unsupported URL/u)
+  })
+})
+
+describe('blob: URLs', () => {
+  const blobUrl = 'blob:https://www.shop.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+  afterEach(() => { globalThis.fetch = realFetch })
+
+  it('fileSourceUrl accepts http(s) and blob:https URLs, and nothing else', () => {
+    const { fileSourceUrl } = loadRetryFlow({ pagePayload: {} })
+    assert.equal(fileSourceUrl('https://shop.test/a.pdf'), 'https://shop.test/a.pdf')
+    assert.equal(fileSourceUrl('http://shop.test/a.pdf'), 'http://shop.test/a.pdf')
+    assert.equal(fileSourceUrl(blobUrl), blobUrl)
+    assert.equal(fileSourceUrl('blob:http://localhost:3000/abc'), 'blob:http://localhost:3000/abc')
+    for (const bad of ['blob:null/abc', 'blob:file:///tmp/a', 'blob:ftp://host/abc', 'blob:', 'blob:not a url', 'ftp://shop.test/a', 'javascript:alert(1)', 'file:///etc/passwd', 'data:text/plain,hi', 'https://user:pw@shop.test/a.pdf', 'blob:https://user:pw@shop.test/abc', undefined]) {
+      assert.throws(() => fileSourceUrl(bad), undefined, String(bad))
+    }
+  })
+
+  it('the page path returns a blob: payload and never asks for an approval', async () => {
+    const payload = { via: 'page', finalUrl: blobUrl, bytes: 4, base64: 'JVBERg==', contentType: 'application/pdf' }
+    const flow = loadRetryFlow({ pagePayload: payload })
+    const result = await flow.fetchFileWithTabSession({ tabId: 7, url: blobUrl })
+    assert.equal(result.needsApproval, undefined)
+    assert.equal(result.retryToken, undefined)
+    assert.equal(result.base64, 'JVBERg==')
+  })
+
+  it('turns a CORS-blocked or failed page result into an explicit error, not a retry token', async () => {
+    const flow = loadRetryFlow({ pagePayload: { blockedByCors: true } })
+    await assert.rejects(flow.fetchFileWithTabSession({ tabId: 7, url: blobUrl }), /^Error: The blob: URL could not be read from this tab\. Blob URLs only work in the tab and frame that created them/u)
+  })
+
+  it('fetchFileAsBase64 reads a blob: URL, and reports a revoked one without probing no-cors', async () => {
+    const calls = stubFetch({ cors: () => new Response('%PDF-1.4 test', { headers: { 'content-type': 'application/pdf' } }) })
+    const ok = await fetchFileAsBase64(blobUrl, 1024, 'page')
+    assert.equal(Buffer.from(ok.base64, 'base64').toString(), '%PDF-1.4 test')
+    assert.equal(ok.bytes, 13)
+    assert.deepEqual(calls, ['cors'])
+    const failing = stubFetch({
+      cors: () => { throw new TypeError('Failed to fetch') },
+      noCors: () => new Response(null, { status: 200 }),
+    })
+    const revoked = await fetchFileAsBase64(blobUrl, 1024, 'page')
+    assert.equal(revoked.blockedByCors, undefined)
+    assert.match(revoked.error, /could not be read from this tab/u)
+    assert.deepEqual(failing, ['cors'])
+  })
+
+  it('keeps the 10 MiB-style byte limit for blob: URLs', async () => {
+    stubFetch({ cors: () => new Response('x'.repeat(20)) })
+    assert.match((await fetchFileAsBase64(blobUrl, 10, 'page')).error, /larger than the 10-byte limit/u)
+  })
+
+  it('never lets the service worker retry a blob: URL, and httpUrl-based paths still refuse it', async () => {
+    let fetched = 0
+    globalThis.fetch = async () => { fetched++; return new Response('x') }
+    const flow = loadRetryFlow({ pagePayload: {} })
+    await assert.rejects(flow.fetchFileApprovedRetry({ tabId: 7, url: blobUrl, retryToken: 'anything' }), /Only HTTP and HTTPS/u)
+    assert.equal(fetched, 0)
+    const httpUrlSource = extractFunction('httpUrl')
+    const httpUrl = new Function(httpUrlSource + '\nreturn httpUrl')()
+    assert.throws(() => httpUrl(blobUrl), /Only HTTP and HTTPS pages can be opened/u)
   })
 })

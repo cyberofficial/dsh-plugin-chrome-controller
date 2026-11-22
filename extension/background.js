@@ -4739,10 +4739,12 @@ function extractPage(params) {
 async function fetchFileWithTabSession(params) {
   const tabId = requireTabId(params.tabId)
   const frameId = params.frameId === undefined ? 0 : requireFrameId(params.frameId)
-  const url = downloadUrl(params.url)
+  const url = fileSourceUrl(params.url)
   const payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
   if (!isRecord(payload)) throw new Error('The tab returned no download result')
   if (payload.blockedByCors === true) {
+    // The service worker cannot read a page's blob: URL, so it is never retried there.
+    if (url.startsWith('blob:')) throw new Error('The blob: URL could not be read from this tab. Blob URLs only work in the tab and frame that created them; pass that tabId/frameId and call before the page revokes it.')
     return { tabId, frameId, needsApproval: 'cors-retry', url, retryToken: issueFetchRetryToken(tabId, url) }
   }
   if (typeof payload.error === 'string') throw new Error(payload.error)
@@ -4803,6 +4805,31 @@ function downloadUrl(value) {
   return parsedUrl.href
 }
 
+/**
+ * A URL dsh_browser_save_file may have a tab fetch: an HTTP(S) download URL, or
+ * a blob: URL minted by a page (blob:https://host/uuid). A blob: URL is only
+ * ever read by the page that owns it, never by the service worker, so only the
+ * page path (fetchFileWithTabSession) uses this; retries keep using downloadUrl.
+ */
+function fileSourceUrl(value) {
+  if (typeof value === 'string' && /^blob:/iu.test(value.trim())) {
+    let url
+    let inner
+    try {
+      url = new URL(value.trim())
+      inner = new URL(url.pathname)
+    } catch {
+      throw new Error('The blob: URL is invalid')
+    }
+    if (url.origin === 'null' || (inner.protocol !== 'http:' && inner.protocol !== 'https:')) {
+      throw new Error('Only blob: URLs created by an HTTP or HTTPS page can be saved')
+    }
+    if (inner.username || inner.password) throw new Error('Download URLs cannot contain embedded credentials')
+    return url.href
+  }
+  return downloadUrl(value)
+}
+
 function issueFetchRetryToken(tabId, url) {
   const now = Date.now()
   for (const [token, entry] of fetchRetryTokens) {
@@ -4834,10 +4861,15 @@ function consumeFetchRetryToken(token, tabId, url) {
  */
 async function fetchFileAsBase64(url, maxBytes, via, redirect = 'follow') {
   const requester = via === 'page' ? 'The page' : 'The extension'
+  // A blob: URL is readable only by the frame that created it: never probe it
+  // with no-cors, and never report it as CORS-blocked (which would invite a retry).
+  const isBlob = url.startsWith('blob:')
+  const blobError = { error: 'The blob: URL could not be read from this tab. Blob URLs only work in the tab and frame that created them; pass that tabId/frameId and call before the page revokes it.' }
   let response
   try {
     response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect })
   } catch (error) {
+    if (isBlob) return blobError
     if (via === 'page') {
       try {
         await fetch(url, { mode: 'no-cors', credentials: 'include', cache: 'no-store', redirect: 'follow' })
@@ -4848,6 +4880,7 @@ async function fetchFileAsBase64(url, maxBytes, via, redirect = 'follow') {
   }
   if (redirect === 'manual' && response.type === 'opaqueredirect') return { redirected: true }
   if (response.type === 'opaque' || response.type === 'opaqueredirect') {
+    if (isBlob) return blobError
     return via === 'page' ? { blockedByCors: true } : { error: requester + ' cannot read the response' }
   }
   if (!response.ok) return { error: requester + ' request failed with HTTP status ' + String(response.status) }
