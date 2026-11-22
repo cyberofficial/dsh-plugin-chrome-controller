@@ -19,7 +19,7 @@ function extractFunction(name) {
   assert.ok(found, name + ' is present in background.js')
   return found[0]
 }
-function loadRetryFlow({ pagePayload, redirects = [] }) {
+function loadRetryFlow({ pagePayload, redirects = [], onRunInFrame }) {
   const listeners = new Set()
   const chrome = {
     webRequest: {
@@ -35,7 +35,7 @@ function loadRetryFlow({ pagePayload, redirects = [] }) {
     requireFrameId: value => value,
     isRecord: value => value !== null && typeof value === 'object',
     httpUrl: value => { const url = new URL(value); if (!/^https?:$/u.test(url.protocol)) throw new Error('Only HTTP and HTTPS pages can be opened'); return value },
-    runInFrame: async () => pagePayload,
+    runInFrame: async (...args) => { onRunInFrame?.(...args); return pagePayload },
     emitRedirects: () => { for (const details of redirects) for (const listener of listeners) listener(details) },
   }
   const body = [
@@ -190,9 +190,25 @@ describe('blob: URLs', () => {
     }
   })
 
+  it('fileSourceUrl tells blob:null (opaque origin) from a malformed blob: URL', () => {
+    const { fileSourceUrl } = loadRetryFlow({ pagePayload: {} })
+    assert.throws(() => fileSourceUrl('blob:null/abc'), /Only blob: URLs created by an HTTP or HTTPS page can be saved/u)
+    assert.throws(() => fileSourceUrl('blob:file:///tmp/a'), /Only blob: URLs created by an HTTP or HTTPS page/u)
+    assert.throws(() => fileSourceUrl('blob:chrome-extension://abc/uuid'), /Only blob: URLs created by an HTTP or HTTPS page/u)
+    assert.throws(() => fileSourceUrl('blob:https://user:pw@shop.test/abc'), /embedded credentials/u)
+    assert.throws(() => fileSourceUrl('blob:'), /Only blob: URLs created by an HTTP or HTTPS page/u)
+  })
+
   it('fileSourceUrl refuses data: URLs with a hint to convert them to a blob', () => {
     const { fileSourceUrl } = loadRetryFlow({ pagePayload: {} })
     assert.throws(() => fileSourceUrl('data:application/pdf;base64,JVBERg=='), /data: URLs are not supported.*URL\.createObjectURL/u)
+  })
+
+  it('passes the frameId through to the page read, so a blob made in an iframe can be saved', async () => {
+    const calls = []
+    const flow = loadRetryFlow({ pagePayload: { via: 'page', finalUrl: blobUrl, bytes: 4, base64: 'JVBERg==' }, onRunInFrame: (...args) => calls.push(args.slice(0, 2)) })
+    await flow.fetchFileWithTabSession({ tabId: 7, frameId: 3, url: blobUrl })
+    assert.deepEqual(calls, [[7, 3]])
   })
 
   it('the page path returns a blob: payload and never asks for an approval', async () => {
@@ -206,7 +222,7 @@ describe('blob: URLs', () => {
 
   it('turns a CORS-blocked or failed page result into an explicit error, not a retry token', async () => {
     const flow = loadRetryFlow({ pagePayload: { blockedByCors: true } })
-    await assert.rejects(flow.fetchFileWithTabSession({ tabId: 7, url: blobUrl }), /^Error: The blob: URL could not be read from this tab\. Blob URLs only work in the tab and frame that created them/u)
+    await assert.rejects(flow.fetchFileWithTabSession({ tabId: 7, url: blobUrl }), /^Error: The blob: URL could not be read from this tab\. It may have been revoked, or it was created in another tab or frame/u)
   })
 
   it('fetchFileAsBase64 reads a blob: URL, and reports a revoked one without probing no-cors', async () => {
@@ -225,7 +241,7 @@ describe('blob: URLs', () => {
     assert.deepEqual(failing, ['cors'])
   })
 
-  it('keeps the 10 MiB-style byte limit for blob: URLs', async () => {
+  it('keeps the byte limit for blob: URLs', async () => {
     stubFetch({ cors: () => new Response('x'.repeat(20)) })
     assert.match((await fetchFileAsBase64(blobUrl, 10, 'page')).error, /larger than the 10-byte limit/u)
   })

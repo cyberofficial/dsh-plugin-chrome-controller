@@ -166,6 +166,17 @@ describe('dsh_browser_save_file', () => {
     await assert.rejects(readdir(join(root, '.tmp', 'downloads')), { code: 'ENOENT' })
   })
 
+  it('keeps a filename without an extension as given, for a blob: URL with unrecognisable content', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const blobUrl = 'blob:https://www.shop.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+    const data = Buffer.from([0x00, 0x01, 0x02, 0x03, 0x99, 0xfe])
+    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: blobUrl, contentType: 'application/octet-stream', bytes: data.length, base64: data.toString('base64') }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: blobUrl, filename: 'invoice' }, exec())
+    await answer()
+    assert.equal((await pending).relativePath, '.tmp/downloads/invoice')
+  })
+
   it('never offers an approval prompt for a blob: URL, even if the extension asks for one', async () => {
     context = fakePluginContext({ root, approvals: ['allowed-once'] })
     await apply(context)

@@ -4743,8 +4743,8 @@ async function fetchFileWithTabSession(params) {
   const payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
   if (!isRecord(payload)) throw new Error('The tab returned no download result')
   if (payload.blockedByCors === true) {
-    // The service worker cannot read a page's blob: URL, so it is never retried there.
-    if (url.startsWith('blob:')) throw new Error('The blob: URL could not be read from this tab. Blob URLs only work in the tab and frame that created them; pass that tabId/frameId and call before the page revokes it.')
+    // Backstop: fetchFileAsBase64 never reports a blob: URL as CORS-blocked. The service worker cannot read a page's blob: URL, so it is never retried there.
+    if (url.startsWith('blob:')) throw new Error('The blob: URL could not be read from this tab. It may have been revoked, or it was created in another tab or frame: pass the tabId/frameId of the page that created it, and save before the page revokes it.')
     return { tabId, frameId, needsApproval: 'cors-retry', url, retryToken: issueFetchRetryToken(tabId, url) }
   }
   if (typeof payload.error === 'string') throw new Error(payload.error)
@@ -4808,29 +4808,30 @@ function downloadUrl(value) {
 /**
  * A URL dsh_browser_save_file may have a tab fetch: an HTTP(S) download URL, or
  * a blob: URL minted by a page (blob:https://host/uuid). A blob: URL is only
- * ever read by the page that owns it, never by the service worker, so only the
+ * ever read from inside a page, never by the service worker, so only the
  * page path (fetchFileWithTabSession) uses this; retries keep using downloadUrl.
  */
 function fileSourceUrl(value) {
-  if (typeof value === 'string' && /^data:/iu.test(value.trim())) {
+  let url
+  try {
+    url = new URL(value)
+  } catch {
+    return downloadUrl(value)
+  }
+  if (url.protocol === 'data:') {
     throw new Error('data: URLs are not supported. Turn it into a blob: URL in the page with fetch(dataUrl).then(r => r.blob()).then(b => URL.createObjectURL(b)), then pass that blob: URL.')
   }
-  if (typeof value === 'string' && /^blob:/iu.test(value.trim())) {
-    let url
-    let inner
-    try {
-      url = new URL(value.trim())
-      inner = new URL(url.pathname)
-    } catch {
-      throw new Error('The blob: URL is invalid')
-    }
-    if (url.origin === 'null' || (inner.protocol !== 'http:' && inner.protocol !== 'https:')) {
-      throw new Error('Only blob: URLs created by an HTTP or HTTPS page can be saved')
-    }
-    if (inner.username || inner.password) throw new Error('Download URLs cannot contain embedded credentials')
-    return url.href
+  if (url.protocol !== 'blob:') return downloadUrl(value)
+  // A blob: URL's origin is the inner URL's origin when that is HTTP(S), else "null".
+  if (url.origin === 'null') throw new Error('Only blob: URLs created by an HTTP or HTTPS page can be saved')
+  let inner
+  try {
+    inner = new URL(url.pathname)
+  } catch {
+    throw new Error('The blob: URL is invalid')
   }
-  return downloadUrl(value)
+  if (inner.username || inner.password) throw new Error('Download URLs cannot contain embedded credentials')
+  return url.href
 }
 
 function issueFetchRetryToken(tabId, url) {
@@ -4867,7 +4868,7 @@ async function fetchFileAsBase64(url, maxBytes, via, redirect = 'follow') {
   // A blob: URL is readable only by the frame that created it: never probe it
   // with no-cors, and never report it as CORS-blocked (which would invite a retry).
   const isBlob = url.startsWith('blob:')
-  const blobError = { error: 'The blob: URL could not be read from this tab. Blob URLs only work in the tab and frame that created them; pass that tabId/frameId and call before the page revokes it.' }
+  const blobError = { error: 'The blob: URL could not be read from this tab. It may have been revoked, or it was created in another tab or frame: pass the tabId/frameId of the page that created it, and save before the page revokes it.' }
   let response
   try {
     response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect })

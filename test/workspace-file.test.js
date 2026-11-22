@@ -4,7 +4,17 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, write
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { chooseFileName, fileNameFromDisposition, isSimpleFileName, sanitizeFileName, saveWorkspaceFile } from '../lib/workspace-file.js'
+import { chooseFileName, fileNameFromDisposition, isSimpleFileName, requireBlobFileName, sanitizeFileName, saveWorkspaceFile } from '../lib/workspace-file.js'
+
+describe('blob: file names', () => {
+  const blobUrl = 'blob:https://e.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
+  it('asks for a filename only for a blob: source with no name and no extension', () => {
+    assert.throws(() => requireBlobFileName({ sourceUrl: blobUrl, fileName: 'download' }), /Pass a filename with an extension/u)
+    requireBlobFileName({ sourceUrl: blobUrl, fileName: 'download.pdf' })
+    requireBlobFileName({ sourceUrl: blobUrl, requested: 'invoice', fileName: 'invoice' })
+    requireBlobFileName({ sourceUrl: 'https://e.test/a', fileName: 'a' })
+  })
+})
 
 describe('file name selection', () => {
   it('prefers RFC 5987 filename* over filename', () => {

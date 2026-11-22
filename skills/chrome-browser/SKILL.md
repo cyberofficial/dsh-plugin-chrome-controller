@@ -58,7 +58,7 @@ The extension connects to the DSH Web origin configured in its Settings (default
 - Use `dsh_browser_focus` and `dsh_browser_blur` for uniquely selected standard controls. Use `dsh_browser_select` for a native `select` element by exact value, exact label, or zero-based option index. For multiple selects, pass `values`. It dispatches `input` and `change` but does not submit the form. Custom dropdowns need normal click and keyboard actions.
 - Use `dsh_browser_upload` only when the user asks to upload a specific file and provides or authorizes its absolute path. It attaches files to an `input[type=file]`. Selecting files can trigger site input-change handlers and automatic uploads, so treat the tool call itself as a possible upload. Do not submit a form unless asked.
 - Use `dsh_browser_download` only when the task asks to download a file to the user's computer. `start` defaults to Chrome's Save As dialog. `saveAs: false` saves to Chrome's normal Downloads folder on the browser's computer, which this session may not be able to read. Use `status` with the returned download ID to check progress, or `cancel` to stop it. Do not open or run downloaded files automatically.
-- Use `dsh_browser_save_file` when this session needs the file itself, for example to process or reupload it. Pass the `tabId` of the signed-in page that shows the link: the tab fetches the URL with its own session, and the file is written to `.tmp/downloads/` in the session workspace. A cross-origin file the page cannot read, and each redirect it leads to, needs the user's approval; if they decline, report it and do not retry. The result gives the path, size, and SHA-256, never the contents, and an existing file is never overwritten. Cookies and tokens stay in the browser. When the page only exposes the file as a blob (a link without an `href` that fetches it with a token), see "Saving a file the page only exposes as a blob" below.
+- Use `dsh_browser_save_file` when this session needs the file itself, for example to process or reupload it. Pass the `tabId` of the signed-in page that shows the link: the tab fetches the URL with its own session, and the file is written to `.tmp/downloads/` in the session workspace. A cross-origin file the page cannot read, and each redirect it leads to, needs the user's approval; if they decline, report it and do not retry. The result gives the path, size, and SHA-256, never the contents, and an existing file is never overwritten. Cookies and tokens stay in the browser. When the page only exposes the file as a blob, see "Saving a blob: URL" below.
 - Use `dsh_browser_wait_user` when browser work requires a human action, including solving a CAPTCHA, completing verification, or choosing a file. Explain the action the user needs to take, then stop browser activity until the user replies. Never automate or bypass a challenge.
 - Use `dsh_browser_tabs` with `action: "open"`, `"activate"`, or `"close"` for tab management.
 - After each consequential action, inspect the live page again with a fresh snapshot, screenshot, HTML read, or task-specific evaluation. Confirm the requested outcome from the page state, not just from the action tool's return value.
@@ -128,17 +128,13 @@ Save a file into the session workspace with `dsh_browser_save_file`, using the s
 {"tabId":123,"url":"https://example.com/invoices/42.pdf"}
 ```
 
-Saving a file the page only exposes as a blob: some pages fetch the document with a token and never expose a URL you could refetch. If you can get the bytes into the page (for example a fetch/XHR hook armed before the click that stores the response in a `window` variable), mint a blob URL with `dsh_browser_evaluate`, then save it from the same tab. Do not click the link twice, since each click may request a new document, and do not reload the page, which destroys both the hook and the blob. Never read or log bearer tokens.
-
-```js
-window.__u = URL.createObjectURL(new Blob([window.__bytes], { type: 'application/pdf' })); window.__u
-```
+Saving a blob: URL: some "Download" buttons build the file in the page with `URL.createObjectURL`, so no URL exists that you could refetch. If the page exposes the `blob:` URL (for example an `<a href="blob:…">`, or one you read with `dsh_browser_evaluate`), pass it to `dsh_browser_save_file` with the `tabId` of the page, and the `frameId` when an iframe created it. It is read from inside that page and needs no approval. Pass a `filename` when the content is not recognisable, since a blob URL gives no name. A revoked blob, or one that tab or frame cannot read, fails with an explicit error: save before the page revokes it, and do not reload the page, which destroys the blob. Never read or log bearer tokens.
 
 ```json
 {"tabId":123,"url":"blob:https://example.com/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11","filename":"invoice.pdf"}
 ```
 
-If the page gives you a `data:` URL instead (an `<a href="data:…">` or an image source), do not pass it to the tool or copy it out of the page: convert it in place with `dsh_browser_evaluate`, `fetch(dataUrl).then(r => r.blob()).then(b => { window.__u = URL.createObjectURL(b) })`, then save `window.__u`. The blob is read inside that tab and frame only (pass the `frameId` if the page that created it is an iframe), needs no approval, and fails with an explicit error if it was revoked or belongs to another tab.
+If the page gives you a `data:` URL instead (an `<a href="data:…">` or an image source), do not pass it to the tool or copy it out of the page: convert it in place with `dsh_browser_evaluate`, `fetch(dataUrl).then(r => r.blob()).then(b => { window.__u = URL.createObjectURL(b) })`, then save `window.__u`.
 
 Click a button by CSS selector, or click a point from a recent screenshot:
 
