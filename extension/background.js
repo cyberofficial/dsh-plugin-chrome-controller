@@ -1,4 +1,5 @@
 import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+import { clampPoiPoint, normalizePoiArea, normalizePoiText, selectPoiPoint } from './poi.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
@@ -7,6 +8,9 @@ const RESPONSE_PATH = '/dsh-browser-extension/respond'
 const DISCONNECT_PATH = '/dsh-browser-extension/disconnect'
 const SESSION_KEY = 'dshBrowserSession'
 const ELEMENT_NOTES_KEY = 'dshElementNotes'
+const POI_STORAGE_KEY = 'dshPointsOfInterest'
+const POI_PAGE_LIMIT = 30
+const POI_TOTAL_LIMIT = 300
 const ELEMENT_NOTE_DRAFT_MS = 10 * 60_000
 const ELEMENT_NOTE_MENU_ID = 'dsh-element-note-mode'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
@@ -1442,6 +1446,20 @@ function requireClipboardText(value) {
   return value
 }
 
+/** Shared real-pointer click dispatch used by ordinary and saved-point clicks. */
+async function dispatchClickAt(target, tabId, x, y) {
+  await visualCursorMove(tabId, x, y, true)
+  await debuggerCommand(target, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
+  })
+  await debuggerCommand(target, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x, y, button: 'left', clickCount: 1,
+  })
+  await debuggerCommand(target, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
+  })
+}
+
 function executeBrowserOperation(method, params, signal) {
   const tabId = Number.isSafeInteger(params?.tabId) ? params.tabId : undefined
   if (tabId === undefined) return executeBrowserOperationNow(method, params, signal)
@@ -1876,6 +1894,10 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.elementNotes':
       return readElementNotes(params)
+    case 'page.poiList':
+      return readPois(params)
+    case 'page.poiClick':
+      return clickSavedPoi(params)
     case 'page.clipboardRead': {
       const response = await clipboardOperation('read')
       let text = typeof response.text === 'string' ? response.text : ''
@@ -2260,16 +2282,7 @@ async function executeBrowserOperationNow(method, params, signal) {
             throw new Error('Click coordinates are outside the viewport. Scroll the target into view and use current viewport coordinates.')
           }
         }
-        if (animate) await visualCursorMove(tabId, x, y, true)
-        await debuggerCommand(target, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
-        })
-        await debuggerCommand(target, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x, y, button: 'left', clickCount: 1,
-        })
-        await debuggerCommand(target, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
-        })
+        if (animate) await dispatchClickAt(target, tabId, x, y)
         return { tabId, clicked: true, ...(hasSelector ? { selector: params.selector } : {}), x, y }
       })
     }
@@ -2877,6 +2890,757 @@ function elementChangePayload(query) {
   return { watchId, armed: true, initialValue: initial.value, historyLimit: 30, idleTimeoutMs: watchLifetimeMs }
 }
 
+function poiViewKey(tabId) {
+  return 'dshPoiView:' + tabId
+}
+
+function poiEditorKey(token) {
+  return 'dshPoiEditor:' + token
+}
+
+function poiEntries(page) {
+  return Array.isArray(page?.points) ? page.points : []
+}
+
+function publicPoiEntry(entry) {
+  return {
+    id: entry.id,
+    text: entry.text,
+    x: entry.x,
+    y: entry.y,
+    pageUrl: entry.pageUrl ?? null,
+    canOpen: entry.canOpen === true,
+    onCurrentPage: entry.onCurrentPage === true,
+  }
+}
+
+function collectPois(stored, address, scope = 'domain') {
+  const pages = Object.entries(stored).filter(([key, page]) => {
+    if (address === undefined) return true
+    return key === address.pageKey || (scope === 'domain' && page.site === address.site)
+  })
+  pages.sort(([aKey, a], [bKey, b]) => {
+    const aCurrent = aKey === address?.pageKey
+    const bCurrent = bKey === address?.pageKey
+    if (aCurrent !== bCurrent) return aCurrent ? -1 : 1
+    return (a.pageUrl ?? '').localeCompare(b.pageUrl ?? '') || aKey.localeCompare(bKey)
+  })
+  return pages.flatMap(([pageKey, page]) => {
+    const onCurrentPage = pageKey === address?.pageKey
+    const meta = onCurrentPage ? address : page
+    return poiEntries(page).map(point => ({
+      ...point,
+      pageKey,
+      pageUrl: meta.pageUrl ?? null,
+      canOpen: meta.canOpen === true,
+      onCurrentPage,
+    }))
+  })
+}
+
+function collectMasterPois(stored) {
+  return collectPois(stored).map(entry => {
+    const page = stored[entry.pageKey]
+    return { ...entry, site: page.site ?? null, originalUrl: page.originalUrl ?? null }
+  })
+}
+
+async function readPoiStore() {
+  await ensureTrustedLocalStorage()
+  const stored = (await chrome.storage.local.get(POI_STORAGE_KEY))[POI_STORAGE_KEY]
+  return isRecord(stored) ? stored : {}
+}
+
+let poiWriteTail = Promise.resolve()
+
+function writePoiStore(mutate) {
+  const write = poiWriteTail.then(async () => {
+    const stored = await readPoiStore()
+    if (mutate(stored)) await chrome.storage.local.set({ [POI_STORAGE_KEY]: stored })
+    return stored
+  })
+  poiWriteTail = write.catch(() => {})
+  return write
+}
+
+function updatePoi(draft, action, text, area) {
+  return writePoiStore(stored => {
+    const page = stored[draft.pageKey]
+    const current = poiEntries(page)
+    const existing = draft.id === undefined ? undefined : current.find(point => point.id === draft.id)
+    if (action === 'save') {
+      if (draft.savedOnly === true && existing === undefined) throw new Error('This point has already been removed')
+      if (existing === undefined && current.length >= POI_PAGE_LIMIT) {
+        throw new Error('This page has 30 points. Remove an existing point before adding another.')
+      }
+      const total = Object.values(stored).reduce((sum, item) => sum + poiEntries(item).length, 0)
+      if (existing === undefined && total >= POI_TOTAL_LIMIT) {
+        throw new Error('The extension has 300 saved points. Remove an existing point before adding another.')
+      }
+      const now = Date.now()
+      const entry = {
+        id: existing?.id ?? crypto.randomUUID(),
+        text: normalizePoiText(text),
+        x: existing?.x ?? draft.x,
+        y: existing?.y ?? draft.y,
+        frameStack: existing?.frameStack ?? draft.frameStack ?? [],
+        frameUrl: existing?.frameUrl ?? draft.frameUrl,
+        area: normalizePoiArea(area),
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      }
+      if (!Number.isFinite(entry.x) || !Number.isFinite(entry.y)) throw new Error('A saved point requires finite x and y')
+      const remaining = current.filter(point => point.id !== entry.id)
+      remaining.unshift(entry)
+      stored[draft.pageKey] = { ...(page ?? draft.address), points: remaining }
+      return true
+    }
+    if (action === 'remove') {
+      const remaining = current.filter(point => point.id !== draft.id)
+      if (remaining.length === current.length) return false
+      if (remaining.length === 0) delete stored[draft.pageKey]
+      else stored[draft.pageKey] = { ...page, points: remaining }
+      return true
+    }
+    throw new Error('Unknown point action')
+  })
+}
+
+async function readPois(params) {
+  const offset = params.offset ?? 0
+  const limit = params.limit ?? 10
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) throw new Error('limit must be an integer between 1 and 20')
+  const scope = params.scope === undefined ? 'domain' : params.scope
+  if (!['domain', 'page', 'all'].includes(scope)) throw new Error('scope must be domain, page, or all')
+  let tabId
+  let all
+  if (scope === 'all') {
+    all = collectPois(await readPoiStore())
+  } else {
+    tabId = requireTabId(params.tabId)
+    const tab = await chrome.tabs.get(tabId)
+    const address = await elementNoteAddress(tab.url)
+    if (address === undefined) throw new Error('Points of interest are available on HTTP and HTTPS pages')
+    all = collectPois(await readPoiStore(), address, scope)
+  }
+  const points = all.slice(offset, offset + limit).map(publicPoiEntry)
+  const result = { scope, total: all.length, points }
+  if (tabId !== undefined) result.tabId = tabId
+  if (offset + points.length < all.length) result.nextOffset = offset + points.length
+  return result
+}
+
+function requirePoiId(id) {
+  if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/u.test(id)) throw new Error('A valid saved point id is required')
+  return id
+}
+
+/** Runs in a parent frame: iframe geometry for converting child CSS pixels. */
+function poiFrameMetrics(xpath) {
+  try {
+    const element = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+    if (!(element instanceof HTMLIFrameElement) && !(element instanceof HTMLFrameElement)) return null
+    const rect = element.getBoundingClientRect()
+    return {
+      left: rect.left + element.clientLeft,
+      top: rect.top + element.clientTop,
+      scaleX: element.clientWidth > 0 ? rect.width / element.clientWidth : 1,
+      scaleY: element.clientHeight > 0 ? rect.height / element.clientHeight : 1,
+    }
+  } catch {
+    return null
+  }
+}
+
+function poiViewportMetrics() {
+  return { width: window.innerWidth, height: window.innerHeight, url: location.href }
+}
+
+function samePoiDocument(savedUrl, currentUrl) {
+  if (typeof savedUrl !== 'string' || savedUrl === '') return true
+  try {
+    const a = new URL(savedUrl)
+    const b = new URL(currentUrl)
+    return a.origin === b.origin && a.pathname === b.pathname
+  } catch {
+    return false
+  }
+}
+
+async function resolvePoiClickPoint(tabId, point) {
+  const stack = Array.isArray(point.frameStack) ? point.frameStack : []
+  let frameId = 0
+  let offsetX = 0
+  let offsetY = 0
+  let scaleX = 1
+  let scaleY = 1
+  for (const segment of stack) {
+    const metrics = await runInFrame(tabId, frameId, poiFrameMetrics, [segment])
+    if (!isRecord(metrics)) throw new Error('The saved frame could not be found. Mark the point again.')
+    offsetX += metrics.left * scaleX
+    offsetY += metrics.top * scaleY
+    scaleX *= metrics.scaleX
+    scaleY *= metrics.scaleY
+    frameId = await resolveChildFrameId(tabId, frameId, segment)
+  }
+  const viewport = await runInFrame(tabId, frameId, poiViewportMetrics, [])
+  if (!samePoiDocument(point.frameUrl, viewport?.url)) {
+    throw new Error('The saved frame changed pages. Mark the point again.')
+  }
+  if (!isRecord(viewport) || point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height) {
+    throw new Error('The saved point is no longer visible. Mark it again on the current page.')
+  }
+  const local = clampPoiPoint(selectPoiPoint(point, Date.now()), viewport.width, viewport.height)
+  return {
+    x: offsetX + local.x * scaleX,
+    y: offsetY + local.y * scaleY,
+  }
+}
+
+async function clickSavedPoi(params) {
+  const tabId = requireTabId(params.tabId)
+  const id = requirePoiId(params.id)
+  const stored = await readPoiStore()
+  const entry = Object.entries(stored).flatMap(([pageKey, page]) => poiEntries(page).map(point => ({ pageKey, point })))
+    .find(item => item.point.id === id)
+  if (entry === undefined) throw new Error('That saved point no longer exists')
+  const address = await elementNoteAddress((await chrome.tabs.get(tabId)).url)
+  if (address?.pageKey !== entry.pageKey) throw new Error('Open the point\'s original page before clicking it')
+  const point = await resolvePoiClickPoint(tabId, entry.point)
+  return withDebugger(tabId, async target => {
+    if (debuggerTargetsNeedingFreshCoordinates.has(target)) {
+      throw new Error('Chrome changed the page viewport when browser control connected. Take a fresh screenshot or use a CSS selector, then retry.')
+    }
+    const viewport = await viewportSize(target)
+    if (point.x < 0 || point.y < 0 || point.x >= viewport.width || point.y >= viewport.height) {
+      throw new Error('The saved point is no longer visible. Mark it again on the current page.')
+    }
+    await dispatchClickAt(target, tabId, point.x, point.y)
+    return { tabId, clicked: true, id }
+  })
+}
+
+async function startPoiInFrame(tabId, view) {
+  const frameId = view.frameId ?? 0
+  let expectedUrl
+  if (frameId === 0) expectedUrl = (await chrome.tabs.get(tabId)).url
+  else expectedUrl = (await chrome.webNavigation.getFrame({ tabId, frameId }).catch(() => undefined))?.url
+  if (view.mode === 'pick') {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] }, world: 'MAIN', func: installNoteKeyGuard,
+    }).catch(() => {})
+  }
+  const started = await runInFrame(tabId, frameId, startPoiView, [{
+    mode: view.mode,
+    token: view.token,
+    points: view.mode === 'list' ? view.points ?? [] : [],
+    lifetimeMs: ELEMENT_NOTE_DRAFT_MS,
+    expectedUrl,
+    frameStack: view.frameStack ?? [],
+    parentFrameId: view.parentFrameId ?? null,
+  }])
+  if (started !== true) throw new Error('Could not open points of interest on this frame')
+}
+
+async function resumePoiView(tabId, view) {
+  const next = { ...view, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+  if (next.mode === 'list') {
+    const stored = await readPoiStore()
+    next.points = collectPois(stored, next.address)
+  }
+  await chrome.storage.session.set({ [poiViewKey(tabId)]: next })
+  await startPoiInFrame(tabId, next)
+}
+
+async function openPoiView(tab, mode, frameId = 0, frameStack = [], parentFrameId = null) {
+  const tabId = requireTabId(tab?.id)
+  const address = await elementNoteAddress(tab.url)
+  if (address === undefined) throw new Error('Open an HTTP or HTTPS page to use points of interest')
+  const token = crypto.randomUUID()
+  const stored = await readPoiStore()
+  const view = {
+    mode,
+    token,
+    address,
+    points: mode === 'list' ? collectPois(stored, address) : [],
+    frameId,
+    frameStack,
+    parentFrameId,
+    expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+  }
+  await chrome.storage.session.set({ [poiViewKey(tabId)]: view })
+  await startPoiInFrame(tabId, view)
+  return { ok: true }
+}
+
+async function openPoiEditor(tabId, view, selected) {
+  const token = crypto.randomUUID()
+  const draft = {
+    token,
+    pageKey: view.address.pageKey,
+    address: view.address,
+    id: selected.id,
+    x: selected.x,
+    y: selected.y,
+    frameStack: selected.frameStack ?? view.frameStack ?? [],
+    frameUrl: selected.frameUrl,
+    area: normalizePoiArea(selected.area),
+    savedOnly: selected.savedOnly === true,
+    picker: selected.savedOnly === true ? undefined : view,
+    view: selected.savedOnly === true ? view : undefined,
+    expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+  }
+  await chrome.storage.session.set({ [poiEditorKey(token)]: draft })
+  const editor = new URL(chrome.runtime.getURL('popup.html'))
+  editor.searchParams.set('poiTab', String(tabId))
+  editor.searchParams.set('poiToken', token)
+  try {
+    await chrome.windows.create({ url: editor.href, type: 'popup', focused: true, width: 500, height: 590 })
+  } catch (error) {
+    await chrome.storage.session.remove(poiEditorKey(token))
+    throw error
+  }
+  return { ok: true }
+}
+
+async function poiEditorMessage(message, sender) {
+  const popup = chrome.runtime.getURL('popup.html')
+  if (sender.url?.startsWith(popup + '?') !== true) throw new Error('Invalid point editor request')
+  const draft = (await chrome.storage.session.get(poiEditorKey(message.token)))[poiEditorKey(message.token)]
+  if (draft === undefined || typeof message.token !== 'string' || draft.token !== message.token
+    || draft.expiresAt <= Date.now()) {
+    throw new Error('This point editor expired. Open the point again.')
+  }
+  const stored = await readPoiStore()
+  const existing = draft.id === undefined ? undefined : poiEntries(stored[draft.pageKey]).find(point => point.id === draft.id)
+  if (message.action === 'read') {
+    return {
+      ok: true,
+      id: draft.id,
+      x: existing?.x ?? draft.x,
+      y: existing?.y ?? draft.y,
+      text: existing?.text ?? '',
+      area: normalizePoiArea(existing?.area ?? draft.area),
+    }
+  }
+  if (message.action === 'preview') {
+    const tabId = Number.isSafeInteger(message.tabId) ? message.tabId : undefined
+    const resume = draft.picker ?? draft.view
+    if (tabId === undefined || resume === undefined) throw new Error('Point preview is unavailable')
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'DSH_POI_AREA_PREVIEW',
+      token: resume.token,
+      x: existing?.x ?? draft.x,
+      y: existing?.y ?? draft.y,
+      area: normalizePoiArea(message.area),
+    }, { frameId: resume.frameId ?? 0 })
+    return { ok: true }
+  }
+  if (!['save', 'remove', 'cancel'].includes(message.action)) throw new Error('Unknown point editor action')
+  if (message.action !== 'cancel') await updatePoi(draft, message.action, message.text, message.area)
+  const tabId = Number.isSafeInteger(message.tabId) ? message.tabId : undefined
+  const resume = draft.picker ?? draft.view
+  if (tabId !== undefined && resume !== undefined) await resumePoiView(tabId, resume)
+  await chrome.storage.session.remove(poiEditorKey(message.token))
+  return { ok: true }
+}
+
+/** Runs in Chrome's isolated world. Point editing happens in the extension window. */
+function startPoiView({ mode, token, points, lifetimeMs, corner = 'top-right', expectedUrl, frameStack = [], parentFrameId = null }) {
+  if (document.contentType !== 'text/html') throw new Error('Points of interest require an HTML document')
+  if (expectedUrl !== undefined && window === window.top && location.href !== expectedUrl) return false
+  globalThis.__dshStopPoiPicker?.()
+  const controller = new AbortController()
+  const listen = { signal: controller.signal }
+  const pageUrl = location.href
+  const host = document.createElement('div')
+  host.id = 'dsh-note-picker-host'
+  for (const [name, value] of Object.entries({
+    all: 'initial', position: 'fixed', inset: '0', 'z-index': '2147483647',
+    'pointer-events': 'none', overflow: 'hidden',
+  })) host.style.setProperty(name, value, 'important')
+  const shadow = host.attachShadow({ mode: 'closed' })
+  const toolbar = document.createElement('section')
+  toolbar.setAttribute('aria-label', mode === 'pick' ? 'Points of Interest' : 'Page Points')
+  Object.assign(toolbar.style, {
+    position: 'absolute', maxWidth: 'calc(100% - 32px)', boxSizing: 'border-box',
+    pointerEvents: 'auto', padding: '12px', borderRadius: '8px', background: '#172337',
+    color: '#fff', boxShadow: '0 2px 12px rgba(0,0,0,.25)', font: '14px/1.4 system-ui, sans-serif',
+  })
+  const header = document.createElement('div')
+  Object.assign(header.style, { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' })
+  const status = document.createElement('span')
+  status.setAttribute('role', 'status')
+  function makeButton(label) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.textContent = label
+    Object.assign(button.style, {
+      font: 'inherit', color: '#fff', background: '#293a54', border: '1px solid #73839e',
+      borderRadius: '4px', padding: '4px 8px', cursor: 'pointer',
+    })
+    return button
+  }
+  const position = document.createElement('select')
+  position.setAttribute('aria-label', 'Panel position')
+  Object.assign(position.style, {
+    font: 'inherit', color: '#fff', background: '#293a54', border: '1px solid #73839e',
+    borderRadius: '4px', padding: '4px',
+  })
+  for (const [value, label] of [['top-left', 'Top left'], ['top-right', 'Top right'], ['bottom-left', 'Bottom left'], ['bottom-right', 'Bottom right']]) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    position.append(option)
+  }
+  function placeToolbar(value) {
+    corner = value
+    toolbar.style.top = corner.startsWith('top-') ? '16px' : 'auto'
+    toolbar.style.bottom = corner.startsWith('bottom-') ? '16px' : 'auto'
+    toolbar.style.left = corner.endsWith('-left') ? '16px' : 'auto'
+    toolbar.style.right = corner.endsWith('-right') ? '16px' : 'auto'
+  }
+  position.value = corner
+  placeToolbar(corner)
+  position.addEventListener('change', event => {
+    if (!event.isTrusted) return
+    placeToolbar(position.value)
+    position.blur()
+  }, listen)
+  const close = makeButton(mode === 'pick' ? 'Done' : 'Close')
+  header.append(status, position, close)
+  toolbar.append(header)
+  let cleanup = () => {}
+  function stop() {
+    controller.abort()
+    host.remove()
+    clearTimeout(timer)
+    cleanup()
+    if (globalThis.__dshStopPoiPicker === stop) delete globalThis.__dshStopPoiPicker
+  }
+  const timer = setTimeout(stop, lifetimeMs)
+  globalThis.__dshStopPoiPicker = stop
+  close.addEventListener('click', event => { if (event.isTrusted) stop() }, listen)
+  window.addEventListener('hashchange', stop, listen)
+  window.addEventListener('popstate', stop, listen)
+  window.navigation?.addEventListener('currententrychange', () => { if (location.href !== pageUrl) stop() }, listen)
+
+  function absoluteXPath(element) {
+    const parts = []
+    for (let node = element; node !== null; node = node.parentElement) {
+      const named = node.namespaceURI === 'http://www.w3.org/1999/xhtml' && /^[a-z][a-z0-9_-]*$/i.test(node.localName)
+      let index = 1
+      for (let sibling = node.previousElementSibling; sibling !== null; sibling = sibling.previousElementSibling) {
+        if (!named || (sibling.namespaceURI === node.namespaceURI && sibling.localName === node.localName)) index++
+      }
+      parts.unshift((named ? node.localName : '*') + '[' + index + ']')
+    }
+    return '/' + parts.join('/')
+  }
+  function sameStack(other) {
+    return Array.isArray(other) && other.length === frameStack.length && other.every((part, index) => part === frameStack[index])
+  }
+  function crosshair() {
+    const marker = document.createElement('div')
+    Object.assign(marker.style, {
+      position: 'absolute', width: '18px', height: '18px', pointerEvents: 'none',
+      border: '2px solid #fbbf24', borderRadius: '50%', boxSizing: 'border-box',
+      transform: 'translate(-9px,-9px)', boxShadow: '0 0 0 1px #172337',
+    })
+    return marker
+  }
+  function placeMarker(marker, x, y) {
+    marker.style.left = x + 'px'
+    marker.style.top = y + 'px'
+  }
+  function areaMarker() {
+    const marker = document.createElement('div')
+    Object.assign(marker.style, {
+      position: 'absolute', boxSizing: 'border-box', pointerEvents: 'none', display: 'none',
+      border: '2px dashed #fbbf24', background: 'rgba(251,191,36,.08)',
+    })
+    return marker
+  }
+  function placeArea(marker, point, area) {
+    if (point === null || area === undefined || area === null) {
+      marker.style.display = 'none'
+      return
+    }
+    if (area.shape === 'circle') {
+      if (!(area.radius > 0)) {
+        marker.style.display = 'none'
+        return
+      }
+      Object.assign(marker.style, {
+        display: 'block', left: (point.x - area.radius) + 'px', top: (point.y - area.radius) + 'px',
+        width: (area.radius * 2) + 'px', height: (area.radius * 2) + 'px', borderRadius: '50%',
+      })
+    } else {
+      if (!(area.width > 0) && !(area.height > 0)) {
+        marker.style.display = 'none'
+        return
+      }
+      Object.assign(marker.style, {
+        display: 'block', left: (point.x - area.width / 2) + 'px', top: (point.y - area.height / 2) + 'px',
+        width: area.width + 'px', height: area.height + 'px', borderRadius: '0',
+      })
+    }
+  }
+
+  if (mode === 'pick') {
+    const shield = document.createElement('div')
+    Object.assign(shield.style, { position: 'absolute', inset: '0', pointerEvents: 'auto', cursor: 'crosshair' })
+    const marker = crosshair()
+    marker.style.display = 'none'
+    const outline = document.createElement('div')
+    Object.assign(outline.style, {
+      position: 'absolute', boxSizing: 'border-box', border: '2px solid #60a5fa',
+      background: 'rgba(96,165,250,.12)', pointerEvents: 'none', display: 'none',
+    })
+    const clickArea = areaMarker()
+    shadow.append(shield, clickArea, marker, outline, toolbar)
+    let selected = null
+    let selectedFrame = null
+    let hovered = null
+    const previousChildren = []
+    let point = null
+    let area = { shape: 'circle', radius: 0, width: 0, height: 0 }
+    let opening = false
+    function render() {
+      marker.style.display = point === null ? 'none' : 'block'
+      if (point !== null) placeMarker(marker, point.x, point.y)
+      placeArea(clickArea, point, area)
+      const rect = selected?.isConnected ? selected.getBoundingClientRect() : undefined
+      if (rect !== undefined && rect.width > 0 && rect.height > 0) {
+        Object.assign(outline.style, {
+          display: 'block', left: rect.left + 'px', top: rect.top + 'px',
+          width: rect.width + 'px', height: rect.height + 'px',
+        })
+      } else outline.style.display = 'none'
+      status.textContent = opening ? 'Editing point...' : selectedFrame !== null
+        ? 'Frame selected. Enter it or add a point. Up widens, Down narrows.'
+        : 'Click to add a point here. Up widens, Down narrows.'
+    }
+    function update(event) {
+      if (opening) return
+      shield.style.pointerEvents = 'none'
+      let hit
+      try { hit = document.elementFromPoint(event.clientX, event.clientY) }
+      finally { shield.style.pointerEvents = 'auto' }
+      if (hit === host || hit === null) return
+      if (hit !== hovered || selected?.isConnected === false) {
+        hovered = hit
+        selected = hit
+        previousChildren.length = 0
+        selectedFrame = hit.localName === 'iframe' || hit.localName === 'frame' ? hit : null
+      }
+      point = { x: event.clientX, y: event.clientY }
+      render()
+    }
+    async function sendSelected() {
+      if (opening || point === null) return
+      opening = true
+      status.textContent = 'Opening point editor...'
+      try {
+        const result = await chrome.runtime.sendMessage({ type: 'DSH_POI_SELECTED', token, x: point.x, y: point.y })
+        if (result?.ok !== true) throw new Error(result?.error ?? 'Could not open the point editor')
+        // Keep the marker and zone visible while the editor previews changes.
+        shield.style.pointerEvents = 'none'
+        render()
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error)
+        opening = false
+        shield.style.pointerEvents = 'auto'
+      }
+    }
+    function onPreview(message) {
+      if (message?.type !== 'DSH_POI_AREA_PREVIEW' || message.token !== token) return
+      point = { x: message.x, y: message.y }
+      area = message.area
+      opening = true
+      shield.style.pointerEvents = 'none'
+      render()
+    }
+    chrome.runtime.onMessage.addListener(onPreview)
+    cleanup = () => chrome.runtime.onMessage.removeListener(onPreview)
+    async function drill(type, xpath) {
+      const result = await chrome.runtime.sendMessage({ type, token, ...(xpath === undefined ? {} : { xpath }) })
+      if (result?.ok === true) stop()
+      else status.textContent = result?.error ?? 'Could not change frames'
+    }
+    function askFrame() {
+      if (selectedFrame === null || opening) return
+      const dialog = document.createElement('div')
+      Object.assign(dialog.style, {
+        position: 'absolute', left: '50%', top: '40%', transform: 'translate(-50%,-50%)',
+        background: '#172337', color: '#fff', borderRadius: '8px', padding: '14px',
+        boxShadow: '0 2px 12px rgba(0,0,0,.25)', font: '14px/1.4 system-ui, sans-serif',
+        pointerEvents: 'auto', textAlign: 'center', zIndex: '1',
+      })
+      const label = document.createElement('div')
+      label.textContent = 'Frame selected'
+      label.style.marginBottom = '10px'
+      const row = document.createElement('div')
+      Object.assign(row.style, { display: 'flex', gap: '8px', justifyContent: 'center' })
+      const enter = makeButton('Enter frame')
+      const add = makeButton('Add point')
+      const stay = makeButton('Stay')
+      row.append(enter, add, stay)
+      dialog.append(label, row)
+      shadow.appendChild(dialog)
+      const dismiss = () => dialog.remove()
+      stay.addEventListener('click', event => { if (event.isTrusted) dismiss() }, listen)
+      add.addEventListener('click', event => { if (event.isTrusted) { dismiss(); void sendSelected() } }, listen)
+      enter.addEventListener('click', event => {
+        if (!event.isTrusted) return
+        dismiss()
+        void drill('DSH_POI_ENTER_FRAME', absoluteXPath(selectedFrame))
+      }, listen)
+    }
+    shield.addEventListener('pointermove', update, listen)
+    shield.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (!event.isTrusted || opening) return
+      update(event)
+      if (selectedFrame !== null) askFrame()
+      else void sendSelected()
+    }, listen)
+    window.addEventListener('keydown', event => {
+      if (!event.isTrusted || event.target === host || opening) return
+      if (event.key === 'ArrowRight' && selectedFrame !== null) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        void drill('DSH_POI_ENTER_FRAME', absoluteXPath(selectedFrame))
+        return
+      }
+      if (event.key === 'ArrowLeft' && parentFrameId !== null && parentFrameId !== undefined) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        void drill('DSH_POI_LEAVE_FRAME')
+        return
+      }
+      if (selected === null || !['ArrowUp', 'ArrowDown'].includes(event.key)) return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      if (event.key === 'ArrowUp') {
+        const parent = selected.parentElement
+        if (parent !== null) {
+          previousChildren.push(selected)
+          selected = parent
+        }
+      } else {
+        const child = previousChildren.pop()
+        if (child?.parentElement === selected) selected = child
+        else selected = Array.from(selected.children)
+          .find(element => element !== host && element.getClientRects().length > 0) ?? selected
+      }
+      selectedFrame = selected.localName === 'iframe' || selected.localName === 'frame' ? selected : null
+      const rect = selected.getBoundingClientRect()
+      point = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+      render()
+    }, { ...listen, capture: true })
+    window.addEventListener('scroll', render, { ...listen, capture: true })
+    window.addEventListener('resize', render, listen)
+    render()
+  } else {
+    const markers = document.createElement('div')
+    const list = document.createElement('div')
+    toolbar.style.width = '360px'
+    Object.assign(list.style, { maxHeight: '60vh', overflow: 'auto', marginTop: '8px' })
+    toolbar.append(list)
+    shadow.append(markers, toolbar)
+    let currentPoints = points
+    let preview = null
+    function renderList() {
+      status.textContent = currentPoints.length === 0 ? 'No points for this site.' : 'Points on this site'
+      markers.replaceChildren()
+      list.replaceChildren()
+      currentPoints.forEach((point, index) => {
+        if (point.onCurrentPage && sameStack(point.frameStack)
+          && point.x >= 0 && point.y >= 0 && point.x <= window.innerWidth && point.y <= window.innerHeight) {
+          const zone = areaMarker()
+          placeArea(zone, point, point.area)
+          markers.appendChild(zone)
+          const marker = crosshair()
+          placeMarker(marker, point.x, point.y)
+          marker.title = String(index + 1) + '. ' + point.text
+          markers.appendChild(marker)
+        }
+        const row = document.createElement('div')
+        Object.assign(row.style, { borderTop: '1px solid #53627a', padding: '8px 0' })
+        const source = document.createElement('div')
+        Object.assign(source.style, { fontSize: '12px', color: '#c6d2e4', overflowWrap: 'anywhere' })
+        source.textContent = point.onCurrentPage ? (sameStack(point.frameStack) ? 'This frame' : 'Another frame') : point.pageUrl
+        const description = document.createElement('div')
+        description.textContent = String(index + 1) + '. ' + point.text
+        const coordinates = document.createElement('code')
+        coordinates.textContent = Math.round(point.x) + ', ' + Math.round(point.y)
+        Object.assign(coordinates.style, { display: 'block', fontSize: '12px', color: '#c6d2e4', marginTop: '4px' })
+        const actions = document.createElement('div')
+        Object.assign(actions.style, { display: 'flex', gap: '6px', marginTop: '6px' })
+        const edit = makeButton('Edit')
+        const remove = makeButton('Delete')
+        actions.append(edit, remove)
+        row.append(source, description, coordinates, actions)
+        list.appendChild(row)
+        edit.addEventListener('click', async event => {
+          if (!event.isTrusted) return
+          const result = await chrome.runtime.sendMessage({ type: 'DSH_POI_OPEN_SAVED', token, id: point.id })
+          if (result?.ok === true) {
+            preview = { x: point.x, y: point.y, area: point.area }
+            renderList()
+          }
+          status.textContent = result?.ok === true ? 'Opening point editor...' : result?.error ?? 'Could not open the point'
+        }, listen)
+        let lastClick
+        remove.addEventListener('click', async event => {
+          if (!event.isTrusted || event.button !== 0 || event.detail === 0) return
+          const elapsed = event.timeStamp - lastClick
+          if (lastClick === undefined || elapsed < 0 || elapsed > 200) {
+            lastClick = event.timeStamp
+            status.textContent = 'Click Delete again within 2 seconds to remove this point'
+            setTimeout(() => { lastClick = undefined }, 2000)
+            return
+          }
+          lastClick = undefined
+          const result = await chrome.runtime.sendMessage({ type: 'DSH_POI_DELETE_SAVED', token, id: point.id })
+          if (result?.ok === true) {
+            currentPoints = result.points
+            preview = null
+            renderList()
+          } else status.textContent = result?.error ?? 'Could not delete the point'
+        }, listen)
+      })
+      if (preview !== null) {
+        const zone = areaMarker()
+        placeArea(zone, preview, preview.area)
+        const marker = crosshair()
+        placeMarker(marker, preview.x, preview.y)
+        markers.append(zone, marker)
+      }
+    }
+    function onUpdated(message) {
+      if (message?.type === 'DSH_POI_LIST_UPDATED' && message.token === token) {
+        currentPoints = message.points ?? []
+        renderList()
+      }
+      if (message?.type === 'DSH_POI_AREA_PREVIEW' && message.token === token) {
+        preview = { x: message.x, y: message.y, area: message.area }
+        renderList()
+      }
+    }
+    chrome.runtime.onMessage.addListener(onUpdated)
+    cleanup = () => chrome.runtime.onMessage.removeListener(onUpdated)
+    window.addEventListener('scroll', renderList, { ...listen, capture: true })
+    window.addEventListener('resize', renderList, listen)
+    renderList()
+  }
+  document.documentElement.appendChild(host)
+  return true
+}
+
 function noteDraftKey(tabId) {
   return 'dshElementNoteDraft:' + tabId
 }
@@ -3373,6 +4137,115 @@ async function handleFrameDrill(tabId, key, draft, sender, message) {
   await chrome.storage.session.set({ [key]: view, [noteViewKey(tabId)]: view })
   await startPickerInFrame(tabId, view)
   return { ok: true, frameId: parentFrameId }
+}
+
+async function refreshPoiLists(pageKey) {
+  const state = await chrome.storage.session.get(null)
+  const stored = await readPoiStore()
+  const site = stored[pageKey]?.site
+  await Promise.allSettled(Object.entries(state).map(async ([key, view]) => {
+    if (!key.startsWith(poiViewKey('')) || view?.mode !== 'list' || view.expiresAt <= Date.now()) return
+    if (site !== undefined && view.address.site !== site) return
+    const tabId = Number(key.slice(poiViewKey('').length))
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'DSH_POI_LIST_UPDATED', token: view.token,
+      points: collectPois(stored, view.address),
+    }, { frameId: view.frameId ?? 0 })
+  }))
+}
+
+async function handlePoiFrameDrill(tabId, draft, sender, message) {
+  const enter = message.type === 'DSH_POI_ENTER_FRAME'
+  if (enter) {
+    const iframeXPath = requireNoteXPath(message.xpath)
+    const childFrameId = await resolveChildFrameId(tabId, sender.frameId, iframeXPath)
+    const view = {
+      ...draft,
+      frameId: childFrameId,
+      parentFrameId: sender.frameId,
+      frameStack: [...(draft.frameStack ?? []), iframeXPath],
+      expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+    }
+    await chrome.storage.session.set({ [poiViewKey(tabId)]: view })
+    await startPoiInFrame(tabId, view)
+    return { ok: true, frameId: childFrameId }
+  }
+  const parentFrameId = draft.parentFrameId
+  if (parentFrameId === null || parentFrameId === undefined) throw new Error('Already at the top frame')
+  const view = {
+    ...draft,
+    frameId: parentFrameId,
+    parentFrameId: parentFrameId === 0 ? null
+      : (await chrome.webNavigation.getFrame({ tabId, frameId: parentFrameId }).catch(() => undefined))?.parentFrameId ?? null,
+    frameStack: (draft.frameStack ?? []).slice(0, -1),
+    expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+  }
+  await chrome.storage.session.set({ [poiViewKey(tabId)]: view })
+  await startPoiInFrame(tabId, view)
+  return { ok: true, frameId: parentFrameId }
+}
+
+async function handlePoiMessage(message, sender) {
+  if (sender.id !== chrome.runtime.id) throw new Error('Invalid point request')
+  const popup = chrome.runtime.getURL('popup.html')
+  if (message.type === 'DSH_POI_ALL') {
+    const manager = popup + '?allPois=1'
+    if (message.action === 'open' && sender.url === popup) {
+      await chrome.windows.create({ url: manager, type: 'popup', focused: true, width: 720, height: 760 })
+      return { ok: true }
+    }
+    if (sender.url !== manager) throw new Error('Open All Points from the extension popup')
+    if (message.action === 'list') return { ok: true, points: collectMasterPois(await readPoiStore()) }
+    if (message.action !== 'save' && message.action !== 'remove') throw new Error('Unknown point action')
+    if (typeof message.pageKey !== 'string' || !/^[a-f0-9]{64}$/u.test(message.pageKey)) throw new Error('Invalid point page')
+    const id = requirePoiId(message.id)
+    const draft = { pageKey: message.pageKey, id, savedOnly: true }
+    const stored = await updatePoi(draft, message.action, message.text, message.area)
+    void refreshPoiLists(message.pageKey).catch(() => {})
+    return { ok: true, points: collectMasterPois(stored) }
+  }
+  if (message.type === 'DSH_POI_MODE' || message.type === 'DSH_POI_LIST') {
+    if (sender.url !== popup) throw new Error('Open points of interest from the extension popup')
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    return openPoiView(tab, message.type === 'DSH_POI_MODE' ? 'pick' : 'list')
+  }
+  if (message.type === 'DSH_POI_EDITOR') return poiEditorMessage(message, sender)
+  const fromPage = ['DSH_POI_SELECTED', 'DSH_POI_OPEN_SAVED', 'DSH_POI_DELETE_SAVED',
+    'DSH_POI_ENTER_FRAME', 'DSH_POI_LEAVE_FRAME'].includes(message.type)
+  if (!fromPage || sender.tab === undefined) throw new Error('Invalid point request')
+  const tabId = requireTabId(sender.tab.id)
+  const draft = (await chrome.storage.session.get(poiViewKey(tabId)))[poiViewKey(tabId)]
+  if (draft === undefined || typeof message.token !== 'string' || draft.token !== message.token
+    || draft.expiresAt <= Date.now()) {
+    throw new Error('This view expired. Open points of interest again from the extension popup.')
+  }
+  if (sender.frameId !== (draft.frameId ?? 0)) throw new Error('Invalid point request')
+  if (message.type === 'DSH_POI_ENTER_FRAME' || message.type === 'DSH_POI_LEAVE_FRAME') {
+    return handlePoiFrameDrill(tabId, draft, sender, message)
+  }
+  const address = await elementNoteAddress(sender.tab.url)
+  if (address?.pageKey !== draft.address.pageKey) {
+    throw new Error('The page changed. Open points of interest again from the extension popup.')
+  }
+  if (message.type === 'DSH_POI_SELECTED') {
+    if (!Number.isFinite(message.x) || !Number.isFinite(message.y)) throw new Error('A point requires finite viewport coordinates')
+    if (message.x < 0 || message.y < 0 || message.x > 10000 || message.y > 10000) throw new Error('The point is outside the viewport')
+    const frameUrl = sender.frameId === 0 ? sender.tab.url
+      : (await chrome.webNavigation.getFrame({ tabId, frameId: sender.frameId }).catch(() => undefined))?.url
+    return openPoiEditor(tabId, draft, { x: message.x, y: message.y, frameUrl })
+  }
+  const id = requirePoiId(message.id)
+  const point = collectPois(await readPoiStore(), address).find(item => item.id === id)
+  if (point === undefined) throw new Error('This point is no longer on the list. Reopen Page Points.')
+  if (point.pageKey !== address.pageKey) throw new Error('Open the point\'s original page before editing it')
+  if (message.type === 'DSH_POI_DELETE_SAVED') {
+    if (draft.mode !== 'list') throw new Error('Open Page Points from the extension popup')
+    const stored = await updatePoi({ pageKey: address.pageKey, id }, 'remove')
+    void refreshPoiLists(address.pageKey).catch(() => {})
+    return { ok: true, points: collectPois(stored, address) }
+  }
+  if (draft.mode !== 'list') throw new Error('Open Page Points from the extension popup')
+  return openPoiEditor(tabId, draft, { ...point, savedOnly: true })
 }
 
 async function handleElementNoteMessage(message, sender) {
@@ -5669,6 +6542,15 @@ chrome.alarms.onAlarm.addListener(alarm => {
 })
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (['DSH_POI_MODE', 'DSH_POI_LIST', 'DSH_POI_ALL', 'DSH_POI_SELECTED',
+    'DSH_POI_OPEN_SAVED', 'DSH_POI_DELETE_SAVED', 'DSH_POI_EDITOR',
+    'DSH_POI_ENTER_FRAME', 'DSH_POI_LEAVE_FRAME'].includes(message?.type)) {
+    void handlePoiMessage(message, sender).then(sendResponse, error => sendResponse({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return true
+  }
   if (['DSH_NOTE_MODE', 'DSH_NOTE_LIST', 'DSH_NOTE_ALL', 'DSH_NOTE_SELECTED',
     'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_EDITOR',
     'DSH_NOTE_ENTER_FRAME', 'DSH_NOTE_LEAVE_FRAME'].includes(message?.type)) {

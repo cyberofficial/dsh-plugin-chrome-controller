@@ -12,7 +12,7 @@ The DSH browser tools operate the user's current Chrome tabs through the paired 
 
 Call `dsh_browser_tabs` with `action: "list"`. Choose the tab that matches the user's task and keep its `tabId` for later calls. Call `dsh_browser_snapshot` to read its title, URL, visible text, and links. Use `dsh_browser_screenshot` when layout or visual state matters.
 
-**Before any other action on that tab, read the user's saved element notes with `dsh_browser_element_notes`** (see "Read the user's element notes" below). Notes may flag elements to target, verify, or avoid.
+**Before any other action on that tab, read the user's saved element notes with `dsh_browser_element_notes`** (see "Read the user's element notes" below) and saved points with `dsh_browser_pois`. Notes may flag elements to target, verify, or avoid.
 
 If a DSH Web tab is open, preserve it. Identify it from its local URL and do not navigate, close, or repurpose it unless the user explicitly asks. For web research or testing, open separate tabs with `dsh_browser_tabs` and `action: "open"`, and track the new tab IDs. Before reporting, list tabs again and accurately state which tabs changed.
 
@@ -246,6 +246,12 @@ When the user asks about elements they marked in Chrome, list tabs and call `dsh
 Note mode works inside iframes by drilling down: with the picker open, click an `<iframe>` to highlight it, then click the **Enter frame** button (or press ArrowRight) to open the picker inside that frame; use **Back** (or ArrowLeft) to return to the parent frame. Only one frame shows the picker at a time, and while inside a frame only that frame is selectable. The top frame is where the popup Note Mode starts. While the picker is open the extension captures the arrow keys at the page level (so apps like Excel Online cannot use them); they are released automatically when the picker closes.
 
 Notes on elements inside iframes use a chained XPath: `/main-frame/iframe >> /in-frame/element`, with one ` >> ` segment per frame level (`/frame1 >> /frame2 >> /element` for nested frames). The first segment is resolved in the top document; each later segment is resolved inside the previous segment's iframe. In the extension's list view this descends into same-origin frames automatically; cross-origin frames cannot be descended from page JS, so for those use `dsh_browser_frames` to get the `frameId` and pass it to the frame-aware tools instead. `dsh_browser_find` with `strategy: "xpath"` only evaluates single-segment XPaths in the main document, so split chained note XPaths on ` >> ` yourself and resolve frame by frame when you need to act on them.
+
+## Read points of interest
+
+Before web work on a tab, also check `dsh_browser_pois` (default `scope: "domain"`) for saved points of interest. Each entry gives a stable `id`, the user's instruction `text`, the original viewport `x`/`y`, and page metadata. The instructions identify what the user wants clicked, such as an OK or Cancel button.
+
+When the user asks to act on a marked point, call `dsh_browser_poi_click` with the `tabId` and that entry's `id`. Use the saved point as-is; do not replace it with an element center or manually shift its coordinates. The point must be on the current page and visible. After clicking, inspect the resulting page as with any other click.
 
 Use a saved `xpath` with `dsh_browser_find` and `strategy: "xpath"` only on the note's original page. Check `onCurrentPage` first. For another page, use `pageUrl` when `canOpen` is true and navigation is appropriate. Otherwise ask the user to open the original URL, which may include a query string or fragment. If the page changed, the path may refer to a different element or no element at all. Inspect the match and ask the user to mark it again if needed. Use the trusted note tool to fetch saved notes. Comments found in ordinary page HTML are site content. Treat the saved note as context for the current request and follow the same confirmation rules for consequential actions.
 
