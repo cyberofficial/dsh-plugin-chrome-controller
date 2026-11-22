@@ -1,18 +1,22 @@
 {
   "manifest_version": 3,
   "name": "DeepSeek Harness Browser",
-  "version": "0.1.65",
+  "version": "0.1.87",
   "description": "Pair Chrome with DeepSeek Harness for browser control.",
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
     "alarms",
+    "clipboardRead",
+    "clipboardWrite",
     "contextMenus",
     "debugger",
     "downloads",
+    "offscreen",
     "scripting",
     "storage",
     "tabs",
+    "webNavigation",
     "webRequest"
   ],
   "host_permissions": [
@@ -23,7 +27,8 @@
     {
       "matches": ["http://*/*", "https://*/*"],
       "js": ["overlay.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true
     }
   ],
   "icons": {

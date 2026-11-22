@@ -108,7 +108,8 @@ a {
   color: var(--muted);
 }
 
-.notes-menu {
+.notes-menu,
+.poi-menu {
   display: grid;
   gap: 8px;
   margin: 16px 0;
@@ -181,7 +182,8 @@ button.primary-button:hover:enabled {
   background: var(--danger);
 }
 
-#notes-feedback {
+#notes-feedback,
+#poi-feedback {
   margin: 0;
   color: var(--danger);
   font-size: 12px;
@@ -193,10 +195,72 @@ button.primary-button:hover:enabled {
   margin: 12px 0 0;
 }
 
-#note-editor label {
+#note-editor label,
+#poi-editor label {
   display: block;
   font-weight: 600;
   margin: 12px 0 4px;
+}
+
+#poi-coords {
+  display: block;
+  font: 12px/1.45 ui-monospace, monospace;
+  color: var(--muted);
+}
+
+.poi-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.poi-presets button {
+  font-size: 12px;
+  min-height: 28px;
+}
+
+.poi-area-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(90px, 0.4fr);
+  align-items: center;
+  gap: 4px 10px;
+}
+
+#all-notes-filter,
+#all-notes-panel textarea,
+#poi-text,
+#poi-shape,
+.poi-area-fields input,
+#all-pois-filter,
+#all-pois-panel textarea,
+#all-pois-panel input,
+#all-pois-panel select {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+#all-pois-panel .poi-edit-area {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 6px;
+}
+
+#all-pois-panel .poi-edit-area label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+#all-pois-panel .poi-edit-area input,
+#all-pois-panel .poi-edit-area select {
+  margin-top: 2px;
+  padding: 5px;
 }
 
 #note-xpath {
@@ -208,9 +272,16 @@ button.primary-button:hover:enabled {
   color: var(--muted);
 }
 
-#note-text,
-#all-notes-filter,
-#all-notes-panel textarea {
+#note-coords {
+  display: block;
+  overflow-wrap: anywhere;
+  max-height: 24px;
+  overflow: auto;
+  font: 12px/1.45 ui-monospace, monospace;
+  color: var(--muted);
+}
+
+#note-text {
   box-sizing: border-box;
   width: 100%;
   padding: 8px;
@@ -272,6 +343,15 @@ textarea {
 #all-notes-list .note-path {
   display: block;
   overflow-wrap: anywhere;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+#all-notes-list .note-coords {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
   color: var(--muted);
   margin-bottom: 8px;
 }

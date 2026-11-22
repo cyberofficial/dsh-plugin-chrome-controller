@@ -32,6 +32,21 @@
         <p id="notes-feedback" role="status" hidden></p>
       </section>
 
+      <section class="poi-menu" aria-label="Points of interest">
+        <button id="poi-mode" class="primary-button" type="button">Points of Interest</button>
+        <div class="notes-menu-grid">
+          <button id="page-pois" type="button">
+            <span>Page Points</span>
+            <small>Current site</small>
+          </button>
+          <button id="all-pois" type="button">
+            <span>All Points</span>
+            <small>All domains</small>
+          </button>
+        </div>
+        <p id="poi-feedback" role="status" hidden></p>
+      </section>
+
       <section class="connection-bar" aria-label="DSH connection">
         <p id="status" role="status" data-state="working">Checking connection...</p>
         <button id="connect" type="button" hidden>Connect to DSH Web</button>
@@ -43,6 +58,8 @@
       <p class="hint">Saved notes are available to DSH when you ask it to read them.</p>
       <label for="note-xpath">Selected element</label>
       <output id="note-xpath"></output>
+      <label for="note-coords">Viewport point (X,Y)</label>
+      <output id="note-coords"></output>
       <form id="note-form">
         <label for="note-text">Note</label>
         <textarea id="note-text" rows="5" maxlength="2000" required></textarea>
@@ -60,6 +77,50 @@
       <input id="all-notes-filter" type="search" placeholder="Search pages or notes">
       <p id="all-notes-status" role="status">Loading notes...</p>
       <div id="all-notes-list"></div>
+    </main>
+    <main id="poi-editor" hidden>
+      <h1>Point of Interest</h1>
+      <p class="hint">Saved points are available to DSH when you ask it to read them.</p>
+      <label for="poi-coords">Viewport point (X,Y)</label>
+      <output id="poi-coords"></output>
+      <form id="poi-form">
+        <label>Presets</label>
+        <div class="poi-presets">
+          <button type="button" data-preset="okay button">okay button</button>
+          <button type="button" data-preset="cancel button">cancel button</button>
+          <button type="button" data-preset="input field for: ">input field for:</button>
+        </div>
+        <label for="poi-text">Instruction</label>
+        <textarea id="poi-text" rows="4" maxlength="2000" required></textarea>
+        <label for="poi-shape">Click area</label>
+        <select id="poi-shape">
+          <option value="circle">Circle</option>
+          <option value="rectangle">Rectangle</option>
+        </select>
+        <div id="poi-circle-fields" class="poi-area-fields">
+          <label for="poi-radius">Radius (0-250 px)</label>
+          <input id="poi-radius" type="number" min="0" max="250" step="1" value="0">
+        </div>
+        <div id="poi-rectangle-fields" class="poi-area-fields" hidden>
+          <label for="poi-width">Width (0-500 px)</label>
+          <input id="poi-width" type="number" min="0" max="500" step="1" value="0">
+          <label for="poi-height">Height (0-500 px)</label>
+          <input id="poi-height" type="number" min="0" max="500" step="1" value="0">
+        </div>
+        <p id="poi-status" role="status"></p>
+        <div class="note-actions">
+          <button id="poi-save" type="submit" disabled>Save point</button>
+          <button id="poi-remove" type="button" hidden>Remove point</button>
+          <button id="poi-cancel" type="button">Cancel</button>
+        </div>
+      </form>
+    </main>
+    <main id="all-pois-panel" hidden>
+      <h1>All Points</h1>
+      <label for="all-pois-filter">Filter points</label>
+      <input id="all-pois-filter" type="search" placeholder="Search pages or instructions">
+      <p id="all-pois-status" role="status">Loading points...</p>
+      <div id="all-pois-list"></div>
     </main>
     <script src="popup.js"></script>
   </body>

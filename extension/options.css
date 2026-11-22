@@ -100,3 +100,29 @@ button {
 #status[data-error="true"] {
   color: #b42318;
 }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  cursor: pointer;
+}
+
+.check input {
+  min-height: 18px;
+  width: 18px;
+}
+
+#clipboard-form h2 {
+  font-size: 17px;
+  margin: 26px 0 10px;
+}
+
+#clipboard-status {
+  min-height: 1.5em;
+}
+
+#clipboard-status[data-error="true"] {
+  color: #b42318;
+}
