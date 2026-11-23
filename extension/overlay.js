@@ -75,7 +75,31 @@
   // Exposed for unit tests; harmless in the page.
   globalThis.__dshBuildCursorPath = buildCursorPath
 
-  if (typeof document === 'undefined' || typeof chrome === 'undefined' || chrome.runtime?.id === undefined) return
+  function cursorTravelDurationMs(distance, cursorSettings, durationOverride) {
+    const speedPxPerMs = Number.isFinite(cursorSettings.speedPxPerMs)
+      ? Math.max(0.1, Math.min(5, cursorSettings.speedPxPerMs))
+      : CURSOR_SPEED_PX_PER_MS
+    const minDurationMs = Number.isFinite(cursorSettings.minDurationMs)
+      ? Math.max(50, Math.min(2_000, cursorSettings.minDurationMs))
+      : CURSOR_MIN_DURATION_MS
+    const maxDurationMs = Number.isFinite(cursorSettings.maxDurationMs)
+      ? Math.max(minDurationMs, Math.min(5_000, cursorSettings.maxDurationMs))
+      : Math.max(minDurationMs, CURSOR_MAX_DURATION_MS)
+    return Number.isFinite(durationOverride)
+      ? Math.max(100, Math.min(2_000, durationOverride))
+      : Math.max(minDurationMs, Math.min(maxDurationMs, distance / speedPxPerMs))
+  }
+
+  function cursorPointAt(points, progress) {
+    const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2
+    return points[Math.floor(eased * (points.length - 1))]
+  }
+
+  if (typeof document === 'undefined' || typeof chrome === 'undefined' || chrome.runtime?.id === undefined
+    || location.protocol === 'chrome-extension:') {
+    globalThis.__dshCursorMotion = { buildCursorPath, cursorTravelDurationMs, cursorPointAt }
+    return
+  }
   // The context-menu capture must run in every frame so note mode works inside
   // iframes; the visual cursor overlay stays on the top frame only.
   const isTopFrame = window === window.top
@@ -167,23 +191,11 @@
       maxArcPx: cursorSettings.maxArcPx,
     })
     const distance = Math.hypot(x - position.x, y - position.y)
-    const speedPxPerMs = Number.isFinite(cursorSettings.speedPxPerMs)
-      ? Math.max(0.1, Math.min(5, cursorSettings.speedPxPerMs))
-      : CURSOR_SPEED_PX_PER_MS
-    const minDurationMs = Number.isFinite(cursorSettings.minDurationMs)
-      ? Math.max(50, Math.min(2_000, cursorSettings.minDurationMs))
-      : CURSOR_MIN_DURATION_MS
-    const maxDurationMs = Number.isFinite(cursorSettings.maxDurationMs)
-      ? Math.max(minDurationMs, Math.min(5_000, cursorSettings.maxDurationMs))
-      : Math.max(minDurationMs, CURSOR_MAX_DURATION_MS)
-    const duration = Number.isFinite(durationOverride)
-      ? Math.max(100, Math.min(2_000, durationOverride))
-      : Math.max(minDurationMs, Math.min(maxDurationMs, distance / speedPxPerMs))
+    const duration = cursorTravelDurationMs(distance, cursorSettings, durationOverride)
     const start = performance.now()
-    const ease = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2
     const step = now => {
       const t = Math.min(1, (now - start) / duration)
-      const point = points[Math.min(points.length - 1, Math.floor(ease(t) * (points.length - 1)))]
+      const point = cursorPointAt(points, t)
       setCursorPosition(point.x, point.y)
       if (t < 1) {
         animationFrame = requestAnimationFrame(step)

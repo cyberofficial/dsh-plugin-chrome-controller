@@ -264,18 +264,18 @@ const CHAR_KEYS = buildCharKeys()
 // Frequent English bigrams are typed faster; used to shorten flight time.
 const COMMON_BIGRAMS = new Set(['th','he','in','er','an','re','on','at','en','nd','ti','es','or','te','of','ed','is','it','al','ar','st','to','nt','ng','se','as','ou','le','ve','co','me','de','hi','ri','ro','ic','ne','ea','ra','ce','li','ch','ll','be','ma','si','om','ur'])
 
-function randomBetween(min, max) {
-  return min + Math.random() * (max - min)
+function randomBetween(min, max, random) {
+  return min + random() * (max - min)
 }
 
 /** Flight time (down-down) before pressing `char`, given the previous char. */
-function flightDelayMs(char, prevChar, baseDelayMs, settings) {
-  if (Math.random() < settings.thinkingPauseChancePercent / 100) {
-    return randomBetween(settings.thinkingPauseMinMs, settings.thinkingPauseMaxMs)
+function flightDelayMs(char, prevChar, baseDelayMs, settings, random = Math.random) {
+  if (random() < settings.thinkingPauseChancePercent / 100) {
+    return randomBetween(settings.thinkingPauseMinMs, settings.thinkingPauseMaxMs, random)
   }
-  let delay = baseDelayMs * randomBetween(settings.flightJitterMinFactor, settings.flightJitterMaxFactor)
+  let delay = baseDelayMs * randomBetween(settings.flightJitterMinFactor, settings.flightJitterMaxFactor, random)
   if (char === ' ' || '.,!?;:'.includes(char)) {
-    delay *= randomBetween(settings.spacePauseMinFactor, settings.spacePauseMaxFactor)
+    delay *= randomBetween(settings.spacePauseMinFactor, settings.spacePauseMaxFactor, random)
   } else if (prevChar !== '' && COMMON_BIGRAMS.has((prevChar + char).toLowerCase())) {
     delay *= settings.commonBigramFactor
   } else if (prevChar === char) {
@@ -284,19 +284,109 @@ function flightDelayMs(char, prevChar, baseDelayMs, settings) {
   return Math.round(delay)
 }
 
-function keyHoldMs(settings) {
-  return Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs))
+function keyHoldMs(settings, random = Math.random) {
+  return Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs, random))
 }
 
-function typingPreviewSteps(values) {
+const TYPING_PREVIEW_SENTENCE = 'The quick brown fox jumps over the lazy dog.'
+const TYPING_PREVIEW_TEXT = Array(3).fill(TYPING_PREVIEW_SENTENCE).join('\n')
+
+function typingPreviewSteps(values, sample = TYPING_PREVIEW_TEXT, randomForCharacter = () => Math.random) {
   const settings = normalizeBehaviorSettings(values)
-  const sentence = 'The quick brown fox jumps over the lazy dog.'
-  const sample = [sentence, sentence, sentence].join('\n')
-  return Array.from(sample, (character, index) => ({
-    character,
-    waitMs: flightDelayMs(character, sample[index - 1] ?? '', settings.baseFlightDelayMs, settings),
-    holdMs: CHAR_KEYS[character] === undefined ? 0 : keyHoldMs(settings),
+  let previous = ''
+  return Array.from(sample, (character, index) => {
+    const random = randomForCharacter(index)
+    const waitMs = flightDelayMs(character, previous, settings.baseFlightDelayMs, settings, random)
+    const holdMs = CHAR_KEYS[character] === undefined ? 0 : keyHoldMs(settings, random)
+    previous = character
+    return { character, waitMs, holdMs }
+  })
+}
+
+const TYPING_EXAMPLE_SETTINGS = {
+  baseFlightDelayMs: 220,
+  flightJitterMinFactor: 1,
+  flightJitterMaxFactor: 1,
+  keyHoldMinMs: 70,
+  keyHoldVariationMs: 0,
+  thinkingPauseChancePercent: 0,
+  spacePauseMinFactor: 1,
+  spacePauseMaxFactor: 1,
+  commonBigramFactor: 1,
+  repeatedKeyFactor: 1,
+}
+
+const TYPING_EXAMPLES = {
+  baseDelay: {
+    sample: 'abcd',
+    presets: [
+      ['80 ms before each key', { baseFlightDelayMs: 80 }],
+      ['360 ms before each key', { baseFlightDelayMs: 360 }],
+    ],
+  },
+  delayVariation: {
+    sample: 'abcd',
+    presets: [
+      ['Fixed at 1x', {}],
+      ['Varies from 0.3x to 2.4x', { flightJitterMinFactor: 0.3, flightJitterMaxFactor: 2.4 }],
+    ],
+  },
+  keyHold: {
+    sample: 'abcd',
+    presets: [
+      ['70 ms hold', {}],
+      ['340 ms hold', { keyHoldMinMs: 340 }],
+      ['70 to 410 ms hold', { keyHoldVariationMs: 340 }],
+    ],
+  },
+  letterPairs: {
+    sample: 'that',
+    presets: [
+      ['1x for common pairs', {}],
+      ['0.2x for common pairs', { commonBigramFactor: 0.2 }],
+    ],
+  },
+  repeatedCharacters: {
+    sample: 'coffee',
+    presets: [
+      ['1x before repeats', {}],
+      ['3x before repeats', { repeatedKeyFactor: 3 }],
+    ],
+  },
+  wordPauses: {
+    sample: 'Go, now!',
+    presets: [
+      ['1x for spaces and punctuation', {}],
+      ['3x to 4x for spaces and punctuation', { spacePauseMinFactor: 3, spacePauseMaxFactor: 4 }],
+    ],
+  },
+  longPauses: {
+    sample: 'abcdef',
+    presets: [
+      ['0% chance', {}],
+      ['25% chance, 800 to 1400 ms', { thinkingPauseChancePercent: 25, thinkingPauseMinMs: 800, thinkingPauseMaxMs: 1400 }],
+    ],
+  },
+}
+
+function typingExamplePlans(name, values) {
+  if (typeof name !== 'string' || !Object.hasOwn(TYPING_EXAMPLES, name)) return undefined
+  const { sample, presets } = TYPING_EXAMPLES[name]
+  // Use the same sample draws for every preset so differences come from the settings.
+  const draws = [0.62, 0.12, 0.84, 0.55, 0.19, 0.76, 0.44, 0.32]
+  const randomForCharacter = index => {
+    let draw = index
+    return () => draws[draw++ % draws.length]
+  }
+  const plans = presets.map(([label, overrides]) => ({
+    label,
+    steps: typingPreviewSteps({ ...TYPING_EXAMPLE_SETTINGS, ...overrides }, sample, randomForCharacter),
   }))
+  if (values !== undefined) plans.unshift({
+    label: 'Your settings',
+    steps: typingPreviewSteps(values, sample, randomForCharacter),
+  })
+  return plans
 }
 
 const KEY_MODIFIER_BITS = { alt: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, super: 4, shift: 8 }
@@ -6693,7 +6783,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'DSH_TYPING_PREVIEW') {
     const optionsUrl = chrome.runtime.getURL('options.html')
     if (sender.id !== chrome.runtime.id || sender.url?.split(/[?#]/u, 1)[0] !== optionsUrl) return false
-    sendResponse({ steps: typingPreviewSteps(message.settings) })
+    sendResponse(message.example === undefined
+      ? { steps: typingPreviewSteps(message.settings) }
+      : { plans: typingExamplePlans(message.example, message.settings) })
     return false
   }
   if (['DSH_POI_MODE', 'DSH_POI_LIST', 'DSH_POI_ALL', 'DSH_POI_SELECTED',
