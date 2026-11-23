@@ -402,6 +402,17 @@ Result should include `"started": true`. Starting again with the same selector i
 ### Step 2 - visit and verify the requested cells
 
 - **Google Sheets** (main frame): drive the name box. A `dsh_browser_sequence` can repeat `fill` with the target cell address and `keypress` with `Enter` for each cell. Keep sequences short; up to 8 cells use 16 steps. Verify each requested address and formula-bar value before reporting it; revisit cells if they were batched.
+- **Excel Online**: when navigating with the name box, pressing Enter is required to commit the address and move the selection. Include it immediately after typing the cell or range address. Typing the address alone leaves it as unsubmitted text, and the selection may stay on the previous cell. For example:
+
+  ```json
+  {"tabId": 123, "steps": [
+    {"action": "keypress", "key": "Ctrl+A"},
+    {"action": "type_human", "text": "B14"},
+    {"action": "keypress", "key": "Enter"}
+  ]}
+  ```
+
+  After Enter, inspect the name box and formula bar to confirm Excel moved to the requested cell. When visiting a list of addresses, include a separate Enter step after every address typed into the name box.
 - **freesheet.app**: inspect the DOM grid with `dsh_browser_snapshot` or `dsh_browser_extract` and check whether the result is complete. If clicking cells, use a fresh screenshot and account for the current scroll position, zoom, and grid layout; verify the selected cell and its value.
 - **Excel Online** (canvas grid): select visible cells using a fresh screenshot and main-viewport coordinates. Frame snapshot rectangles are frame-relative and require the iframe offset and any transforms before use for clicks. Derive positions from the currently visible rows and columns, including scroll, zoom, headers, frozen or hidden cells, and actual row and column sizes; do not assume the canvas begins at A1. After each selection, confirm the name box and formula bar. Before the first coordinate click after (re)attaching, call `dsh_browser_screenshot` once on the tab.
 - You can also get the used range first from an Excel frame snapshot (`usedRange: {LastRow, LastColumn}`) or, for Sheets/freesheet, read the whole grid via `dsh_browser_snapshot`/`dsh_browser_extract` if the DOM contains it.
