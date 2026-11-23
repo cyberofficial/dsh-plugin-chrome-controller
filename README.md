@@ -61,6 +61,12 @@ DSH Web does not have to run on the same computer as Chrome. For example, it can
 
 Enter the HTTPS origin shown in DSH **Settings → Chrome browser** in the extension Settings. The extension routes do not use the DSH Web login cookie; the pairing code authenticates them. After 10 wrong pairing codes within a minute, every pairing attempt is refused with a "wait a minute" message (HTTP 429) until the minute has passed; the extension popup shows that message when Connect fails. The counter is global, because behind a proxy every peer looks local, so anyone who can reach a trusted address can also hold the limit open and block pairing. Only expose DSH Web on networks you trust, as for DSH Web itself.
 
+## Browser domain filter
+
+In the extension's **Settings**, open **Browser domain filter**. Enter one domain or URL per line, choose **Whitelist** to permit only listed domains or **Blacklist** to block listed domains, then save. **Off** is the default. The same list is kept when you switch modes. Each entry includes its subdomains, regardless of port or path.
+
+The filter checks the main tab address and the destinations passed to tab-opening and navigation tools. Blocked tabs are omitted from DSH's tab list. Chrome can still load a page reached by a link or redirect. If the main tab lands on a blocked domain, DSH denies access to it. Embedded frames in an allowed tab continue to work.
+
 ## Clipboard access
 
 The extension can read and write the system clipboard, but **only after you opt in** on the extension Settings page: first check **I understand the risks and want to allow clipboard access**, then check **Allow DSH to read the clipboard and paste text into pages**, and save. Both checkboxes must be on; unchecking the acknowledgement also turns the toggle off. While disabled, every clipboard tool returns an error.
@@ -93,7 +99,7 @@ The clipboard operations run in a dedicated offscreen document (Chrome's `clipbo
 - `dsh_browser_click` clicks a CSS-selected element or a viewport coordinate, showing the virtual cursor sweeping to the point first.
 - `dsh_browser_mouse_move` hovers a unique CSS-selected element or moves to viewport coordinates, showing the virtual cursor and dispatching a real `mouseMoved`.
 - `dsh_browser_drag` performs a real left-button drag between two visible elements or viewport coordinates, with intermediate mouse-move events. Activate the target tab first; mouse movement can stall on background tabs.
-- `dsh_browser_scroll` brings a CSS-selected element into the viewport or scrolls the page by horizontal and vertical deltas. Selector clicks also scroll their target into view automatically.
+- `dsh_browser_scroll` brings a CSS-selected element into view or scrolls by horizontal and vertical deltas. Use `frameId` to scroll inside a frame and `containerSelector` with deltas to scroll an open menu, panel, or list.
 - `dsh_browser_fill` replaces the text in a CSS-selected field by typing it character by character. `dsh_browser_type_human` does the same into the focused or a CSS-selected field and types the entire supplied string in one run (up to 2000 characters). Bulk pasting-style insertion is not available: instant text injection is a banned action, so `page.type` refuses to run.
 - `dsh_browser_submit` submits a CSS-selected form with `requestSubmit()`, preserving native validation. Its result reports whether submission was attempted and the form's validity, not whether the site completed the submission.
 - `dsh_browser_keypress` presses a supported key, optionally with modifiers as a chord joined by `+` (e.g. `Ctrl+L`, `Control+Shift+ArrowRight`, `Cmd+A`). Chords that close the browser or tab (`Alt+F4`, `Ctrl+W`, `Cmd+W`, `Ctrl+Shift+Q`) are refused.

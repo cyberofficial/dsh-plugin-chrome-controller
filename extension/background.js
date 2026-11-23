@@ -1,4 +1,4 @@
-import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, domainFilterAllows, normalizeDshOrigin } from './origin.js'
 import { clampPoiPoint, normalizePoiArea, normalizePoiText, selectPoiPoint } from './poi.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
@@ -1202,7 +1202,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     keypress: { method: 'page.keypress', required: ['key'], allowed: ['key'] },
     mouse_move: { method: 'page.mouseMove', required: [], allowed: ['selector', 'x', 'y'] },
     drag: { method: 'page.drag', required: [], allowed: ['fromSelector', 'toSelector', 'fromX', 'fromY', 'toX', 'toY', 'durationMs'] },
-    scroll: { method: 'page.scroll', required: [], allowed: ['selector', 'deltaX', 'deltaY'] },
+    scroll: { method: 'page.scroll', required: [], allowed: ['selector', 'frameId', 'containerSelector', 'deltaX', 'deltaY'] },
     navigate: { method: 'page.navigate', required: ['url'], allowed: ['url'] },
     back: { method: 'page.back', required: [], allowed: [] },
     forward: { method: 'page.forward', required: [], allowed: [] },
@@ -1246,8 +1246,8 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     for (const key of spec.allowed) {
       const value = stepParams[key]
       if (value === undefined) continue
-      const expected = ['x', 'y', 'fromX', 'fromY', 'toX', 'toY'].includes(key) ? 'number'
-        : ['delayMs', 'timeoutMs', 'maxChars', 'maxItems', 'durationMs', 'pollIntervalMs', 'index'].includes(key) ? 'integer'
+      const expected = ['x', 'y', 'fromX', 'fromY', 'toX', 'toY', 'deltaX', 'deltaY'].includes(key) ? 'number'
+        : ['delayMs', 'timeoutMs', 'maxChars', 'maxItems', 'durationMs', 'pollIntervalMs', 'index', 'frameId'].includes(key) ? 'integer'
             : 'string'
       const valid = expected === 'integer' ? Number.isSafeInteger(value)
         : expected === 'number' ? Number.isFinite(value)
@@ -1270,11 +1270,10 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
       }
     }
     if (step.action === 'scroll') {
-      const hasSelector = stepParams.selector !== undefined
-      const hasDelta = stepParams.deltaX !== undefined || stepParams.deltaY !== undefined
-      if (hasSelector === hasDelta) throw new Error('Sequence scroll step ' + String(index + 1) + ' requires a selector or scroll deltas')
-      if ([stepParams.deltaX, stepParams.deltaY].some(value => value !== undefined && Math.abs(value) > 10_000)) {
-        throw new Error('Sequence scroll step ' + String(index + 1) + ' has out-of-range deltas')
+      try {
+        validateScrollParams(stepParams)
+      } catch (error) {
+        throw new Error('Sequence scroll step ' + String(index + 1) + ': ' + error.message)
       }
     }
     if (step.action === 'drag') {
@@ -1313,7 +1312,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
         throw new Error('Sequence wait_for_element step ' + String(index + 1) + ' has out-of-range timing')
       }
     }
-    if (['click', 'type_human', 'type_fast', 'fill', 'paste', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
+    if (['click', 'type_human', 'type_fast', 'fill', 'paste', 'get_html', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
       && stepParams.selector !== undefined) {
       requireCssSelector(stepParams.selector)
     }
@@ -1384,11 +1383,16 @@ async function ensureClipboardOffscreen() {
  * runs in the active tab: readText when the document is focused, with an
  * execCommand('paste') fallback into a hidden textarea.
  */
-async function readClipboardFromActiveTab() {
+async function readClipboardFromActiveTab(policy, signal) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
   if (tab?.id === undefined) throw new Error('No active tab to read the clipboard from')
+  const read = () => readClipboardFromTab(tab.id)
+  return policy.mode === 'off' ? read() : withDomainTabAccess(tab.id, policy, signal, read)
+}
+
+async function readClipboardFromTab(tabId) {
   const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     func: async () => {
       const hasFocus = document.hasFocus()
       let text = ''
@@ -1421,13 +1425,14 @@ async function readClipboardFromActiveTab() {
   return { ok: true, text: value.text, totalChars: value.text.length, fallback: value.usedFallback }
 }
 
-async function clipboardOperation(action, text) {
+async function requireClipboardAccess() {
   if (!(await clipboardAccessAllowed())) {
     throw new Error('Clipboard access is disabled. Enable it in the extension Settings page after acknowledging the risks.')
   }
-  // Reads must run in a focused document; the offscreen document can never be
-  // focused, so readText there always fails with "Document is not focused".
-  if (action === 'read') return readClipboardFromActiveTab()
+}
+
+async function clipboardOperation(action, text) {
+  await requireClipboardAccess()
   await ensureClipboardOffscreen()
   const response = await chrome.runtime.sendMessage({ dshClipboard: true, action, text })
   if (!isRecord(response) || response.ok !== true) {
@@ -1477,6 +1482,15 @@ function executeBrowserOperation(method, params, signal) {
 }
 
 async function executeBrowserOperationNow(method, params, signal) {
+  const policy = await getDomainFilter()
+  if (policy.mode === 'off' || !Number.isSafeInteger(params.tabId)) {
+    return dispatchBrowserOperation(method, params, signal, policy)
+  }
+  return withDomainTabAccess(params.tabId, policy, signal, guardedSignal =>
+    dispatchBrowserOperation(method, params, guardedSignal, policy), method === 'tabs.close')
+}
+
+async function dispatchBrowserOperation(method, params, signal, policy) {
   switch (method) {
     case 'page.sequence': {
       const settings = await getBehaviorSettings()
@@ -1597,10 +1611,15 @@ async function executeBrowserOperationNow(method, params, signal) {
       await chrome.downloads.cancel(params.downloadId)
       return { downloadId: params.downloadId, cancelled: true }
     case 'tabs.list':
-      return { tabs: await getTabs() }
+      return { tabs: await getTabs(policy) }
     case 'tabs.open': {
       const url = httpUrl(params.url)
-      const tab = await chrome.tabs.create({ url, active: params.active !== false })
+      requireDomainAccess(policy, url)
+      let tab = await chrome.tabs.create({ url, active: params.active !== false })
+      if (policy.mode !== 'off') {
+        tab = await navigateTabAndWait(tab.id, url, signal, true)
+        requireTabDomainAccess(policy, tab)
+      }
       return { tabId: tab.id, url: tab.url ?? url, title: tab.title ?? '' }
     }
     case 'tabs.activate': {
@@ -1720,7 +1739,9 @@ async function executeBrowserOperationNow(method, params, signal) {
     case 'page.navigate': {
       const tabId = requireTabId(params.tabId)
       const url = httpUrl(params.url)
+      requireDomainAccess(policy, url)
       const tab = await navigateTabAndWait(tabId, url, signal)
+      requireTabDomainAccess(policy, tab)
       return { tabId, url: tab.url ?? url, title: tab.title ?? '', loaded: true }
     }
     case 'page.back':
@@ -1728,7 +1749,8 @@ async function executeBrowserOperationNow(method, params, signal) {
     case 'page.reload': {
       const tabId = requireTabId(params.tabId)
       const action = method === 'page.back' ? 'back' : method === 'page.forward' ? 'forward' : 'reload'
-      const { tab, navigationObserved, navigationMethod } = await historyTabAndWait(tabId, action, signal)
+      const { tab, navigationObserved, navigationMethod } = await historyTabAndWait(tabId, action, signal, policy)
+      requireTabDomainAccess(policy, tab)
       return {
         tabId,
         action,
@@ -1893,13 +1915,14 @@ async function executeBrowserOperationNow(method, params, signal) {
       throw new Error('Timed out waiting for the selected element to change')
     }
     case 'page.elementNotes':
-      return readElementNotes(params)
+      return readElementNotes(params, policy)
     case 'page.poiList':
-      return readPois(params)
+      return readPois(params, policy)
     case 'page.poiClick':
       return clickSavedPoi(params)
     case 'page.clipboardRead': {
-      const response = await clipboardOperation('read')
+      await requireClipboardAccess()
+      const response = await readClipboardFromActiveTab(policy, signal)
       let text = typeof response.text === 'string' ? response.text : ''
       const totalChars = typeof response.totalChars === 'number' ? response.totalChars : text.length
       const truncated = totalChars > MAX_CLIPBOARD_TEXT_CHARS
@@ -2196,20 +2219,23 @@ async function executeBrowserOperationNow(method, params, signal) {
         }
       })
     }
-    case 'page.scroll': {
+    case 'page.scroll':
+    case 'page.scrollTarget': {
       const tabId = requireTabId(params.tabId)
-      const hasSelector = params.selector !== undefined
-      const hasDelta = params.deltaX !== undefined || params.deltaY !== undefined
-      if (hasSelector === hasDelta) throw new Error('Provide a selector or one or both scroll deltas')
-      if (params.selector !== undefined) requireCssSelector(params.selector)
+      validateScrollParams(params)
       const deltaX = params.deltaX ?? 0
       const deltaY = params.deltaY ?? 0
-      if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)
-        || Math.abs(deltaX) > 10_000 || Math.abs(deltaY) > 10_000) {
-        throw new Error('Scroll deltas must be between -10000 and 10000')
+      if (params.frameId !== undefined || params.containerSelector !== undefined) {
+        const frameId = params.frameId ?? 0
+        const result = await runInFrame(tabId, frameId, scrollFramePayload, [
+          params.selector ?? null, params.containerSelector ?? null, deltaX, deltaY,
+        ])
+        if (!isRecord(result)) throw new Error('The frame returned no scroll result')
+        if (result.error) throw new Error(result.error)
+        return { tabId, frameId, ...result }
       }
       return withDebugger(tabId, async target => {
-        if (hasSelector) {
+        if (params.selector !== undefined) {
           const nodeId = await querySelectorNode(target, params.selector)
           const info = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
           if (!isRecord(info) || info.visible !== true) {
@@ -2558,10 +2584,58 @@ async function executeBrowserOperationNow(method, params, signal) {
   }
 }
 
-async function getTabs() {
+async function getDomainFilter() {
+  await ensureTrustedLocalStorage()
+  const stored = (await chrome.storage.local.get(DOMAIN_FILTER_KEY))[DOMAIN_FILTER_KEY]
+  if (stored === undefined || stored?.mode === 'off') return { mode: 'off', domains: [] }
+  if (['whitelist', 'blacklist'].includes(stored?.mode) && Array.isArray(stored.domains)
+    && stored.domains.every(domain => typeof domain === 'string' && domain !== '')) return stored
+  throw new Error('The browser domain filter is invalid. Save it again in the extension Settings.')
+}
+
+function requireDomainAccess(policy, url) {
+  if (!domainFilterAllows(policy, url)) throw domainFilterError(policy)
+}
+
+function domainFilterError(policy) {
+  return new Error('Blocked by the browser domain filter (' + policy.mode + '). Ask the user to review the extension Settings if this tab is needed.')
+}
+
+function tabDomainAllows(policy, tab) {
+  return domainFilterAllows(policy, tab.url) && (!tab.pendingUrl || domainFilterAllows(policy, tab.pendingUrl))
+}
+
+function requireTabDomainAccess(policy, tab) {
+  if (!tabDomainAllows(policy, tab)) throw domainFilterError(policy)
+}
+
+async function withDomainTabAccess(tabId, policy, signal, operation, closesTab = false) {
+  const controller = new AbortController()
+  const guardedSignal = signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal])
+  const onCommitted = ({ tabId: changedTabId, frameId, url, documentLifecycle }) => {
+    if (changedTabId !== tabId || frameId !== 0 || (documentLifecycle && documentLifecycle !== 'active')) return
+    if (!domainFilterAllows(policy, url)) controller.abort(domainFilterError(policy))
+  }
+  chrome.webNavigation.onCommitted.addListener(onCommitted)
+  try {
+    requireTabDomainAccess(policy, await chrome.tabs.get(tabId))
+    guardedSignal.throwIfAborted()
+    const result = await operation(guardedSignal)
+    if (!closesTab) requireTabDomainAccess(policy, await chrome.tabs.get(tabId))
+    guardedSignal.throwIfAborted()
+    return result
+  } catch (error) {
+    controller.signal.throwIfAborted()
+    throw error
+  } finally {
+    chrome.webNavigation.onCommitted.removeListener(onCommitted)
+  }
+}
+
+async function getTabs(policy) {
   const tabs = await chrome.tabs.query({})
   return tabs
-    .filter(tab => Number.isInteger(tab.id))
+    .filter(tab => Number.isInteger(tab.id) && tabDomainAllows(policy, tab))
     .map(tab => ({
       tabId: tab.id,
       windowId: tab.windowId,
@@ -2590,7 +2664,7 @@ function httpUrl(value) {
   return url.href
 }
 
-function navigateTabAndWait(tabId, url, signal) {
+function navigateTabAndWait(tabId, url, signal, alreadyOpening = false) {
   signal?.throwIfAborted()
   return new Promise((resolve, reject) => {
     let sawLoading = false
@@ -2610,7 +2684,7 @@ function navigateTabAndWait(tabId, url, signal) {
     const onUpdated = (updatedTabId, changeInfo, tab) => {
       if (updatedTabId !== tabId) return
       if (changeInfo.status === 'loading') sawLoading = true
-      if (changeInfo.status === 'complete' && sawLoading) finish(undefined, tab)
+      if (changeInfo.status === 'complete' && (sawLoading || alreadyOpening)) finish(undefined, tab)
     }
     const onAbort = () => finish(signal.reason ?? new Error('Navigation cancelled'))
     const timer = setTimeout(() => finish(new Error('Navigation did not finish before timeout')), NAVIGATION_TIMEOUT_MS)
@@ -2620,15 +2694,16 @@ function navigateTabAndWait(tabId, url, signal) {
       onAbort()
       return
     }
-    chrome.tabs.update(tabId, { url }).then(tab => {
+    const navigation = alreadyOpening ? chrome.tabs.get(tabId) : chrome.tabs.update(tabId, { url })
+    navigation.then(tab => {
       // Same-URL updates and fast navigations may already be complete by the
       // time tabs.update resolves, before the loading/complete events are seen.
-      if (tab?.status === 'complete' && tab.url === url) finish(undefined, tab)
+      if (tab?.status === 'complete' && (alreadyOpening ? tab.url && !tab.pendingUrl : tab.url === url)) finish(undefined, tab)
     }, error => finish(error))
   })
 }
 
-function historyTabAndWait(tabId, action, signal) {
+function historyTabAndWait(tabId, action, signal, policy) {
   signal?.throwIfAborted()
   return chrome.tabs.get(tabId).then(before => new Promise((resolve, reject) => {
     let sawLoading = false
@@ -2669,8 +2744,12 @@ function historyTabAndWait(tabId, action, signal) {
       return
     }
     let operation
+    const guardedHistory = action !== 'reload' && policy.mode !== 'off'
     try {
-      operation = action === 'back' ? chrome.tabs.goBack(tabId)
+      if (guardedHistory) {
+        navigationMethod = 'cdp-history'
+        operation = navigateHistoryViaDebugger(tabId, action, policy, signal).then(() => { navigationObserved = true })
+      } else operation = action === 'back' ? chrome.tabs.goBack(tabId)
         : action === 'forward' ? chrome.tabs.goForward(tabId)
           : chrome.tabs.reload(tabId)
     } catch (error) {
@@ -2678,7 +2757,7 @@ function historyTabAndWait(tabId, action, signal) {
       return
     }
     Promise.resolve(operation).catch(async error => {
-      if (action === 'reload') throw error
+      if (action === 'reload' || guardedHistory) throw error
       try {
         const historyResult = await navigateHistoryViaDebugger(tabId, action)
         navigationObserved = true
@@ -2706,7 +2785,7 @@ function historyTabAndWait(tabId, action, signal) {
   }))
 }
 
-async function navigateHistoryViaDebugger(tabId, action) {
+async function navigateHistoryViaDebugger(tabId, action, policy = { mode: 'off' }, signal) {
   return withDebugger(tabId, async target => {
     await debuggerCommand(target, 'Page.enable').catch(() => {})
     const history = await debuggerCommand(target, 'Page.getNavigationHistory')
@@ -2718,6 +2797,8 @@ async function navigateHistoryViaDebugger(tabId, action) {
         ? 'No previous page exists in the tab navigation history'
         : 'No next page exists in the tab navigation history')
     }
+    requireDomainAccess(policy, entry.url)
+    signal?.throwIfAborted()
     await debuggerCommand(target, 'Page.navigateToHistoryEntry', { entryId: entry.id })
     return { targetUrl: entry.url, targetTitle: entry.title }
   })
@@ -2796,6 +2877,58 @@ async function runInFrame(tabId, frameId, func, args, world = 'ISOLATED') {
   const first = results[0]
   if (first === undefined) throw new Error('The frame returned no result')
   return first.result
+}
+
+function validateScrollParams({ selector, containerSelector, frameId, deltaX, deltaY }) {
+  const hasDeltas = deltaX !== undefined || deltaY !== undefined
+  if ((selector !== undefined) === hasDeltas) throw new Error('Provide a selector or one or both scroll deltas')
+  if (containerSelector !== undefined && !hasDeltas) throw new Error('containerSelector requires scroll deltas')
+  if (selector !== undefined) requireCssSelector(selector)
+  if (containerSelector !== undefined) requireCssSelector(containerSelector, 'The scroll container CSS selector')
+  if (frameId !== undefined) requireFrameId(frameId)
+  if ([deltaX, deltaY].some(value => value !== undefined && (!Number.isFinite(value) || Math.abs(value) > 10_000))) {
+    throw new Error('Scroll deltas must be between -10000 and 10000')
+  }
+}
+
+/** Runs inside the selected frame, so geometry and scroll offsets are frame-local. */
+function scrollFramePayload(selector, containerSelector, deltaX, deltaY) {
+  const query = selector ?? containerSelector
+  let target
+  if (query !== null) {
+    let matches
+    try {
+      matches = document.querySelectorAll(query)
+    } catch {
+      return { error: 'The CSS selector is invalid' }
+    }
+    if (matches.length !== 1) return { error: 'The scroll selector must match exactly one element in the selected frame' }
+    target = matches[0]
+  }
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+  if (selector !== null) {
+    target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+    const rect = target.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0
+      || rect.left >= viewportWidth || rect.top >= viewportHeight) {
+      return { error: 'The selected element could not be brought into the frame viewport' }
+    }
+    return {
+      scrolled: true, selector, viewportWidth, viewportHeight,
+      x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
+    }
+  }
+  const scroller = target ?? window
+  const beforeX = target?.scrollLeft ?? window.scrollX
+  const beforeY = target?.scrollTop ?? window.scrollY
+  scroller.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' })
+  const x = target?.scrollLeft ?? window.scrollX
+  const y = target?.scrollTop ?? window.scrollY
+  return {
+    scrolled: true, moved: x !== beforeX || y !== beforeY, x, y,
+    ...(containerSelector === null ? { width: viewportWidth, height: viewportHeight } : { containerSelector }),
+  }
 }
 
 /** Sample an element or manage its change history in Chrome's isolated world. */
@@ -3006,7 +3139,7 @@ function updatePoi(draft, action, text, area) {
   })
 }
 
-async function readPois(params) {
+async function readPois(params, policy) {
   const offset = params.offset ?? 0
   const limit = params.limit ?? 10
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
@@ -3016,7 +3149,7 @@ async function readPois(params) {
   let tabId
   let all
   if (scope === 'all') {
-    all = collectPois(await readPoiStore())
+    all = collectPois(await readPoiStore()).filter(point => domainFilterAllows(policy, point.pageUrl))
   } else {
     tabId = requireTabId(params.tabId)
     const tab = await chrome.tabs.get(tabId)
@@ -3703,7 +3836,7 @@ async function readNoteStore() {
   return isRecord(stored) ? stored : {}
 }
 
-async function readElementNotes(params) {
+async function readElementNotes(params, policy) {
   const offset = params.offset ?? 0
   const limit = params.limit ?? 10
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
@@ -3713,7 +3846,7 @@ async function readElementNotes(params) {
   let tabId
   let all
   if (scope === 'all') {
-    all = collectElementNotes(await readNoteStore())
+    all = collectElementNotes(await readNoteStore()).filter(note => domainFilterAllows(policy, note.pageUrl))
   } else {
     tabId = requireTabId(params.tabId)
     const tab = await chrome.tabs.get(tabId)

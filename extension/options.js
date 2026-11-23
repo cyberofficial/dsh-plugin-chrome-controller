@@ -1,4 +1,4 @@
-import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, normalizeDshOrigin, parseDomainFilterEntries } from './origin.js'
 
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
@@ -30,37 +30,46 @@ const DEFAULTS = {
 
 const GROUPS = [
   {
-    title: 'Typing',
+    title: 'Keystroke timing',
+    description: 'The delay before the next key and the time that key stays pressed are separate settings.',
     fields: [
-      ['baseFlightDelayMs', 'Base delay between keys', 'Base flight delay. Other timing variations adjust this value.', 0, 1000, 10, 'ms'],
-      ['flightJitterMinFactor', 'Flight variation minimum', 'Lowest random multiplier applied to the base key delay.', 0.1, 2, 0.05, 'x'],
-      ['flightJitterMaxFactor', 'Flight variation maximum', 'Highest random multiplier applied to the base key delay.', 0.1, 3, 0.05, 'x'],
-      ['keyHoldMinMs', 'Key hold minimum', 'Minimum time a supported key stays down.', 0, 500, 10, 'ms'],
-      ['keyHoldVariationMs', 'Additional key hold variation', 'Random amount added to the minimum key hold time.', 0, 500, 10, 'ms'],
-      ['thinkingPauseChancePercent', 'Long pause chance', 'Chance per character of a longer pause.', 0, 25, 1, '%'],
-      ['thinkingPauseMinMs', 'Long pause minimum', 'Shortest optional long pause.', 100, 5000, 50, 'ms'],
-      ['thinkingPauseMaxMs', 'Long pause maximum', 'Longest optional long pause.', 100, 5000, 50, 'ms'],
-      ['spacePauseMinFactor', 'Word and punctuation pause minimum', 'Minimum multiplier after spaces or punctuation.', 1, 8, 0.1, 'x'],
-      ['spacePauseMaxFactor', 'Word and punctuation pause maximum', 'Maximum multiplier after spaces or punctuation.', 1, 10, 0.1, 'x'],
-      ['commonBigramFactor', 'Common letter pair multiplier', 'Multiplier for common English letter pairs. Lower values shorten those pauses.', 0.1, 2, 0.05, 'x'],
-      ['repeatedKeyFactor', 'Repeated key multiplier', 'Multiplier when the same character repeats.', 1, 4, 0.05, 'x'],
+      ['baseFlightDelayMs', 'Base delay before each key', 'Starting delay before pressing a key. A higher value slows typing.', 0, 1000, 10, 'ms'],
+      ['flightJitterMinFactor', 'Delay multiplier minimum', 'Lower bound for the random multiplier. A value of 0.5 allows half the base delay.', 0.1, 2, 0.05, 'x'],
+      ['flightJitterMaxFactor', 'Delay multiplier maximum', 'Upper bound for the random multiplier. Set both bounds to 1 for a fixed base delay.', 0.1, 3, 0.05, 'x'],
+      ['keyHoldMinMs', 'Key hold minimum', 'Shortest time a supported key stays pressed.', 0, 500, 10, 'ms'],
+      ['keyHoldVariationMs', 'Extra key hold time', 'Up to this much time is randomly added to the minimum. Set to 0 for a fixed hold.', 0, 500, 10, 'ms'],
+      ['commonBigramFactor', 'Common letter pairs', 'Scales the delay for supported pairs such as th or he. Values below 1 shorten it.', 0.1, 2, 0.05, 'x'],
+      ['repeatedKeyFactor', 'Repeated characters', 'Scales the delay before the same character is typed again. Values above 1 lengthen it.', 1, 4, 0.05, 'x'],
     ],
   },
   {
-    title: 'Cursor animation',
+    title: 'Typing pauses',
+    description: 'Adjust pauses at spaces and punctuation, and occasional longer pauses during typing.',
     fields: [
-      ['cursorSpeedPxPerMs', 'Cursor speed', 'Pixels per millisecond used to estimate animation duration.', 0.1, 5, 0.1, 'px/ms'],
-      ['cursorMinDurationMs', 'Minimum cursor animation', 'Shortest cursor animation.', 50, 2000, 10, 'ms'],
-      ['cursorMaxDurationMs', 'Maximum cursor animation', 'Longest cursor animation.', 50, 5000, 10, 'ms'],
-      ['cursorArcRatio', 'Cursor arc size', 'How far the cursor path curves relative to travel distance.', 0, 0.6, 0.01, 'ratio'],
-      ['cursorMaxArcPx', 'Cursor arc cap', 'Maximum sideways curve of the cursor path.', 0, 500, 10, 'px'],
-      ['dragDurationMs', 'Default drag duration', 'Duration used by drag actions unless a tool call overrides it.', 100, 2000, 25, 'ms'],
+      ['spacePauseMinFactor', 'Space and punctuation minimum', 'Smallest multiplier before spaces or common punctuation. A value of 1 adds no extra delay.', 1, 8, 0.1, 'x'],
+      ['spacePauseMaxFactor', 'Space and punctuation maximum', 'Largest multiplier before spaces or common punctuation.', 1, 10, 0.1, 'x'],
+      ['thinkingPauseChancePercent', 'Long pause chance', 'Chance that a long pause replaces the usual delay for each character. Set to 0 to turn it off.', 0, 25, 1, '%'],
+      ['thinkingPauseMinMs', 'Long pause minimum', 'Shortest delay when a long pause is selected.', 100, 5000, 50, 'ms'],
+      ['thinkingPauseMaxMs', 'Long pause maximum', 'Longest delay when a long pause is selected.', 100, 5000, 50, 'ms'],
     ],
   },
   {
-    title: 'Sequence pacing',
+    title: 'Cursor movement',
+    description: 'These values set how the on-page cursor travels between positions.',
     fields: [
-      ['sequenceDelayMs', 'Delay between sequence actions', 'Pause between actions in dsh_browser_sequence unless the call overrides it.', 0, 1000, 10, 'ms'],
+      ['cursorSpeedPxPerMs', 'Cursor speed', 'Higher values shorten cursor travel time, within the duration limits below.', 0.1, 5, 0.1, 'px/ms'],
+      ['cursorMinDurationMs', 'Minimum travel time', 'Keeps short cursor moves from finishing faster than this time.', 50, 2000, 10, 'ms'],
+      ['cursorMaxDurationMs', 'Maximum travel time', 'Caps the time the cursor takes to travel across the page.', 50, 5000, 10, 'ms'],
+      ['cursorArcRatio', 'Path curve', 'Scales the path bend with the travel distance. Set to 0 for a straight path.', 0, 0.6, 0.01, 'ratio'],
+      ['cursorMaxArcPx', 'Maximum path bend', 'Limits the sideways bend on long moves.', 0, 500, 10, 'px'],
+    ],
+  },
+  {
+    title: 'Drag and sequence timing',
+    description: 'These defaults apply when an individual action or sequence supplies no timing override.',
+    fields: [
+      ['dragDurationMs', 'Default drag duration', 'Time spent moving between the start and end of a drag.', 100, 2000, 25, 'ms'],
+      ['sequenceDelayMs', 'Delay between sequence steps', 'Pause between actions in a browser sequence. Set to 0 for no added pause.', 0, 1000, 10, 'ms'],
     ],
   },
 ]
@@ -72,6 +81,10 @@ const pairingCodeInput = document.querySelector('#dsh-pairing-code')
 const pairingPageNode = document.querySelector('#pairing-page-url')
 const autoConnectInput = document.querySelector('#dsh-autoconnect')
 const connectionStatusNode = document.querySelector('#connection-status')
+const domainFilterForm = document.querySelector('#domain-filter-form')
+const domainFilterMode = document.querySelector('#domain-filter-mode')
+const domainFilterEntries = document.querySelector('#domain-filter-entries')
+const domainFilterStatus = document.querySelector('#domain-filter-status')
 const clipboardForm = document.querySelector('#clipboard-form')
 const clipboardAcknowledgeInput = document.querySelector('#clipboard-acknowledge')
 const clipboardEnabledInput = document.querySelector('#clipboard-enabled')
@@ -81,6 +94,48 @@ const statusNode = document.querySelector('#status')
 const resetButton = document.querySelector('#reset')
 const inputs = new Map()
 let savedPairingCode = ''
+
+const tabs = [...document.querySelectorAll('.settings-tabs [role="tab"]')]
+const panels = tabs.map(tab => document.getElementById(tab.getAttribute('aria-controls')))
+
+function selectTab(index) {
+  tabs.forEach((tab, tabIndex) => {
+    const selected = tabIndex === index
+    tab.setAttribute('aria-selected', String(selected))
+    tab.tabIndex = selected ? 0 : -1
+    panels[tabIndex].hidden = !selected
+  })
+}
+
+function selectTabFromHash() {
+  const index = panels.findIndex(panel => '#' + panel.id === location.hash)
+  selectTab(index < 0 ? 0 : index)
+}
+
+function openTab(index) {
+  selectTab(index)
+  history.replaceState(null, '', '#' + panels[index].id)
+  tabs[index].focus({ preventScroll: true })
+  window.scrollTo(0, 0)
+}
+
+tabs.forEach((tab, index) => {
+  tab.addEventListener('click', () => openTab(index))
+  tab.addEventListener('keydown', event => {
+    let next
+    switch (event.key) {
+      case 'ArrowLeft': next = (index + tabs.length - 1) % tabs.length; break
+      case 'ArrowRight': next = (index + 1) % tabs.length; break
+      case 'Home': next = 0; break
+      case 'End': next = tabs.length - 1; break
+      default: return
+    }
+    event.preventDefault()
+    openTab(next)
+  })
+})
+window.addEventListener('hashchange', selectTabFromHash)
+selectTabFromHash()
 
 function makeField([key, title, description, min, max, step, unit]) {
   const wrapper = document.createElement('div')
@@ -99,7 +154,7 @@ function makeField([key, title, description, min, max, step, unit]) {
   input.required = true
   const help = document.createElement('p')
   help.id = inputId + '-help'
-  help.textContent = description + ' Range: ' + String(min) + ' to ' + String(max) + '.'
+  help.textContent = description + ' Default ' + DEFAULTS[key] + '. Range ' + min + ' to ' + max + '.'
   input.setAttribute('aria-describedby', help.id)
   wrapper.append(label, input, help)
   inputs.set(key, input)
@@ -109,12 +164,15 @@ function makeField([key, title, description, min, max, step, unit]) {
 for (const group of GROUPS) {
   const section = document.createElement('section')
   section.className = 'settings-group'
-  const heading = document.createElement('h2')
+  const heading = document.createElement('h3')
   heading.textContent = group.title
+  const description = document.createElement('p')
+  description.className = 'group-intro'
+  description.textContent = group.description
   const grid = document.createElement('div')
   grid.className = 'settings-grid'
   for (const field of group.fields) grid.append(makeField(field))
-  section.append(heading, grid)
+  section.append(heading, description, grid)
   groupsNode.append(section)
 }
 
@@ -186,6 +244,14 @@ async function initialize() {
     autoConnectInput.checked = true
   }
   try {
+    const stored = (await chrome.storage.local.get(DOMAIN_FILTER_KEY))[DOMAIN_FILTER_KEY]
+    domainFilterMode.value = ['whitelist', 'blacklist'].includes(stored?.mode) ? stored.mode : 'off'
+    domainFilterEntries.value = Array.isArray(stored?.domains) ? stored.domains.join('\n') : ''
+  } catch (error) {
+    domainFilterStatus.textContent = 'Could not load the domain filter: ' + error.message
+    domainFilterStatus.dataset.error = 'true'
+  }
+  try {
     const clipboard = await chrome.storage.local.get(CLIPBOARD_SETTINGS_KEY)
     const saved = clipboard?.[CLIPBOARD_SETTINGS_KEY]
     clipboardAcknowledgeInput.checked = saved?.acknowledged === true
@@ -198,6 +264,23 @@ async function initialize() {
   }
   updatePairingPage()
 }
+
+domainFilterForm.addEventListener('submit', async event => {
+  event.preventDefault()
+  try {
+    const mode = domainFilterMode.value
+    const domains = parseDomainFilterEntries(domainFilterEntries.value)
+    await chrome.storage.local.set({ [DOMAIN_FILTER_KEY]: { mode, domains } })
+    domainFilterEntries.value = domains.join('\n')
+    domainFilterStatus.textContent = mode === 'off' ? 'Domain filter is off.'
+      : mode === 'whitelist' && domains.length === 0 ? 'Whitelist saved. DSH cannot access any tabs until you add a domain.'
+        : 'Domain filter saved.'
+    domainFilterStatus.dataset.error = 'false'
+  } catch (error) {
+    domainFilterStatus.textContent = error instanceof Error ? error.message : String(error)
+    domainFilterStatus.dataset.error = 'true'
+  }
+})
 
 /** The enable toggle stays disabled until the risk acknowledgement is checked. */
 function updateClipboardGate() {

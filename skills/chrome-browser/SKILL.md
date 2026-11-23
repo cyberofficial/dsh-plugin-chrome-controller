@@ -12,6 +12,8 @@ The DSH browser tools operate the user's current Chrome tabs through the paired 
 
 Call `dsh_browser_tabs` with `action: "list"`. Choose the tab that matches the user's task and keep its `tabId` for later calls. Call `dsh_browser_snapshot` to read its title, URL, visible text, and links. Use `dsh_browser_screenshot` when layout or visual state matters.
 
+The extension's **Browser domain filter** is off by default. If the user enables it, **Whitelist** permits only listed web domains and **Blacklist** denies the listed web domains. A saved entry includes its subdomains at any port or path. Tab listings hide denied tabs, and opening, navigating, or operating on a denied tab returns a domain filter error. History navigation checks the destination too. A link or redirect can load in Chrome, but if it lands on a denied main tab address, stop work on that tab. If the task requires it, ask the user to review the domain filter in extension Settings. Continue using frame-aware tools on an allowed tab without checking its iframe domains separately.
+
 **Before any other action on that tab, read the user's saved element notes with `dsh_browser_element_notes`** (see "Read the user's element notes" below) and saved points with `dsh_browser_pois`. Notes may flag elements to target, verify, or avoid.
 
 If a DSH Web tab is open, preserve it. Identify it from its local URL and do not navigate, close, or repurpose it unless the user explicitly asks. For web research or testing, open separate tabs with `dsh_browser_tabs` and `action: "open"`, and track the new tab IDs. Before reporting, list tabs again and accurately state which tabs changed.
@@ -53,7 +55,7 @@ The extension connects to the DSH Web origin configured in its Settings (default
 - Before `dsh_browser_drag`, activate the target tab with `dsh_browser_tabs` action `activate`. Background-tab mouse movement can stall in Chrome's debugger. Then drag between two CSS-selected elements or viewport coordinates. Both endpoints must be visible together. For spreadsheet ranges or fill handles, use a recent screenshot to choose coordinates, or inspect both elements and confirm the returned locations are in view. Inspect the sheet after the drag to verify the selection or fill result.
 - After a link click, inspect the current tab and list tabs to see whether navigation happened in place or opened a new tab. A `clicked: true` result confirms the pointer action was dispatched, not that navigation succeeded. If a click selector is ambiguous, use `dsh_browser_find` and choose a visible, unobscured candidate. If no click option works, use the inspected `href` with `dsh_browser_navigate` as the final fallback. Avoid repeating a click until checking for an existing navigation or new tab.
 - Use `dsh_browser_mouse_move` with a unique CSS `selector` to hover an element at its current position, or use `x`/`y` from a recent screenshot. Selector targeting is more reliable when the page layout may have changed. If a coordinate action reports that Chrome changed the viewport, take a fresh screenshot or use a selector before retrying.
-- Use `dsh_browser_scroll` with a `selector` to center an element in the viewport, or with `deltaX` and/or `deltaY` to scroll the page. A selector scroll returns the target's current viewport center.
+- Use `dsh_browser_scroll` with `selector` to bring an element into view, or with `deltaX` and/or `deltaY` to scroll by CSS pixels. Add `frameId` from `dsh_browser_frames` to target an iframe, including a nested or cross-origin frame. Add `containerSelector` with deltas to scroll a specific open menu, list, or panel. These fields also work in a sequence `scroll` step.
 - Use `dsh_browser_sequence` when the next actions are already known and can run in order without model decisions between them. It supports click, drag, back, forward, reload, wait, wait_for_element, type_human, fill, paste, keypress, mouse_move, scroll, navigate, evaluate, snapshot, get_html, get_source, extract, focus, blur, and select steps on one tab. The `type` action is not supported. It uses the configured pause between steps (120 ms by default), returns each step result, and stops on the first failed step. Check `ok` and `completedSteps` before retrying a partial sequence.
 - Do not batch actions past a step that could reveal a CAPTCHA, spam check, anti-bot challenge, or other human verification. If a check is running automatically, wait and inspect the page. Continue only after it disappears and the normal page is ready. If it asks for human interaction, stop all browser actions on that page, tell the user they must solve it, and wait for their explicit confirmation before continuing. Never solve, bypass, hide, or automate a challenge. If unsure whether it needs human interaction, stop and ask the user.
 - Enter text only with `dsh_browser_type_human` (per-keystroke key events) or `dsh_browser_fill` to replace a CSS-selected field's text. Bulk insertion (`dsh_browser_type` / `page.type`) is removed and refuses to run; never emulate it with `Input.insertText`, an evaluate-based value set, or clipboard tricks for user-visible text entry — instant paste-like insertion is a banned action.
@@ -138,6 +140,14 @@ Save a file into the session workspace with `dsh_browser_save_file`, using the s
 ```json
 {"tabId":123,"url":"https://example.com/invoices/42.pdf"}
 ```
+
+Scroll an open menu inside a frame by 400 CSS pixels:
+
+```json
+{"tabId":123,"frameId":7,"containerSelector":"#results-menu","deltaY":400}
+```
+
+To bring a specific menu item into view, pass its CSS `selector` and omit the deltas and `containerSelector`. The returned `x` and `y` are the element's center in the selected frame's viewport. With deltas, `x` and `y` are scroll offsets and `moved: false` means the frame or container stayed at the same position. If an ancestor iframe is offscreen, bring it into view separately. Use a fresh screenshot before a main-viewport coordinate click inside a frame.
 
 Click a button by CSS selector whenever possible — target actual elements, not screen coordinates. Only use X,Y coordinates from a recent screenshot as a last resort when the element cannot be targeted by selector (e.g. canvas-based controls or elements with no stable selector):
 
@@ -416,7 +426,7 @@ Use the log to find candidate labels and values, but do not assume the last entr
 
 ### Off-screen data: scroll it into view, or ask the user where it is
 
-- Canvas grids (Excel Online, Google Sheets) only render cells currently in the viewport. Bring the target region into view using the name box or PageUp/PageDown with the correct grid focused, then inspect the current screenshot and selection. `dsh_browser_scroll` targets the main page and may not scroll an embedded grid. Recalculate visible cell positions after scrolling. DOM grids (freesheet.app) can expose off-screen rows in a snapshot.
+- Canvas grids (Excel Online, Google Sheets) only render cells currently in the viewport. Bring the target region into view using the name box or PageUp/PageDown with the correct grid focused, then inspect the current screenshot and selection. If the grid exposes a scrollable DOM container, pass its `containerSelector` and any `frameId` to `dsh_browser_scroll`. Recalculate visible cell positions after scrolling. DOM grids (freesheet.app) can expose off-screen rows in a snapshot.
 - If the user says "the data is somewhere in the sheet" without a location, do not blind-scan the whole grid. Ask the user where the data is (which sheet/cells/rows, or a header text to search for), and only scan that region. If they give a range, scan exactly that range.
 
 ### Entering data in Excel Online cells (commit/cancel buttons)
