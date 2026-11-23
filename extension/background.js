@@ -284,6 +284,21 @@ function flightDelayMs(char, prevChar, baseDelayMs, settings) {
   return Math.round(delay)
 }
 
+function keyHoldMs(settings) {
+  return Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs))
+}
+
+function typingPreviewSteps(values) {
+  const settings = normalizeBehaviorSettings(values)
+  const sentence = 'The quick brown fox jumps over the lazy dog.'
+  const sample = [sentence, sentence, sentence].join('\n')
+  return Array.from(sample, (character, index) => ({
+    character,
+    waitMs: flightDelayMs(character, sample[index - 1] ?? '', settings.baseFlightDelayMs, settings),
+    holdMs: CHAR_KEYS[character] === undefined ? 0 : keyHoldMs(settings),
+  }))
+}
+
 const KEY_MODIFIER_BITS = { alt: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, super: 4, shift: 8 }
 
 /**
@@ -403,7 +418,7 @@ async function typeCharacter(target, char, prevChar, baseDelayMs, settings, sign
       windowsVirtualKeyCode: mapping.vk, nativeVirtualKeyCode: mapping.vk,
     })
     try {
-      await delay(Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs)), signal ?? new AbortController().signal)
+      await delay(keyHoldMs(settings), signal ?? new AbortController().signal)
       signal?.throwIfAborted()
       await debuggerCommand(target, 'Input.dispatchKeyEvent', {
         type: 'char', key: mapping.key, code: mapping.code, modifiers,
@@ -6675,6 +6690,12 @@ chrome.alarms.onAlarm.addListener(alarm => {
 })
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'DSH_TYPING_PREVIEW') {
+    const optionsUrl = chrome.runtime.getURL('options.html')
+    if (sender.id !== chrome.runtime.id || sender.url?.split(/[?#]/u, 1)[0] !== optionsUrl) return false
+    sendResponse({ steps: typingPreviewSteps(message.settings) })
+    return false
+  }
   if (['DSH_POI_MODE', 'DSH_POI_LIST', 'DSH_POI_ALL', 'DSH_POI_SELECTED',
     'DSH_POI_OPEN_SAVED', 'DSH_POI_DELETE_SAVED', 'DSH_POI_EDITOR',
     'DSH_POI_ENTER_FRAME', 'DSH_POI_LEAVE_FRAME'].includes(message?.type)) {

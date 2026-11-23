@@ -31,6 +31,7 @@ const DEFAULTS = {
 const GROUPS = [
   {
     title: 'Keystroke timing',
+    typing: true,
     description: 'The delay before the next key and the time that key stays pressed are separate settings.',
     fields: [
       ['baseFlightDelayMs', 'Base delay before each key', 'Starting delay before pressing a key. A higher value slows typing.', 0, 1000, 10, 'ms'],
@@ -44,6 +45,7 @@ const GROUPS = [
   },
   {
     title: 'Typing pauses',
+    typing: true,
     description: 'Adjust pauses at spaces and punctuation, and occasional longer pauses during typing.',
     fields: [
       ['spacePauseMinFactor', 'Space and punctuation minimum', 'Smallest multiplier before spaces or common punctuation. A value of 1 adds no extra delay.', 1, 8, 0.1, 'x'],
@@ -92,13 +94,19 @@ const clipboardStatusNode = document.querySelector('#clipboard-status')
 const groupsNode = document.querySelector('#settings-groups')
 const statusNode = document.querySelector('#status')
 const resetButton = document.querySelector('#reset')
+const previewButton = document.querySelector('#typing-preview-play')
+const previewOutput = document.querySelector('#typing-preview-output')
+const previewStatus = document.querySelector('#typing-preview-status')
+const previewKey = document.querySelector('#typing-preview-key')
 const inputs = new Map()
 let savedPairingCode = ''
+let previewRun
 
 const tabs = [...document.querySelectorAll('.settings-tabs [role="tab"]')]
 const panels = tabs.map(tab => document.getElementById(tab.getAttribute('aria-controls')))
 
 function selectTab(index) {
+  if (panels[index].id !== 'interaction') previewRun?.abort()
   tabs.forEach((tab, tabIndex) => {
     const selected = tabIndex === index
     tab.setAttribute('aria-selected', String(selected))
@@ -188,10 +196,11 @@ function populate(settings) {
   }
 }
 
-function readInputs() {
+function readInputs(groups = GROUPS) {
   const settings = {}
   let valid = true
-  for (const [key, input] of inputs) {
+  for (const [key] of groups.flatMap(group => group.fields)) {
+    const input = inputs.get(key)
     input.setCustomValidity('')
     const value = input.valueAsNumber
     if (!Number.isFinite(value) || !input.checkValidity()) {
@@ -216,6 +225,65 @@ function readInputs() {
   }
   return valid ? settings : undefined
 }
+
+function waitForPreview(ms, signal) {
+  signal.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    function abort() {
+      clearTimeout(timer)
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
+
+previewButton.addEventListener('click', async () => {
+  if (previewRun !== undefined) {
+    previewRun.abort()
+    return
+  }
+  const settings = readInputs(GROUPS.filter(group => group.typing))
+  previewStatus.dataset.error = String(settings === undefined)
+  if (settings === undefined) {
+    previewStatus.textContent = 'Check the typing settings and try again.'
+    return
+  }
+  previewRun = new AbortController()
+  const { signal } = previewRun
+  previewButton.textContent = 'Stop preview'
+  previewOutput.textContent = ''
+  previewStatus.textContent = 'Preparing preview...'
+  try {
+    const result = await chrome.runtime.sendMessage({ type: 'DSH_TYPING_PREVIEW', settings })
+    signal.throwIfAborted()
+    if (!Array.isArray(result?.steps)) throw new Error('Could not start the typing preview.')
+    const plannedMs = result.steps.reduce((total, step) => total + step.waitMs + step.holdMs, 0)
+    previewStatus.textContent = 'Estimated total ' + (plannedMs / 1000).toFixed(1) + ' s'
+    const startedAt = performance.now()
+    for (const { character, waitMs, holdMs } of result.steps) {
+      await waitForPreview(waitMs, signal)
+      if (holdMs > 0) {
+        previewKey.textContent = 'Key held: ' + (character === ' ' ? 'Space' : character)
+        previewKey.hidden = false
+        await waitForPreview(holdMs, signal)
+        previewKey.hidden = true
+      }
+      previewOutput.textContent += character
+    }
+    previewStatus.textContent = 'Three sentences in ' + ((performance.now() - startedAt) / 1000).toFixed(1) + ' s.'
+  } catch (error) {
+    previewStatus.dataset.error = String(!signal.aborted)
+    previewStatus.textContent = signal.aborted ? 'Preview stopped.' : error.message
+  } finally {
+    previewRun = undefined
+    previewButton.textContent = 'Play preview'
+    previewKey.hidden = true
+  }
+})
 
 async function initialize() {
   try {
@@ -371,6 +439,7 @@ form.addEventListener('submit', async event => {
 resetButton.addEventListener('click', async () => {
   try {
     await chrome.storage.local.set({ [SETTINGS_KEY]: { ...DEFAULTS } })
+    previewRun?.abort()
     populate(DEFAULTS)
     showStatus('Restored the tested default settings.')
   } catch (error) {

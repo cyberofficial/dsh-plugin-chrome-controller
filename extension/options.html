@@ -98,6 +98,16 @@
             <h2>Interaction timing</h2>
             <p class="panel-intro">Adjust how the extension types, moves the cursor, and spaces out actions. The defaults are the tested baseline.</p>
             <form id="settings-form" novalidate>
+              <section class="typing-preview" aria-labelledby="typing-preview-title">
+                <h3 id="typing-preview-title">Typing preview</h3>
+                <p>Watch the same sentence typed three times using your current typing settings, including unsaved changes.</p>
+                <pre id="typing-preview-output" aria-label="Typed sample"></pre>
+                <div class="preview-actions">
+                  <button type="button" id="typing-preview-play">Play preview</button>
+                  <p id="typing-preview-status" class="status" role="status"></p>
+                  <span id="typing-preview-key" class="preview-key" aria-hidden="true" hidden></span>
+                </div>
+              </section>
               <div id="settings-groups"></div>
               <p class="notice timing-notice">Timing changes do not guarantee site acceptance. If a site asks for human verification, complete it yourself.</p>
               <div class="actions">
