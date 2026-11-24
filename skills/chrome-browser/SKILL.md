@@ -334,6 +334,8 @@ Example short row entry. Start each later row by changing `A2` to its actual sta
 {"tabId":123,"interActionDelayMs":120,"steps":[{"action":"fill","selector":"#t-name-box","text":"A2"},{"action":"keypress","key":"Enter"},{"action":"type_human","text":"2"},{"action":"keypress","key":"Tab"},{"action":"type_human","text":"Zootopia 2"},{"action":"keypress","key":"Tab"},{"action":"type_human","text":"1870309291"},{"action":"keypress","key":"Enter"}]}
 ```
 
+For Google Sheets, call `dsh_browser_workbook_status` on the open Sheets tab. It reports `provider: "google-sheets"` and `frameId: 0`. Use `dsh_browser_workbook_navigate` with the expected active sheet and an A1 address, then check `confirmed` and the returned sheet and address. If the edit guard blocks navigation, ask the user to finish or cancel the edit. Workbook values, file, and probe tools are Excel Online only.
+
 For Excel for the web, begin with `dsh_browser_workbook_status` for the target tab. Use `dsh_browser_workbook_navigate` to enter and submit a cell address in the name box. Before reading or editing the target, check that the tool confirmed the selection. For a known range, prefer `dsh_browser_workbook_values` with an explicit bounded address and the workbook frame ID.
 
 Submit a form with its named submit button:

@@ -1751,6 +1751,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       return {
         tabId,
         frameId: workbook.frameId,
+        provider: state.provider,
         capabilities: {
           canReadStatus: state.recognized === true,
           canNavigate: state.nameBoxReady === true && typeof state.activeSheetName === 'string' && state.editing !== true,
@@ -1777,14 +1778,14 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       }
       const requestedSheetName = params.sheetName
       const tab = await chrome.tabs.get(tabId)
-      if (tab.active !== true) throw new Error('Activate the target Excel tab before navigating')
+      if (tab.active !== true) throw new Error('Activate the target workbook tab before navigating')
       return withDebugger(tabId, async target => {
         signal?.throwIfAborted()
         const workbook = await resolveWorkbookFrame(tabId, requestedFrameId)
         const frameId = workbook.frameId
         let expectedSheetName = workbook.state.activeSheetName
         if (typeof expectedSheetName !== 'string' || expectedSheetName === '') {
-          throw new Error('The active Excel sheet name is unavailable')
+          throw new Error('The active sheet name is unavailable')
         }
         if (requestedSheetName !== undefined) {
           if (requestedSheetName.toLowerCase() !== expectedSheetName.toLowerCase()) {
@@ -1796,21 +1797,34 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
         let state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
         requireWorkbookNavigationReady(state)
         if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
-          throw new Error('The active Excel sheet changed before navigation could start')
+          throw new Error('The active sheet changed before navigation could start')
         }
         if (state.editing === true) {
           throw workbookNavigationEditError(state)
         }
         const initialAddress = state.address
         if (typeof initialAddress !== 'string' || initialAddress === '') {
-          throw new Error('The current Excel selection is unavailable in the name box')
+          throw new Error('The current workbook selection is unavailable in the name box')
         }
 
-        state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload,
-          ['focus', expectedSheetName, initialAddress], 'MAIN')
+        if (workbook.state.provider === 'google-sheets') {
+          const preflight = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload,
+            ['locate', expectedSheetName, initialAddress], 'MAIN')
+          requireWorkbookNavigationReady(preflight)
+          const point = preflight.nameBoxPoint
+          if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
+            throw new Error('The Google Sheets name box has no clickable point')
+          }
+          signal?.throwIfAborted()
+          await dispatchClickAt(target, tabId, point.x, point.y)
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        } else {
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload,
+            ['focus', expectedSheetName, initialAddress], 'MAIN')
+        }
         requireWorkbookNavigationFocused(state, expectedSheetName)
         if (state.address !== initialAddress) {
-          throw new Error('The Excel selection changed before the name box was focused')
+          throw new Error('The workbook selection changed before the name box was focused')
         }
 
         signal?.throwIfAborted()
@@ -1818,11 +1832,11 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
         state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
         requireWorkbookNavigationFocused(state, expectedSheetName)
         if (state.address !== initialAddress) {
-          throw new Error('The Excel name box changed before address entry; Enter was not pressed')
+          throw new Error('The workbook name box changed before address entry; Enter was not pressed')
         }
         if (state.selectionRangeAvailable === true
           && (state.selectionStart !== 0 || state.selectionEnd !== initialAddress.length)) {
-          throw new Error('Ctrl+A did not select the complete Excel name-box value; Enter was not pressed')
+          throw new Error('Ctrl+A did not select the complete workbook name-box value; Enter was not pressed')
         }
         let typedPrefix = ''
         let previousCharacter = ''
@@ -1831,7 +1845,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
           state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
           requireWorkbookNavigationFocused(state, expectedSheetName)
           if (state.address !== (typedPrefix === '' ? initialAddress : typedPrefix)) {
-            throw new Error('The Excel name box changed during navigation; Enter was not pressed')
+            throw new Error('The workbook name box changed during navigation; Enter was not pressed')
           }
           await typeCharacter(target, character, previousCharacter, 0, FAST_TYPE_SETTINGS, signal)
           typedPrefix += character
@@ -1839,7 +1853,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
           state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
           requireWorkbookNavigationFocused(state, expectedSheetName)
           if (state.address !== typedPrefix) {
-            throw new Error('The Excel name box lost the requested address during entry; Enter was not pressed')
+            throw new Error('The workbook name box lost the requested address during entry; Enter was not pressed')
           }
         }
 
@@ -1847,7 +1861,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
         state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
         requireWorkbookNavigationFocused(state, expectedSheetName)
         if (state.address !== parsedAddress.address) {
-          throw new Error('The Excel name box does not contain the requested address; Enter was not pressed')
+          throw new Error('The workbook name box does not contain the requested address; Enter was not pressed')
         }
         await pressKey(target, KEYS.Enter)
         return settleWorkbookNavigation(tabId, frameId, expectedSheetName, parsedAddress, signal)
@@ -1863,6 +1877,9 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
         throw new Error('sheetName must be a string')
       }
       const frame = await chrome.webNavigation.getFrame({ tabId, frameId })
+      if (frameId === 0 && isGoogleSheetsUrl(frame?.url)) {
+        throw new Error('Google Sheets supports workbook status and navigation. Workbook range reads are currently available only for Excel Online.')
+      }
       if (!isExcelAppFrameUrl(frame?.url)) throw new Error('The requested frame is not an Excel Online workbook frame')
       signal?.throwIfAborted()
       const payload = await runInFrame(tabId, frameId, frameWorkbookValuesPayload,
@@ -3100,10 +3117,21 @@ function sameExcelSheetName(left, right) {
 async function resolveWorkbookFrame(tabId, requestedFrameId) {
   const inspect = async frameId => {
     const state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
-    if (!isRecord(state)) throw new Error('The frame returned no Excel workbook status')
+    if (!isRecord(state)) throw new Error('The frame returned no workbook status')
     return state
   }
   const frameList = await listFrames(tabId)
+  const mainFrame = frameList.frames.find(frame => frame.frameId === 0)
+  if (isGoogleSheetsUrl(mainFrame?.url)) {
+    if (requestedFrameId !== undefined && requestedFrameId !== 0) {
+      throw new Error('Google Sheets workbook tools use the top-level frame (frameId 0)')
+    }
+    const state = await inspect(0)
+    if (state.recognized !== true || state.provider !== 'google-sheets') {
+      throw new Error('The Google Sheets editor is unavailable in the top-level frame')
+    }
+    return { frameId: 0, state }
+  }
   if (requestedFrameId !== undefined) {
     const requestedFrame = frameList.frames.find(frame => frame.frameId === requestedFrameId)
     if (requestedFrame === undefined || !isExcelAppFrameUrl(requestedFrame.url)) {
@@ -3124,13 +3152,24 @@ async function resolveWorkbookFrame(tabId, requestedFrameId) {
       // Some cross-origin or transient frames cannot be probed at this moment.
     }
   }
-  if (matches.length === 0) throw new Error('No Excel Online workbook frame was found in the tab')
+  if (matches.length === 0) throw new Error('No Excel Online or Google Sheets workbook was found in the tab')
   const contextMatches = matches.filter(match => match.state.hasWorkbookContext === true)
   const candidates = contextMatches.length > 0 ? contextMatches : matches
   if (candidates.length !== 1) {
     throw new Error('More than one Excel workbook frame was found; provide frameId from page.frames')
   }
   return candidates[0]
+}
+
+function isGoogleSheetsUrl(value) {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.origin === 'https://docs.google.com'
+      && /^\/spreadsheets\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+\/edit\/?$/u.test(url.pathname)
+  } catch {
+    return false
+  }
 }
 
 function isExcelAppFrameUrl(value) {
@@ -3150,30 +3189,30 @@ function workbookNavigationEditError(state) {
     editGuard: state.editGuard ?? null,
     focusedControl: state.focusedControl ?? null,
   })
-  return new Error('Excel navigation stopped because focus is in an editable control. ' + details)
+  return new Error('Workbook navigation stopped because focus is in an editable control. ' + details)
 }
 
 function requireWorkbookNavigationReady(state) {
   if (!isRecord(state) || state.recognized !== true) {
-    throw new Error('The Excel workbook frame is no longer available')
+    throw new Error('The workbook frame is no longer available')
   }
   if (typeof state.error === 'string') {
     if (state.editing === true) throw workbookNavigationEditError(state)
     throw new Error(state.error)
   }
   if (state.nameBoxReady !== true) {
-    throw new Error('The Excel name box is unavailable, hidden, disabled, or read-only')
+    throw new Error('The workbook name box is unavailable, hidden, disabled, or read-only')
   }
 }
 
 function requireWorkbookNavigationFocused(state, expectedSheetName) {
   requireWorkbookNavigationReady(state)
   if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
-    throw new Error('The active Excel sheet changed during navigation; Enter was not pressed')
+    throw new Error('The active sheet changed during navigation; Enter was not pressed')
   }
   if (state.editing === true) throw workbookNavigationEditError(state)
   if (state.documentFocused !== true || state.focused !== true) {
-    throw new Error('The Excel name box lost focus during navigation; Enter was not pressed')
+    throw new Error('The workbook name box lost focus during navigation; Enter was not pressed')
   }
 }
 
@@ -3193,7 +3232,7 @@ async function settleWorkbookNavigation(tabId, frameId, expectedSheetName, parse
       }
       lastState = state
       if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
-        readError = 'The active Excel sheet changed before the selection could be confirmed'
+        readError = 'The active sheet changed before the selection could be confirmed'
         break
       }
       if (state.nameBoxReady === true && state.documentFocused === true && state.focused !== true
@@ -3216,7 +3255,7 @@ async function settleWorkbookNavigation(tabId, frameId, expectedSheetName, parse
         previousKey = undefined
       }
     } catch {
-      readError = 'The Excel selection could not be re-read after Enter'
+      readError = 'The workbook selection could not be re-read after Enter'
       break
     }
     await delay(EXCEL_NAVIGATION_POLL_MS, signal ?? new AbortController().signal)
@@ -5822,13 +5861,20 @@ const ELEMENT_WATCH_MAX_VALUE_CHARS = 500
 // NOTE: the frame-injected payload functions below must stay self-contained; they inline
 // the 5000/500 limits as literals because module constants are not serialized into the frame.
 
-/** Read Excel workbook identity and the name-box state, or focus that box after preflight. */
+/** Read workbook identity and the name-box state, or focus that box after preflight. */
 function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddress) {
+  const googleSheets = window === window.top && location.origin === 'https://docs.google.com'
+    && /^\/spreadsheets\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+\/edit\/?$/u.test(location.pathname)
+  const provider = googleSheets ? 'google-sheets' : 'excel-online'
+  const nameBoxSelector = googleSheets ? '#t-name-box' : '#FormulaBar-NameBox-input'
   const readState = () => {
-    const nameBox = document.querySelector('#FormulaBar-NameBox-input')
+    const nameBox = document.querySelector(nameBoxSelector)
     const context = document.querySelector('#m_excelWebRenderer_ewaCtl_m_workbookContextJson')
     let activeSheetName = null
-    if (context !== null) {
+    if (googleSheets) {
+      const activeTabs = document.querySelectorAll('.docs-sheet-active-tab .docs-sheet-tab-name')
+      if (activeTabs.length === 1) activeSheetName = activeTabs[0].textContent.trim() || null
+    } else if (context !== null) {
       try {
         const workbookContext = JSON.parse(context.value)
         if (typeof workbookContext?.ActiveSheetName === 'string' && workbookContext.ActiveSheetName !== '') {
@@ -5851,7 +5897,10 @@ function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddre
         selectionRangeAvailable = Number.isInteger(selectionStart) && Number.isInteger(selectionEnd)
       } catch {}
     }
-    const focusedEditor = active !== null && active !== nameBox && (
+    // Sheets focuses its zero-width editor for grid keyboard shortcuts even outside cell edit mode.
+    const idleSheetsGrid = googleSheets && active?.id === 'waffle-rich-text-editor'
+      && active.offsetWidth === 0 && active.textContent.trim() === ''
+    const focusedEditor = active !== null && active !== nameBox && !idleSheetsGrid && (
       active instanceof HTMLTextAreaElement
       || (active instanceof HTMLInputElement && active.type !== 'hidden'
         && active.type !== 'button' && active.type !== 'checkbox' && active.type !== 'radio'
@@ -5878,7 +5927,8 @@ function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddre
       textboxRole: active.getAttribute('role') === 'textbox',
     } : null
     return {
-      recognized: context !== null || nameBox !== null,
+      provider,
+      recognized: googleSheets ? nameBox instanceof HTMLInputElement && activeSheetName !== null : context !== null || nameBox !== null,
       hasWorkbookContext: context !== null,
       activeSheetName,
       address: nameBox instanceof HTMLInputElement ? nameBox.value : null,
@@ -5902,29 +5952,39 @@ function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddre
   }
 
   let state = readState()
-  if (action !== 'focus') return state
-  if (state.recognized !== true) return { ...state, error: 'No Excel workbook was found in this frame' }
+  if (action !== 'focus' && action !== 'locate') return state
+  if (state.recognized !== true) return { ...state, error: 'No workbook was found in this frame' }
   if (state.editing === true) {
-    return { ...state, error: 'Excel navigation stopped because focus is in an editable control (' + state.editGuard + ')' }
+    return { ...state, error: 'Workbook navigation stopped because focus is in an editable control (' + state.editGuard + ')' }
   }
   if (state.nameBoxReady !== true) {
-    return { ...state, error: 'The Excel name box is unavailable, hidden, disabled, or read-only' }
+    return { ...state, error: 'The workbook name box is unavailable, hidden, disabled, or read-only' }
   }
   if (typeof state.activeSheetName !== 'string'
     || state.activeSheetName.toLowerCase() !== String(expectedSheetName).toLowerCase()) {
-    return { ...state, error: 'The active Excel sheet changed before the name box was focused' }
+    return { ...state, error: 'The active sheet changed before the name box was focused' }
   }
   if (state.address !== expectedAddress) {
-    return { ...state, error: 'The Excel selection changed before the name box was focused' }
+    return { ...state, error: 'The workbook selection changed before the name box was focused' }
   }
-  const nameBox = document.querySelector('#FormulaBar-NameBox-input')
+  const nameBox = document.querySelector(nameBoxSelector)
   if (!(nameBox instanceof HTMLInputElement) || !nameBox.isConnected) {
-    return { ...state, error: 'The Excel name box was detached before focus' }
+    return { ...state, error: 'The workbook name box was detached before focus' }
+  }
+  if (action === 'locate') {
+    if (!googleSheets) return { ...state, error: 'The Google Sheets editor is no longer available' }
+    const bounds = nameBox.getBoundingClientRect()
+    const x = bounds.left + bounds.width / 2
+    const y = bounds.top + bounds.height / 2
+    if (document.elementFromPoint(x, y) !== nameBox) {
+      return { ...state, error: 'The Google Sheets name box is covered or outside the viewport' }
+    }
+    return { ...state, nameBoxPoint: { x, y } }
   }
   nameBox.focus()
   state = readState()
   if (state.focused !== true || state.nameBoxAttached !== true) {
-    return { ...state, error: 'The Excel name box did not retain focus' }
+    return { ...state, error: 'The workbook name box did not retain focus' }
   }
   return state
 }
