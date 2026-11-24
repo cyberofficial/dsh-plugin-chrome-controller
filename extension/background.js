@@ -45,6 +45,8 @@ const MAX_EVALUATION_CHARS = 50_000
 const MAX_EVALUATION_RESULT_CHARS = 100_000
 const MAX_WORKBOOK_CELLS = 10_000
 const MAX_WORKBOOK_RESULT_CHARS = 1_000_000
+const EXCEL_NAVIGATION_POLL_MS = 100
+const EXCEL_NAVIGATION_SETTLE_TIMEOUT_MS = 1_500
 const MAX_FIND_QUERY_CHARS = 2_000
 const MAX_FIND_RESULTS = 50
 const MAX_FIND_TEXT_CHARS = 300
@@ -1741,11 +1743,130 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       const tabId = requireTabId(params.tabId)
       return listFrames(tabId)
     }
+    case 'page.workbookStatus': {
+      const tabId = requireTabId(params.tabId)
+      const requestedFrameId = params.frameId === undefined ? undefined : requireFrameId(params.frameId)
+      const workbook = await resolveWorkbookFrame(tabId, requestedFrameId)
+      const state = workbook.state
+      return {
+        tabId,
+        frameId: workbook.frameId,
+        capabilities: {
+          canReadStatus: state.recognized === true,
+          canNavigate: state.nameBoxReady === true && typeof state.activeSheetName === 'string' && state.editing !== true,
+          canConfirmSelection: state.nameBoxReady === true,
+        },
+        sheet: { activeName: state.activeSheetName ?? null },
+        editGuard: state.editGuard ?? null,
+        focusedControl: state.focusedControl ?? null,
+        editButtons: state.editButtons ?? null,
+        nameBox: {
+          address: state.address ?? null,
+          focused: state.focused === true,
+          ready: state.nameBoxReady === true,
+        },
+      }
+    }
+    case 'page.workbookNavigate': {
+      const tabId = requireTabId(params.tabId)
+      const requestedFrameId = params.frameId === undefined ? undefined : requireFrameId(params.frameId)
+      const parsedAddress = requireExcelA1Address(params.address)
+      if (params.sheetName !== undefined
+        && (typeof params.sheetName !== 'string' || params.sheetName.length < 1 || params.sheetName.length > 31)) {
+        throw new Error('sheetName must be a non-empty Excel sheet name of at most 31 characters')
+      }
+      const requestedSheetName = params.sheetName
+      const tab = await chrome.tabs.get(tabId)
+      if (tab.active !== true) throw new Error('Activate the target Excel tab before navigating')
+      return withDebugger(tabId, async target => {
+        signal?.throwIfAborted()
+        const workbook = await resolveWorkbookFrame(tabId, requestedFrameId)
+        const frameId = workbook.frameId
+        let expectedSheetName = workbook.state.activeSheetName
+        if (typeof expectedSheetName !== 'string' || expectedSheetName === '') {
+          throw new Error('The active Excel sheet name is unavailable')
+        }
+        if (requestedSheetName !== undefined) {
+          if (requestedSheetName.toLowerCase() !== expectedSheetName.toLowerCase()) {
+            throw new Error('The requested sheet does not match the active Excel sheet; sheet switching is not supported')
+          }
+          expectedSheetName = requestedSheetName
+        }
+
+        let state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        requireWorkbookNavigationReady(state)
+        if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
+          throw new Error('The active Excel sheet changed before navigation could start')
+        }
+        if (state.editing === true) {
+          throw new Error('Excel navigation stopped because focus is in an editable control (' + state.editGuard + ')')
+        }
+        const initialAddress = state.address
+        if (typeof initialAddress !== 'string' || initialAddress === '') {
+          throw new Error('The current Excel selection is unavailable in the name box')
+        }
+
+        state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload,
+          ['focus', expectedSheetName, initialAddress], 'MAIN')
+        requireWorkbookNavigationFocused(state, expectedSheetName)
+        if (state.address !== initialAddress) {
+          throw new Error('The Excel selection changed before the name box was focused')
+        }
+
+        signal?.throwIfAborted()
+        await pressKey(target, { key: 'a', code: 'KeyA', virtualKey: 65, modifiers: 2 })
+        state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        requireWorkbookNavigationFocused(state, expectedSheetName)
+        if (state.address !== initialAddress) {
+          throw new Error('The Excel name box changed before address entry; Enter was not pressed')
+        }
+        if (state.selectionRangeAvailable === true
+          && (state.selectionStart !== 0 || state.selectionEnd !== initialAddress.length)) {
+          throw new Error('Ctrl+A did not select the complete Excel name-box value; Enter was not pressed')
+        }
+        let typedPrefix = ''
+        let previousCharacter = ''
+        for (const character of parsedAddress.address) {
+          signal?.throwIfAborted()
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+          requireWorkbookNavigationFocused(state, expectedSheetName)
+          if (state.address !== (typedPrefix === '' ? initialAddress : typedPrefix)) {
+            throw new Error('The Excel name box changed during navigation; Enter was not pressed')
+          }
+          await typeCharacter(target, character, previousCharacter, 0, FAST_TYPE_SETTINGS, signal)
+          typedPrefix += character
+          previousCharacter = character
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+          requireWorkbookNavigationFocused(state, expectedSheetName)
+          if (state.address !== typedPrefix) {
+            throw new Error('The Excel name box lost the requested address during entry; Enter was not pressed')
+          }
+        }
+
+        signal?.throwIfAborted()
+        state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        requireWorkbookNavigationFocused(state, expectedSheetName)
+        if (state.address !== parsedAddress.address) {
+          throw new Error('The Excel name box does not contain the requested address; Enter was not pressed')
+        }
+        await pressKey(target, KEYS.Enter)
+        return settleWorkbookNavigation(tabId, frameId, expectedSheetName, parsedAddress, signal)
+      })
+    }
     case 'page.workbookValues': {
       const tabId = requireTabId(params.tabId)
       const frameId = requireFrameId(params.frameId)
+      if (params.address !== undefined && typeof params.address !== 'string') {
+        throw new Error('address must be an A1 cell or rectangle string')
+      }
+      if (params.sheetName !== undefined && typeof params.sheetName !== 'string') {
+        throw new Error('sheetName must be a string')
+      }
+      const frame = await chrome.webNavigation.getFrame({ tabId, frameId })
+      if (!isExcelAppFrameUrl(frame?.url)) throw new Error('The requested frame is not an Excel Online workbook frame')
+      signal?.throwIfAborted()
       const payload = await runInFrame(tabId, frameId, frameWorkbookValuesPayload,
-        [MAX_WORKBOOK_CELLS, MAX_WORKBOOK_RESULT_CHARS], 'MAIN')
+        [MAX_WORKBOOK_CELLS, MAX_WORKBOOK_RESULT_CHARS, params.address ?? null, params.sheetName ?? null], 'MAIN')
       if (!isRecord(payload)) throw new Error('The frame returned no workbook data')
       if (typeof payload.error === 'string') throw new Error(payload.error)
       return { tabId, frameId, ...payload }
@@ -2946,6 +3067,162 @@ function requireFrameId(value) {
     throw new Error('A valid frameId from page.frames is required')
   }
   return value
+}
+
+function requireExcelA1Address(value) {
+  if (typeof value !== 'string' || value.length > 32) {
+    throw new Error('address must be an A1 cell or range such as A1 or B2:D9')
+  }
+  const match = /^\$?([A-Za-z]{1,3})\$?([1-9]\d{0,6})(?::\$?([A-Za-z]{1,3})\$?([1-9]\d{0,6}))?$/u.exec(value)
+  if (match === null) throw new Error('address must be an A1 cell or range such as A1 or B2:D9')
+  const columnIndex = letters => Array.from(letters.toUpperCase()).reduce(
+    (total, character) => total * 26 + character.charCodeAt(0) - 64, 0)
+  const firstColumn = columnIndex(match[1])
+  const firstRow = Number(match[2])
+  const lastColumn = match[3] === undefined ? firstColumn : columnIndex(match[3])
+  const lastRow = match[4] === undefined ? firstRow : Number(match[4])
+  if (firstColumn > 16_384 || lastColumn > 16_384 || firstRow > 1_048_576 || lastRow > 1_048_576
+    || firstColumn > lastColumn || firstRow > lastRow) {
+    throw new Error('address is outside Excel limits or has its range bounds reversed')
+  }
+  return { address: value, normalized: value.replace(/\$/gu, '').toUpperCase() }
+}
+
+function normalizeExcelAddress(value) {
+  return typeof value === 'string' ? value.replace(/\$/gu, '').toUpperCase() : ''
+}
+
+function sameExcelSheetName(left, right) {
+  return typeof left === 'string' && typeof right === 'string'
+    && left.toLowerCase() === right.toLowerCase()
+}
+
+async function resolveWorkbookFrame(tabId, requestedFrameId) {
+  const inspect = async frameId => {
+    const state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+    if (!isRecord(state)) throw new Error('The frame returned no Excel workbook status')
+    return state
+  }
+  const frameList = await listFrames(tabId)
+  if (requestedFrameId !== undefined) {
+    const requestedFrame = frameList.frames.find(frame => frame.frameId === requestedFrameId)
+    if (requestedFrame === undefined || !isExcelAppFrameUrl(requestedFrame.url)) {
+      throw new Error('frameId must identify the Excel Online app frame on excel.officeapps.live.com')
+    }
+    const state = await inspect(requestedFrameId)
+    if (state.recognized !== true) throw new Error('No Excel Online workbook was found in the requested frame')
+    return { frameId: requestedFrameId, state }
+  }
+
+  const matches = []
+  for (const frame of frameList.frames) {
+    if (!isExcelAppFrameUrl(frame.url)) continue
+    try {
+      const state = await inspect(frame.frameId)
+      if (state.recognized === true) matches.push({ frameId: frame.frameId, state })
+    } catch {
+      // Some cross-origin or transient frames cannot be probed at this moment.
+    }
+  }
+  if (matches.length === 0) throw new Error('No Excel Online workbook frame was found in the tab')
+  const contextMatches = matches.filter(match => match.state.hasWorkbookContext === true)
+  const candidates = contextMatches.length > 0 ? contextMatches : matches
+  if (candidates.length !== 1) {
+    throw new Error('More than one Excel workbook frame was found; provide frameId from page.frames')
+  }
+  return candidates[0]
+}
+
+function isExcelAppFrameUrl(value) {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.hostname.toLowerCase() === 'excel.officeapps.live.com'
+      && url.pathname.toLowerCase().includes('xlviewerinternal.aspx')
+  } catch {
+    return false
+  }
+}
+
+function requireWorkbookNavigationReady(state) {
+  if (!isRecord(state) || state.recognized !== true) {
+    throw new Error('The Excel workbook frame is no longer available')
+  }
+  if (typeof state.error === 'string') throw new Error(state.error)
+  if (state.nameBoxReady !== true) {
+    throw new Error('The Excel name box is unavailable, hidden, disabled, or read-only')
+  }
+}
+
+function requireWorkbookNavigationFocused(state, expectedSheetName) {
+  requireWorkbookNavigationReady(state)
+  if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
+    throw new Error('The active Excel sheet changed during navigation; Enter was not pressed')
+  }
+  if (state.documentFocused !== true || state.focused !== true) {
+    throw new Error('The Excel name box lost focus during navigation; Enter was not pressed')
+  }
+  if (state.editing === true) {
+    throw new Error('Excel entered an edit field during navigation; Enter was not pressed')
+  }
+}
+
+async function settleWorkbookNavigation(tabId, frameId, expectedSheetName, parsedAddress, signal) {
+  const deadline = Date.now() + EXCEL_NAVIGATION_SETTLE_TIMEOUT_MS
+  let previousKey
+  let stableSamples = 0
+  let lastState
+  let readError
+  while (Date.now() < deadline) {
+    signal?.throwIfAborted()
+    try {
+      const state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+      if (!isRecord(state) || state.recognized !== true) {
+        readError = 'The Excel workbook frame stopped responding after Enter'
+        break
+      }
+      lastState = state
+      if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
+        readError = 'The active Excel sheet changed before the selection could be confirmed'
+        break
+      }
+      if (state.nameBoxReady === true && state.documentFocused === true && state.focused !== true
+        && normalizeExcelAddress(state.address) === parsedAddress.normalized) {
+        const key = state.activeSheetName + '\u0000' + normalizeExcelAddress(state.address)
+        stableSamples = key === previousKey ? stableSamples + 1 : 1
+        previousKey = key
+        if (stableSamples >= 3) {
+          return {
+            tabId,
+            frameId,
+            requested: { sheetName: expectedSheetName, address: parsedAddress.address },
+            confirmed: true,
+            selection: { sheetName: state.activeSheetName, address: state.address },
+            confirmationSignal: 'stable-name-box-address-after-enter',
+          }
+        }
+      } else {
+        stableSamples = 0
+        previousKey = undefined
+      }
+    } catch {
+      readError = 'The Excel selection could not be re-read after Enter'
+      break
+    }
+    await delay(EXCEL_NAVIGATION_POLL_MS, signal ?? new AbortController().signal)
+  }
+  return {
+    tabId,
+    frameId,
+    requested: { sheetName: expectedSheetName, address: parsedAddress.address },
+    confirmed: false,
+    reason: readError ?? 'Excel did not expose a stable name-box selection matching the requested address',
+    selection: lastState === undefined
+      ? null
+      : { sheetName: lastState.activeSheetName ?? null, address: lastState.address ?? null },
+    confirmationSignal: 'name-box-readback-unconfirmed',
+  }
 }
 
 /** List every frame of a tab, including cross-origin frames, via an all-frames script probe. */
@@ -5536,6 +5813,113 @@ const ELEMENT_WATCH_MAX_VALUE_CHARS = 500
 // NOTE: the frame-injected payload functions below must stay self-contained; they inline
 // the 5000/500 limits as literals because module constants are not serialized into the frame.
 
+/** Read Excel workbook identity and the name-box state, or focus that box after preflight. */
+function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddress) {
+  const readState = () => {
+    const nameBox = document.querySelector('#FormulaBar-NameBox-input')
+    const context = document.querySelector('#m_excelWebRenderer_ewaCtl_m_workbookContextJson')
+    let activeSheetName = null
+    if (context !== null) {
+      try {
+        const workbookContext = JSON.parse(context.value)
+        if (typeof workbookContext?.ActiveSheetName === 'string' && workbookContext.ActiveSheetName !== '') {
+          activeSheetName = workbookContext.ActiveSheetName
+        }
+      } catch {}
+    }
+    const active = document.activeElement
+    const documentFocused = document.hasFocus()
+    const formulaEditor = document.querySelector('#formulaBarTextDivId_textElement')
+    const formulaEditorFocused = formulaEditor !== null
+      && (active === formulaEditor || formulaEditor.contains(active))
+    let selectionStart = null
+    let selectionEnd = null
+    let selectionRangeAvailable = false
+    if (nameBox instanceof HTMLInputElement) {
+      try {
+        selectionStart = nameBox.selectionStart
+        selectionEnd = nameBox.selectionEnd
+        selectionRangeAvailable = Number.isInteger(selectionStart) && Number.isInteger(selectionEnd)
+      } catch {}
+    }
+    const focusedEditor = active !== null && active !== nameBox && (
+      active instanceof HTMLTextAreaElement
+      || (active instanceof HTMLInputElement && active.type !== 'hidden'
+        && active.type !== 'button' && active.type !== 'checkbox' && active.type !== 'radio'
+        && active.disabled !== true && active.readOnly !== true && active.getClientRects().length > 0)
+      || active.isContentEditable === true
+      || active.getAttribute?.('role') === 'textbox'
+      || formulaEditorFocused
+    )
+    const isVisible = element => {
+      if (element === null || !element.isConnected || element.getClientRects().length === 0) return false
+      const style = getComputedStyle(element)
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0
+    }
+    const describeButton = selector => {
+      const button = document.querySelector(selector)
+      if (button === null) return null
+      return { visible: isVisible(button), enabled: !button.matches(':disabled, [aria-disabled="true"]') }
+    }
+    const focusedControl = focusedEditor ? {
+      tag: active.localName,
+      id: /^[A-Za-z_][A-Za-z0-9_:.-]{0,95}$/u.test(active.id) ? active.id : null,
+      visible: isVisible(active),
+      contentEditable: active.isContentEditable === true,
+      textboxRole: active.getAttribute('role') === 'textbox',
+    } : null
+    return {
+      recognized: context !== null || nameBox !== null,
+      hasWorkbookContext: context !== null,
+      activeSheetName,
+      address: nameBox instanceof HTMLInputElement ? nameBox.value : null,
+      selectionStart,
+      selectionEnd,
+      selectionRangeAvailable,
+      nameBoxAttached: nameBox instanceof HTMLInputElement && nameBox.isConnected,
+      nameBoxReady: nameBox instanceof HTMLInputElement && isVisible(nameBox)
+        && nameBox.disabled !== true && nameBox.readOnly !== true
+        && nameBox.getAttribute('aria-disabled') !== 'true',
+      documentFocused,
+      focused: documentFocused && nameBox !== null && active === nameBox,
+      editing: focusedEditor === true,
+      editGuard: focusedEditor ? (formulaEditorFocused ? 'formula-bar-focus' : 'editable-control-focus') : null,
+      focusedControl,
+      editButtons: {
+        ok: describeButton('#m_excelWebRenderer_ewaCtl_okboxButton'),
+        cancel: describeButton('#m_excelWebRenderer_ewaCtl_cancelboxButton'),
+      },
+    }
+  }
+
+  let state = readState()
+  if (action !== 'focus') return state
+  if (state.recognized !== true) return { ...state, error: 'No Excel workbook was found in this frame' }
+  if (state.editing === true) {
+    return { ...state, error: 'Excel navigation stopped because focus is in an editable control (' + state.editGuard + ')' }
+  }
+  if (state.nameBoxReady !== true) {
+    return { ...state, error: 'The Excel name box is unavailable, hidden, disabled, or read-only' }
+  }
+  if (typeof state.activeSheetName !== 'string'
+    || state.activeSheetName.toLowerCase() !== String(expectedSheetName).toLowerCase()) {
+    return { ...state, error: 'The active Excel sheet changed before the name box was focused' }
+  }
+  if (state.address !== expectedAddress) {
+    return { ...state, error: 'The Excel selection changed before the name box was focused' }
+  }
+  const nameBox = document.querySelector('#FormulaBar-NameBox-input')
+  if (!(nameBox instanceof HTMLInputElement) || !nameBox.isConnected) {
+    return { ...state, error: 'The Excel name box was detached before focus' }
+  }
+  nameBox.focus()
+  state = readState()
+  if (state.focused !== true || state.nameBoxAttached !== true) {
+    return { ...state, error: 'The Excel name box did not retain focus' }
+  }
+  return state
+}
+
 /**
  * Runs inside the target frame's MAIN world: start a generic element watcher that records
  * the watched element's text/value (and an optional label element's value) on every change.
@@ -5681,18 +6065,78 @@ function frameElementWatchReadPayload(clear) {
   }
 }
 
-async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
-  const input = document.querySelector('#m_excelWebRenderer_ewaCtl_m_workbookContextJson')
-  if (input === null) return { error: 'No Excel workbook context was found in this frame' }
-  let workbookContext
-  try {
-    workbookContext = JSON.parse(input.value)
-  } catch {
-    return { error: 'The Excel workbook context is not valid JSON' }
+async function frameWorkbookValuesPayload(maxCells, maxResultChars, requestedAddress, requestedSheetName) {
+  const parseA1 = (value, allowAbsolute = false) => {
+    if (typeof value !== 'string' || value.length > 24) throw new Error('address must be a bounded A1 cell or rectangle')
+    const source = allowAbsolute ? value.replace(/\$/gu, '') : value
+    const match = /^([A-Za-z]{1,3})([1-9][0-9]{0,6})(?::([A-Za-z]{1,3})([1-9][0-9]{0,6}))?$/u.exec(source)
+    if (match === null) throw new Error('address must be a single A1 cell or bounded A1 rectangle without a sheet prefix')
+    const columnNumber = letters => {
+      let number = 0
+      for (const letter of letters.toUpperCase()) number = number * 26 + letter.charCodeAt(0) - 64
+      if (number > 16_384) throw new Error('address column exceeds Excel bounds')
+      return number
+    }
+    const startColumn = columnNumber(match[1])
+    const startRow = Number(match[2])
+    const endColumn = match[3] === undefined ? startColumn : columnNumber(match[3])
+    const endRow = match[4] === undefined ? startRow : Number(match[4])
+    if (startRow > 1_048_576 || endRow > 1_048_576) throw new Error('address row exceeds Excel bounds')
+    if (endRow < startRow || endColumn < startColumn) throw new Error('address rectangle endpoints must be in ascending order')
+    return { startRow, startColumn, endRow, endColumn }
   }
-  const sheetName = workbookContext?.ActiveSheetName
-  if (typeof sheetName !== 'string' || sheetName === '') {
-    return { error: 'The active Excel sheet name is unavailable' }
+  const columnName = number => {
+    let value = number
+    let result = ''
+    while (value > 0) {
+      const remainder = (value - 1) % 26
+      result = String.fromCharCode(65 + remainder) + result
+      value = Math.floor((value - 1) / 26)
+    }
+    return result
+  }
+  const addressFor = rect => {
+    const first = columnName(rect.startColumn) + String(rect.startRow)
+    const last = columnName(rect.endColumn) + String(rect.endRow)
+    return first === last ? first : first + ':' + last
+  }
+  const cellCount = rect => (rect.endRow - rect.startRow + 1) * (rect.endColumn - rect.startColumn + 1)
+  const withinBudget = (rect, label) => {
+    if (!Number.isSafeInteger(cellCount(rect)) || cellCount(rect) > maxCells) {
+      throw new Error(label + ' exceeds the ' + String(maxCells) + '-cell read limit')
+    }
+  }
+  let requestedRect = null
+  try {
+    if (requestedAddress !== null) {
+      requestedRect = parseA1(requestedAddress)
+      withinBudget(requestedRect, 'Requested address')
+    }
+  } catch (error) {
+    return { error: String(error?.message ?? error) }
+  }
+  if (requestedSheetName !== null
+    && (typeof requestedSheetName !== 'string' || requestedSheetName.length === 0 || requestedSheetName.length > 31)) {
+    return { error: 'sheetName must be an Excel worksheet name of 1 to 31 characters' }
+  }
+
+  const input = document.querySelector('#m_excelWebRenderer_ewaCtl_m_workbookContextJson')
+  let workbookContext = null
+  let contextError = null
+  if (input === null) {
+    contextError = 'No Excel workbook context was found in this frame'
+  } else {
+    try {
+      workbookContext = JSON.parse(input.value)
+    } catch {
+      contextError = 'The Excel workbook context is not valid JSON'
+    }
+  }
+  const activeSheetName = typeof workbookContext?.ActiveSheetName === 'string'
+    && workbookContext.ActiveSheetName !== '' ? workbookContext.ActiveSheetName : null
+  const sheetName = requestedSheetName ?? activeSheetName
+  if (sheetName === null) {
+    return { error: contextError ?? 'The active Excel sheet name is unavailable; provide sheetName to select a worksheet' }
   }
   const usedRange = workbookContext?.ActiveSheetProcessedDataResult?.UR
   const lastRow = Number(usedRange?.LastRow)
@@ -5703,7 +6147,7 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
   const describe = error => String(error?.message ?? error)
     .replace(/access_token=[^&\s"'<>]+/gi, 'access_token=<redacted>')
     .slice(0, 240)
-  const deadline = Date.now() + 25_000
+  const deadline = Date.now() + 24_000
   const timed = (operation, timeoutMs) => new Promise((resolve, reject) => {
     const remainingMs = Math.min(timeoutMs, Math.max(1, deadline - Date.now()))
     const timer = setTimeout(() => reject(new Error('timed out')), remainingMs)
@@ -5712,20 +6156,84 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
       error => { clearTimeout(timer); reject(error) },
     )
   })
-  const packageValues = (api, address, values, formulas) => {
+  const reportedSheet = address => {
+    if (typeof address !== 'string') return null
+    const bang = address.lastIndexOf('!')
+    if (bang < 0) return null
+    let name = address.slice(0, bang)
+    if (name.startsWith("'") && name.endsWith("'")) name = name.slice(1, -1).replace(/''/gu, "'")
+    const bookEnd = name.lastIndexOf(']')
+    if (bookEnd >= 0) name = name.slice(bookEnd + 1)
+    return name
+  }
+  const verifyReportedSheet = (address, requireQualified = false) => {
+    const actual = reportedSheet(address)
+    if (actual === null) {
+      if (requireQualified) throw new Error('The grid range address does not identify its worksheet')
+      return
+    }
+    if (actual !== sheetName) throw new Error('The workbook API returned a range for worksheet ' + actual)
+  }
+  const rectangleFromAddress = (address, requireQualified = false) => {
+    verifyReportedSheet(address, requireQualified)
+    const bang = typeof address === 'string' ? address.lastIndexOf('!') : -1
+    const a1 = bang < 0 ? address : address.slice(bang + 1)
+    return parseA1(a1, true)
+  }
+  const verifyAddressMatchesRect = (address, expected, requireQualified = false) => {
+    const actual = rectangleFromAddress(address, requireQualified)
+    if (actual.startRow !== expected.startRow || actual.startColumn !== expected.startColumn
+      || actual.endRow !== expected.endRow || actual.endColumn !== expected.endColumn) {
+      throw new Error('The workbook API returned address ' + String(address) + ' instead of ' + addressFor(expected))
+    }
+  }
+  const verifyActiveSheetContext = () => {
+    if (requestedSheetName !== null) return
+    if (input === null) throw new Error('The active Excel sheet context is unavailable')
+    let currentSheetName
+    try {
+      currentSheetName = JSON.parse(input.value)?.ActiveSheetName
+    } catch {
+      throw new Error('The active Excel sheet context is not valid JSON')
+    }
+    if (currentSheetName !== sheetName) throw new Error('The active Excel sheet changed during the workbook read')
+  }
+  const usedRangeRectangle = () => {
+    if (sheetName !== activeSheetName || !validBounds) {
+      throw new Error('EWA used-range bounds cannot verify the selected worksheet')
+    }
+    const rect = { startRow: 1, startColumn: 1, endRow: lastRow + 1, endColumn: lastColumn + 1 }
+    withinBudget(rect, 'EWA used range')
+    return rect
+  }
+  const packageValues = (api, address, values, displayedTextValues, formulaValues, expectedRect) => {
     if (!Array.isArray(values) || values.length === 0 || !Array.isArray(values[0])
       || values[0].length === 0 || values.some(row => !Array.isArray(row) || row.length !== values[0].length)) {
       throw new Error('The workbook API returned an invalid value matrix')
     }
     const rowCount = values.length
     const columnCount = values[0].length
-    if (rowCount * columnCount > maxCells) {
-      throw new Error('The used range exceeds the ' + String(maxCells) + '-cell read limit')
+    if (rowCount * columnCount > maxCells) throw new Error('The requested range exceeds the ' + String(maxCells) + '-cell read limit')
+    if (expectedRect !== undefined
+      && (rowCount !== expectedRect.endRow - expectedRect.startRow + 1
+        || columnCount !== expectedRect.endColumn - expectedRect.startColumn + 1)) {
+      throw new Error('The workbook API returned matrix dimensions that do not match the selected address')
     }
+    const matrixMatches = matrix => Array.isArray(matrix) && matrix.length === rowCount
+      && matrix.every(row => Array.isArray(row) && row.length === columnCount)
+    const hasDisplayedText = matrixMatches(displayedTextValues)
+    const hasFormulas = matrixMatches(formulaValues)
+    if (displayedTextValues !== null && !hasDisplayedText) throw new Error('The workbook API returned an invalid displayed-text matrix')
+    if (formulaValues !== null && !hasFormulas) throw new Error('The workbook API returned an invalid formula matrix')
+    const displayedText = hasDisplayedText
+      ? displayedTextValues.map(row => row.map(value => value === null || value === undefined ? '' : String(value)))
+      : null
+    const formulas = hasFormulas
+      ? formulaValues.map(row => row.map(value => typeof value === 'string' && value.startsWith('=') ? value : null))
+      : null
     const populated = values.map((row, rowIndex) => row.map((value, columnIndex) =>
       (value !== null && value !== undefined && value !== '')
-      || (typeof formulas?.[rowIndex]?.[columnIndex] === 'string'
-        && formulas[rowIndex][columnIndex].startsWith('='))))
+      || (typeof formulas?.[rowIndex]?.[columnIndex] === 'string')))
     const result = {
       api,
       sheetName,
@@ -5734,25 +6242,46 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
       columnCount,
       values,
       populated,
-      populationBasis: api === 'office-js' ? 'nonempty-value-or-formula' : 'nonempty-value',
+      populationBasis: hasFormulas ? 'nonempty-value-or-formula' : 'nonempty-value',
+      displayedText,
+      formulas,
+      fieldAvailability: { values: true, displayedText: hasDisplayedText, formulas: hasFormulas },
+      provenance: {
+        api,
+        sheetSelection: requestedSheetName === null ? 'active-sheet-context' : 'named-worksheet-lookup',
+        rangeSelection: requestedRect === null ? 'used-range' : 'requested-a1',
+        values: api === 'office-js' ? 'Excel JavaScript Range.values' : 'EWA Range.getValuesAsync',
+        displayedText: hasDisplayedText ? 'Excel JavaScript Range.text' : null,
+        formulas: hasFormulas ? 'Excel JavaScript Range.formulas' : null,
+      },
+      blankSemantics: {
+        emptyValue: 'null, undefined, and empty string are blank',
+        populated: hasFormulas ? 'nonempty value or formula' : 'nonempty value',
+        displayedText: hasDisplayedText ? 'empty string means no displayed text' : null,
+      },
+      limitations: hasFormulas && hasDisplayedText
+        ? []
+        : ['This API did not expose separate displayed text and formulas for the selected range.'],
     }
     if (JSON.stringify(result).length > maxResultChars) {
-      throw new Error('The used range exceeds the workbook response size limit')
+      throw new Error('The requested range exceeds the workbook response size limit')
     }
     return result
   }
 
-  const validateEwaBounds = () => {
-    if (!validBounds) throw new Error('EWA used-range bounds are unavailable')
-    if ((lastRow + 1) * (lastColumn + 1) > maxCells) {
-      throw new Error('EWA used range exceeds the ' + String(maxCells) + '-cell read limit')
-    }
-  }
-  const readEwaRange = async (api, range) => {
-    validateEwaBounds()
+  const selectedEwaRectangle = () => requestedRect ?? usedRangeRectangle()
+  const readEwaRange = async (api, range, rect, address, directSheetLookup = false, knownRangeAddress = null) => {
+    withinBudget(rect, 'Requested range')
     if (typeof range?.getValuesAsync !== 'function') throw new Error('EWA range has no getValuesAsync')
-    const address = typeof range.getAddressA1 === 'function'
-      ? await timed(() => range.getAddressA1(), 4_000) : null
+    let returnedAddress = knownRangeAddress
+    const hasAddressMethod = typeof range.getAddressA1 === 'function'
+    if (returnedAddress === null && hasAddressMethod) {
+      returnedAddress = await timed(() => range.getAddressA1(), 4_000)
+    }
+    if (hasAddressMethod && typeof returnedAddress !== 'string') throw new Error('EWA range returned no A1 address')
+    if (returnedAddress !== null) verifyAddressMatchesRect(returnedAddress, rect, !directSheetLookup)
+    else if (!directSheetLookup) throw new Error('EWA range has no verifiable worksheet address')
+    verifyActiveSheetContext()
     const values = await timed(() => new Promise((resolve, reject) => {
       range.getValuesAsync(0, result => {
         try {
@@ -5765,15 +6294,19 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
         }
       }, null)
     }), 12_000)
-    return packageValues(api, address, values)
+    verifyActiveSheetContext()
+    return packageValues(api, address, values, null, null, rect)
   }
   const readEwaSheets = async (api, sheets) => {
-    validateEwaBounds()
     if (typeof sheets?.getItemByName !== 'function') throw new Error('EWA sheets have no getItemByName')
+    const rect = selectedEwaRectangle()
+    verifyActiveSheetContext()
     const sheet = await timed(() => sheets.getItemByName(sheetName), 4_000)
     if (typeof sheet?.getRange !== 'function') throw new Error('EWA sheet has no getRange')
-    const range = await timed(() => sheet.getRange(0, 0, lastRow + 1, lastColumn + 1), 4_000)
-    return readEwaRange(api, range)
+    verifyActiveSheetContext()
+    const range = await timed(() => sheet.getRange(rect.startRow - 1, rect.startColumn - 1,
+      rect.endRow - rect.startRow + 1, rect.endColumn - rect.startColumn + 1), 4_000)
+    return readEwaRange(api, range, rect, addressFor(rect), true)
   }
   const readEwaWorkbook = async (api, workbook) => {
     if (typeof workbook?.getSheets !== 'function') {
@@ -5790,6 +6323,37 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
     }
     const workbook = await timed(() => control.getActiveWorkbook(), 4_000)
     return readEwaWorkbook(api, workbook)
+  }
+
+  if (typeof globalThis.Excel?.run === 'function') {
+    try {
+      return await timed(() => globalThis.Excel.run(async context => {
+        verifyActiveSheetContext()
+        const sheet = context.workbook.worksheets.getItem(sheetName)
+        const range = requestedRect === null
+          ? sheet.getUsedRange(true)
+          : sheet.getRange(addressFor(requestedRect))
+        range.load('address,rowCount,columnCount')
+        await context.sync()
+        verifyActiveSheetContext()
+        const rect = requestedRect ?? rectangleFromAddress(range.address)
+        verifyAddressMatchesRect(range.address, rect)
+        withinBudget(rect, requestedRect === null ? 'Office JavaScript used range' : 'Requested range')
+        if (Number(range.rowCount) !== rect.endRow - rect.startRow + 1
+          || Number(range.columnCount) !== rect.endColumn - rect.startColumn + 1) {
+          throw new Error('Office JavaScript returned dimensions that do not match the selected range')
+        }
+        range.load('values,text,formulas')
+        await context.sync()
+        verifyActiveSheetContext()
+        return packageValues('office-js', requestedRect === null ? range.address : addressFor(requestedRect),
+          range.values, range.text, range.formulas, rect)
+      }), 20_000)
+    } catch (error) {
+      failures.push('Office JavaScript read failed: ' + describe(error))
+    }
+  } else {
+    failures.push('Office JavaScript Excel.run is unavailable in the workbook frame')
   }
 
   const seenEwa = new Set()
@@ -5809,21 +6373,8 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
     if (exported !== undefined) {
       const returned = typeof exported === 'function' ? exported.call(crossFrame) : exported
       const resolved = await timed(() => Promise.resolve(returned), 8_000)
-      let control = resolved
-      if (typeof control?.getActiveWorkbook !== 'function'
-        && control !== null && ['object', 'function'].includes(typeof control)) {
-        const names = Object.getOwnPropertyNames(control).slice(0, 40)
-        for (const name of names) {
-          const descriptor = Object.getOwnPropertyDescriptor(control, name)
-          if (!descriptor || !Object.hasOwn(descriptor, 'value')) continue
-          if (typeof descriptor.value?.getActiveWorkbook === 'function') {
-            control = descriptor.value
-            break
-          }
-        }
-      }
-      if (typeof control?.getActiveWorkbook === 'function') {
-        return await readEwaControl('ewa-cross-frame', control)
+      if (typeof resolved?.getActiveWorkbook === 'function') {
+        return await readEwaControl('ewa-cross-frame', resolved)
       }
       const workbook = await timed(() => Promise.resolve(resolved?.wkb), 4_000)
       if (typeof workbook?.getSheets === 'function') {
@@ -5833,7 +6384,7 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
         throw new Error('Cross-frame wkb has no getSheets (type '
           + (workbook === null ? 'null' : typeof workbook) + ')')
       }
-      return await readEwaControl('ewa-cross-frame', control)
+      throw new Error('Cross-frame export did not return a verifiable EWA control or workbook')
     }
   } catch (error) {
     failures.push('ewa-cross-frame read failed: ' + describe(error))
@@ -5849,20 +6400,26 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
         throw new Error('Grid export did not return an object')
       }
       const directFailures = []
-      let usedRange
-      try {
-        usedRange = await timed(() => Promise.resolve(grid.usedRange), 4_000)
-        if (typeof usedRange?.getValuesAsync === 'function') {
-          const result = await readEwaRange('ewa-cross-frame-grid-usedRange', usedRange)
-          return { ...result, gridMember: 'usedRange' }
+      if (requestedRect === null) {
+        try {
+          const usedRange = await timed(() => Promise.resolve(grid.usedRange), 4_000)
+          if (typeof usedRange?.getValuesAsync === 'function') {
+            if (typeof usedRange.getAddressA1 !== 'function') {
+              throw new Error('Grid usedRange has no verifiable A1 address')
+            }
+            const address = await timed(() => usedRange.getAddressA1(), 4_000)
+            const rect = rectangleFromAddress(address, true)
+            withinBudget(rect, 'Grid used range')
+            const result = await readEwaRange('ewa-cross-frame-grid-usedRange', usedRange, rect, address, false, address)
+            return { ...result, gridMember: 'usedRange' }
+          }
+          directFailures.push('usedRange.getValuesAsync=' + typeof usedRange?.getValuesAsync)
+        } catch (error) {
+          directFailures.push('usedRange: ' + describe(error))
         }
-        directFailures.push('usedRange.getValuesAsync=' + typeof usedRange?.getValuesAsync)
-      } catch (error) {
-        directFailures.push('usedRange: ' + describe(error))
       }
-      let sheets
       try {
-        sheets = await timed(() => Promise.resolve(grid.mc?.sheets), 4_000)
+        const sheets = await timed(() => Promise.resolve(grid.mc?.sheets), 4_000)
         if (typeof sheets?.getItemByName === 'function') {
           const result = await readEwaSheets('ewa-cross-frame-grid-mc-sheets', sheets)
           return { ...result, gridMember: 'mc.sheets' }
@@ -5871,160 +6428,18 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
       } catch (error) {
         directFailures.push('mc.sheets: ' + describe(error))
       }
-      const candidates = [{ name: 'grid', value: grid }]
-      for (const name of Object.getOwnPropertyNames(grid).slice(0, 300)) {
-        const descriptor = Object.getOwnPropertyDescriptor(grid, name)
-        if (!descriptor || !Object.hasOwn(descriptor, 'value')) continue
-        const value = descriptor.value
-        if (value !== null && ['object', 'function'].includes(typeof value)) {
-          candidates.push({ name, value })
-        }
-      }
-      const seen = new Set()
-      const candidateFailures = []
-      for (const candidate of candidates) {
-        if (seen.has(candidate.value)) continue
-        seen.add(candidate.value)
-        try {
-          let result
-          if (typeof candidate.value.getActiveWorkbook === 'function') {
-            result = await readEwaControl('ewa-cross-frame-grid', candidate.value)
-          } else if (typeof candidate.value.getSheets === 'function') {
-            result = await readEwaWorkbook('ewa-cross-frame-grid', candidate.value)
-          } else continue
-          return { ...result, gridMember: candidate.name }
-        } catch (error) {
-          if (candidateFailures.length < 3) {
-            candidateFailures.push(candidate.name + ': ' + describe(error))
-          }
-          if (candidateFailures.length >= 3) break
-        }
-      }
-      throw new Error(candidateFailures.length > 0
-        ? 'Grid workbook candidates failed: ' + candidateFailures.join('; ')
-        : directFailures.join('; ') + '; Grid has no EWA workbook method')
+      throw new Error(directFailures.length > 0
+        ? directFailures.join('; ') + '; no verified direct grid worksheet lookup'
+        : 'Grid has no verified direct worksheet lookup')
     }
   } catch (error) {
     failures.push('ewa-cross-frame-grid read failed: ' + describe(error))
   }
 
-  if (typeof globalThis.Excel?.run === 'function') {
-    try {
-      return await timed(() => globalThis.Excel.run(async context => {
-        const sheet = context.workbook.worksheets.getItem(sheetName)
-        const range = sheet.getUsedRange(true)
-        range.load('address,rowCount,columnCount')
-        await context.sync()
-        if (range.rowCount * range.columnCount > maxCells) {
-          throw new Error('The used range exceeds the ' + String(maxCells) + '-cell read limit')
-        }
-        range.load('values,formulas')
-        await context.sync()
-        return packageValues('office-js', range.address, range.values, range.formulas)
-      }), 12_000)
-    } catch (error) {
-      failures.push('Office JavaScript read failed: ' + describe(error))
-    }
-  }
-
-  // Path: sheet model under grid.nGi (Sheet*) read cell-by-cell via its getCell method.
-  try {
-    const imports = globalThis._Ewa?.CrossFrameStaticMethods?.imports
-    const grid = typeof imports?.grid === 'function' ? imports.grid() : null
-    const nGi = grid?.nGi
-    const modelName = nGi ? Object.keys(nGi).find(k => /^Sheet/.test(k)) : undefined
-    const model = modelName ? nGi[modelName] : null
-    if (model !== null && model !== undefined && typeof model.getCell === 'function') {
-      if (!validBounds) throw new Error('used-range bounds are unavailable')
-      if ((lastRow + 1) * (lastColumn + 1) > maxCells) {
-        throw new Error('The used range exceeds the ' + String(maxCells) + '-cell read limit')
-      }
-      const colName = i => {
-        let s = ''
-        i += 1
-        while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26) }
-        return s
-      }
-      const valueNames = ['value', 'text', 'displayValue', 'formattedValue', 'cellValue', 'v', 'result', 'data']
-      const cellValue = cell => {
-        if (cell === null || cell === undefined) return null
-        if (typeof cell !== 'object') return cell
-        const proto = Object.getPrototypeOf(cell)
-        const names = Object.keys(cell)
-        if (proto !== null) names.push(...Object.getOwnPropertyNames(proto))
-        for (const n of valueNames) {
-          if (!names.includes(n)) continue
-          try {
-            const v = cell[n]
-            if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
-          } catch { /* ignore accessor errors */ }
-        }
-        for (const n of names) {
-          if (!/^get[a-z]/i.test(n)) continue
-          try {
-            const d = Object.getOwnPropertyDescriptor(cell, n)
-              ?? (proto !== null ? Object.getOwnPropertyDescriptor(proto, n) : undefined)
-            const fn = typeof d?.value === 'function' && d.value.length === 0 ? d.value
-              : typeof cell[n] === 'function' && cell[n].length === 0 ? cell[n]
-                : null
-            if (fn === null) continue
-            const v = fn.call(cell)
-            if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
-          } catch { /* ignore */ }
-        }
-        return null
-      }
-      // Detect the getCell calling convention: 'A1' address string vs numeric (row, col).
-      let useAddress = false
-      let zeroBased = false
-      let cellSample = null
-      const probeLog = []
-      const resolveMaybe = v => (v !== null && typeof v === 'object' && typeof v.then === 'function')
-        ? v.then(x => x, () => null)
-        : v
-      for (const args of [[], ['A1'], [1, 1], [0, 0], [0], [{ row: 1, column: 1 }]]) {
-        try {
-          let c = await resolveMaybe(model.getCell(...args))
-          probeLog.push(JSON.stringify(args) + '=>' + (c === null || c === undefined ? String(c) : typeof c))
-          if (c !== null && typeof c === 'object') {
-            cellSample = c
-            useAddress = typeof args[0] === 'string'
-            zeroBased = args[0] === 0
-            break
-          }
-        } catch (error) {
-          probeLog.push(JSON.stringify(args) + '=>throw:' + describe(error).slice(0, 80))
-        }
-      }
-      if (cellSample === null) throw new Error('sheet model getCell returned no cell object; probes: ' + probeLog.join(', '))
-      const row0 = useAddress || !zeroBased ? 1 : 0
-      const col0 = row0
-      const values = []
-      for (let r = row0; r < row0 + lastRow; r++) {
-        const row = []
-        for (let c = col0; c < col0 + lastColumn; c++) {
-          let cell = null
-          try {
-            cell = useAddress ? model.getCell(colName(c - col0) + r) : model.getCell(r, c)
-          } catch { cell = null }
-          row.push(cellValue(cell))
-        }
-        values.push(row)
-      }
-      const sampleNames = Object.keys(cellSample)
-      const sampleProto = Object.getPrototypeOf(cellSample)
-      if (sampleProto !== null) sampleNames.push(...Object.getOwnPropertyNames(sampleProto))
-      const result = packageValues('ewa-sheetmodel-getCell', 'A1:' + colName(lastColumn - 1) + lastRow, values, null)
-      return { ...result, gridMember: modelName, cellMemberNames: sampleNames.slice(0, 80) }
-    }
-  } catch (error) {
-    failures.push('ewa-sheetmodel-getCell read failed: ' + describe(error))
-  }
-
+  failures.push('EWA sheet-model getCell fallback skipped because its worksheet identity and address semantics are unverified')
   return { error: failures.length > 0 ? failures.join('; ')
     : 'No compatible EWA or Office JavaScript API is available in this frame; run dsh_browser_workbook_probe' }
 }
-
 /**
  * Runs inside an Office Online (WAC) frame: extract the WOPI source and access token from the
  * hidden workbook-context input. The result stays inside the extension process (service worker);
