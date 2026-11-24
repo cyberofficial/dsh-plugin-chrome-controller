@@ -1,4 +1,4 @@
-import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, domainFilterAllows, normalizeDshOrigin } from './origin.js'
 import { clampPoiPoint, normalizePoiArea, normalizePoiText, selectPoiPoint } from './poi.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
@@ -45,6 +45,8 @@ const MAX_EVALUATION_CHARS = 50_000
 const MAX_EVALUATION_RESULT_CHARS = 100_000
 const MAX_WORKBOOK_CELLS = 10_000
 const MAX_WORKBOOK_RESULT_CHARS = 1_000_000
+const EXCEL_NAVIGATION_POLL_MS = 100
+const EXCEL_NAVIGATION_SETTLE_TIMEOUT_MS = 1_500
 const MAX_FIND_QUERY_CHARS = 2_000
 const MAX_FIND_RESULTS = 50
 const MAX_FIND_TEXT_CHARS = 300
@@ -139,6 +141,7 @@ let restoreTask
 let keepaliveInterval
 let reconnectWanted = false
 let reconnectTask
+let startupConnectionTask
 let trustedStorageTask
 let behaviorSettingsCache = { ...DEFAULT_BEHAVIOR_SETTINGS }
 let behaviorSettingsLoaded = false
@@ -264,24 +267,129 @@ const CHAR_KEYS = buildCharKeys()
 // Frequent English bigrams are typed faster; used to shorten flight time.
 const COMMON_BIGRAMS = new Set(['th','he','in','er','an','re','on','at','en','nd','ti','es','or','te','of','ed','is','it','al','ar','st','to','nt','ng','se','as','ou','le','ve','co','me','de','hi','ri','ro','ic','ne','ea','ra','ce','li','ch','ll','be','ma','si','om','ur'])
 
-function randomBetween(min, max) {
-  return min + Math.random() * (max - min)
+function randomBetween(min, max, random) {
+  return min + random() * (max - min)
 }
 
 /** Flight time (down-down) before pressing `char`, given the previous char. */
-function flightDelayMs(char, prevChar, baseDelayMs, settings) {
-  if (Math.random() < settings.thinkingPauseChancePercent / 100) {
-    return randomBetween(settings.thinkingPauseMinMs, settings.thinkingPauseMaxMs)
+function flightDelayMs(char, prevChar, baseDelayMs, settings, random = Math.random) {
+  if (random() < settings.thinkingPauseChancePercent / 100) {
+    return randomBetween(settings.thinkingPauseMinMs, settings.thinkingPauseMaxMs, random)
   }
-  let delay = baseDelayMs * randomBetween(settings.flightJitterMinFactor, settings.flightJitterMaxFactor)
+  let delay = baseDelayMs * randomBetween(settings.flightJitterMinFactor, settings.flightJitterMaxFactor, random)
   if (char === ' ' || '.,!?;:'.includes(char)) {
-    delay *= randomBetween(settings.spacePauseMinFactor, settings.spacePauseMaxFactor)
+    delay *= randomBetween(settings.spacePauseMinFactor, settings.spacePauseMaxFactor, random)
   } else if (prevChar !== '' && COMMON_BIGRAMS.has((prevChar + char).toLowerCase())) {
     delay *= settings.commonBigramFactor
   } else if (prevChar === char) {
     delay *= settings.repeatedKeyFactor
   }
   return Math.round(delay)
+}
+
+function keyHoldMs(settings, random = Math.random) {
+  return Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs, random))
+}
+
+const TYPING_PREVIEW_SENTENCE = 'The quick brown fox jumps over the lazy dog.'
+const TYPING_PREVIEW_TEXT = Array(3).fill(TYPING_PREVIEW_SENTENCE).join('\n')
+
+function typingPreviewSteps(values, sample = TYPING_PREVIEW_TEXT, randomForCharacter = () => Math.random) {
+  const settings = normalizeBehaviorSettings(values)
+  let previous = ''
+  return Array.from(sample, (character, index) => {
+    const random = randomForCharacter(index)
+    const waitMs = flightDelayMs(character, previous, settings.baseFlightDelayMs, settings, random)
+    const holdMs = CHAR_KEYS[character] === undefined ? 0 : keyHoldMs(settings, random)
+    previous = character
+    return { character, waitMs, holdMs }
+  })
+}
+
+const TYPING_EXAMPLE_SETTINGS = {
+  baseFlightDelayMs: 220,
+  flightJitterMinFactor: 1,
+  flightJitterMaxFactor: 1,
+  keyHoldMinMs: 70,
+  keyHoldVariationMs: 0,
+  thinkingPauseChancePercent: 0,
+  spacePauseMinFactor: 1,
+  spacePauseMaxFactor: 1,
+  commonBigramFactor: 1,
+  repeatedKeyFactor: 1,
+}
+
+const TYPING_EXAMPLES = {
+  baseDelay: {
+    sample: 'abcd',
+    presets: [
+      ['80 ms before each key', { baseFlightDelayMs: 80 }],
+      ['360 ms before each key', { baseFlightDelayMs: 360 }],
+    ],
+  },
+  delayVariation: {
+    sample: 'abcd',
+    presets: [
+      ['Fixed at 1x', {}],
+      ['Varies from 0.3x to 2.4x', { flightJitterMinFactor: 0.3, flightJitterMaxFactor: 2.4 }],
+    ],
+  },
+  keyHold: {
+    sample: 'abcd',
+    presets: [
+      ['70 ms hold', {}],
+      ['340 ms hold', { keyHoldMinMs: 340 }],
+      ['70 to 410 ms hold', { keyHoldVariationMs: 340 }],
+    ],
+  },
+  letterPairs: {
+    sample: 'that',
+    presets: [
+      ['1x for common pairs', {}],
+      ['0.2x for common pairs', { commonBigramFactor: 0.2 }],
+    ],
+  },
+  repeatedCharacters: {
+    sample: 'coffee',
+    presets: [
+      ['1x before repeats', {}],
+      ['3x before repeats', { repeatedKeyFactor: 3 }],
+    ],
+  },
+  wordPauses: {
+    sample: 'Go, now!',
+    presets: [
+      ['1x for spaces and punctuation', {}],
+      ['3x to 4x for spaces and punctuation', { spacePauseMinFactor: 3, spacePauseMaxFactor: 4 }],
+    ],
+  },
+  longPauses: {
+    sample: 'abcdef',
+    presets: [
+      ['0% chance', {}],
+      ['25% chance, 800 to 1400 ms', { thinkingPauseChancePercent: 25, thinkingPauseMinMs: 800, thinkingPauseMaxMs: 1400 }],
+    ],
+  },
+}
+
+function typingExamplePlans(name, values) {
+  if (typeof name !== 'string' || !Object.hasOwn(TYPING_EXAMPLES, name)) return undefined
+  const { sample, presets } = TYPING_EXAMPLES[name]
+  // Use the same sample draws for every preset so differences come from the settings.
+  const draws = [0.62, 0.12, 0.84, 0.55, 0.19, 0.76, 0.44, 0.32]
+  const randomForCharacter = index => {
+    let draw = index
+    return () => draws[draw++ % draws.length]
+  }
+  const plans = presets.map(([label, overrides]) => ({
+    label,
+    steps: typingPreviewSteps({ ...TYPING_EXAMPLE_SETTINGS, ...overrides }, sample, randomForCharacter),
+  }))
+  if (values !== undefined) plans.unshift({
+    label: 'Your settings',
+    steps: typingPreviewSteps(values, sample, randomForCharacter),
+  })
+  return plans
 }
 
 const KEY_MODIFIER_BITS = { alt: 1, ctrl: 2, control: 2, meta: 4, cmd: 4, command: 4, super: 4, shift: 8 }
@@ -403,7 +511,7 @@ async function typeCharacter(target, char, prevChar, baseDelayMs, settings, sign
       windowsVirtualKeyCode: mapping.vk, nativeVirtualKeyCode: mapping.vk,
     })
     try {
-      await delay(Math.round(randomBetween(settings.keyHoldMinMs, settings.keyHoldMinMs + settings.keyHoldVariationMs)), signal ?? new AbortController().signal)
+      await delay(keyHoldMs(settings), signal ?? new AbortController().signal)
       signal?.throwIfAborted()
       await debuggerCommand(target, 'Input.dispatchKeyEvent', {
         type: 'char', key: mapping.key, code: mapping.code, modifiers,
@@ -1096,7 +1204,7 @@ function stopReconnect() {
 
 /**
  * Re-pair automatically after an unexpected session loss (host restart, expired
- * token, network drop), on Chrome startup when autoConnect is enabled, or when the
+ * token, network drop), on Chrome startup or extension load when enabled, or when the
  * user clicks Connect. Uses the saved origin and code without creating a tab.
  */
 async function attemptAutoReconnect() {
@@ -1202,7 +1310,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     keypress: { method: 'page.keypress', required: ['key'], allowed: ['key'] },
     mouse_move: { method: 'page.mouseMove', required: [], allowed: ['selector', 'x', 'y'] },
     drag: { method: 'page.drag', required: [], allowed: ['fromSelector', 'toSelector', 'fromX', 'fromY', 'toX', 'toY', 'durationMs'] },
-    scroll: { method: 'page.scroll', required: [], allowed: ['selector', 'deltaX', 'deltaY'] },
+    scroll: { method: 'page.scroll', required: [], allowed: ['selector', 'frameId', 'containerSelector', 'deltaX', 'deltaY'] },
     navigate: { method: 'page.navigate', required: ['url'], allowed: ['url'] },
     back: { method: 'page.back', required: [], allowed: [] },
     forward: { method: 'page.forward', required: [], allowed: [] },
@@ -1246,8 +1354,8 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     for (const key of spec.allowed) {
       const value = stepParams[key]
       if (value === undefined) continue
-      const expected = ['x', 'y', 'fromX', 'fromY', 'toX', 'toY'].includes(key) ? 'number'
-        : ['delayMs', 'timeoutMs', 'maxChars', 'maxItems', 'durationMs', 'pollIntervalMs', 'index'].includes(key) ? 'integer'
+      const expected = ['x', 'y', 'fromX', 'fromY', 'toX', 'toY', 'deltaX', 'deltaY'].includes(key) ? 'number'
+        : ['delayMs', 'timeoutMs', 'maxChars', 'maxItems', 'durationMs', 'pollIntervalMs', 'index', 'frameId'].includes(key) ? 'integer'
             : 'string'
       const valid = expected === 'integer' ? Number.isSafeInteger(value)
         : expected === 'number' ? Number.isFinite(value)
@@ -1270,11 +1378,10 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
       }
     }
     if (step.action === 'scroll') {
-      const hasSelector = stepParams.selector !== undefined
-      const hasDelta = stepParams.deltaX !== undefined || stepParams.deltaY !== undefined
-      if (hasSelector === hasDelta) throw new Error('Sequence scroll step ' + String(index + 1) + ' requires a selector or scroll deltas')
-      if ([stepParams.deltaX, stepParams.deltaY].some(value => value !== undefined && Math.abs(value) > 10_000)) {
-        throw new Error('Sequence scroll step ' + String(index + 1) + ' has out-of-range deltas')
+      try {
+        validateScrollParams(stepParams)
+      } catch (error) {
+        throw new Error('Sequence scroll step ' + String(index + 1) + ': ' + error.message)
       }
     }
     if (step.action === 'drag') {
@@ -1313,7 +1420,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
         throw new Error('Sequence wait_for_element step ' + String(index + 1) + ' has out-of-range timing')
       }
     }
-    if (['click', 'type_human', 'type_fast', 'fill', 'paste', 'get_html', 'scroll', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
+    if (['click', 'type_human', 'type_fast', 'fill', 'paste', 'get_html', 'focus', 'blur', 'select', 'extract', 'mouse_move'].includes(step.action)
       && stepParams.selector !== undefined) {
       requireCssSelector(stepParams.selector)
     }
@@ -1384,11 +1491,16 @@ async function ensureClipboardOffscreen() {
  * runs in the active tab: readText when the document is focused, with an
  * execCommand('paste') fallback into a hidden textarea.
  */
-async function readClipboardFromActiveTab() {
+async function readClipboardFromActiveTab(policy, signal) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
   if (tab?.id === undefined) throw new Error('No active tab to read the clipboard from')
+  const read = () => readClipboardFromTab(tab.id)
+  return policy.mode === 'off' ? read() : withDomainTabAccess(tab.id, policy, signal, read)
+}
+
+async function readClipboardFromTab(tabId) {
   const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     func: async () => {
       const hasFocus = document.hasFocus()
       let text = ''
@@ -1421,13 +1533,14 @@ async function readClipboardFromActiveTab() {
   return { ok: true, text: value.text, totalChars: value.text.length, fallback: value.usedFallback }
 }
 
-async function clipboardOperation(action, text) {
+async function requireClipboardAccess() {
   if (!(await clipboardAccessAllowed())) {
     throw new Error('Clipboard access is disabled. Enable it in the extension Settings page after acknowledging the risks.')
   }
-  // Reads must run in a focused document; the offscreen document can never be
-  // focused, so readText there always fails with "Document is not focused".
-  if (action === 'read') return readClipboardFromActiveTab()
+}
+
+async function clipboardOperation(action, text) {
+  await requireClipboardAccess()
   await ensureClipboardOffscreen()
   const response = await chrome.runtime.sendMessage({ dshClipboard: true, action, text })
   if (!isRecord(response) || response.ok !== true) {
@@ -1460,6 +1573,158 @@ async function dispatchClickAt(target, tabId, x, y) {
   })
 }
 
+const FORM_REVIEW_TTL_MS = 120_000
+const formReviews = new Map()
+
+// Restoring a pairing from Chrome storage creates a new object for the same session.
+function sameFormReviewPairing(left, right) {
+  return Boolean(left && right && left.origin === right.origin && left.sessionToken === right.sessionToken)
+}
+
+async function runFormReview(method, params, signal, policy) {
+  const tabId = requireTabId(params.tabId)
+  const prepare = method === 'page.formReviewPrepare'
+  const session = activeSession
+  const now = Date.now()
+  const stale = reason => ({ status: 'stale', reason: reason + ' Request a fresh review.' })
+  for (const [id, review] of formReviews) {
+    if (id !== params.reviewId && (review.expires <= now || !sameFormReviewPairing(review.session, session))) formReviews.delete(id)
+  }
+  if (!session) return stale('The browser pairing is no longer active.')
+  if (prepare && formReviews.size >= 32) throw new Error('Too many pending form reviews')
+  const reviewId = prepare ? crypto.randomUUID() : params.reviewId
+  const review = formReviews.get(reviewId)
+  if (!prepare) {
+    if (!review || review.tabId !== tabId) return stale('The extension no longer holds this pending review.')
+    formReviews.delete(reviewId)
+    if (!sameFormReviewPairing(review.session, session)) return stale('The browser pairing changed.')
+    if (review.expires <= now) return stale('The review expired before the click.')
+  }
+
+  const selectors = prepare ? params.previewSelectors : []
+  const validSelector = value => typeof value === 'string' && value.trim() !== '' && value.length <= 512
+  if (prepare && (!validSelector(params.buttonSelector) || !Array.isArray(selectors)
+    || selectors.length > 8 || !selectors.every(validSelector))) {
+    throw new Error('Provide a button selector and up to eight preview selectors')
+  }
+  const tab = await chrome.tabs.get(tabId).catch(() => null)
+  if (!tab || tab.pendingUrl || !/^https?:\/\//u.test(tab.url ?? '') || !tabDomainAllows(policy, tab)) return stale('The tab is unavailable, navigating, or blocked by the domain filter.')
+  if (!prepare) {
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => null)
+    if (tab.url !== review.url) return stale('The tab URL changed.')
+    if (!frame?.documentId) return stale('Chrome could no longer identify the reviewed document.')
+    if (frame.documentId !== review.documentId) return stale('The reviewed document was replaced.')
+  }
+  signal?.throwIfAborted()
+  if (!sameFormReviewPairing(activeSession, session)) return stale('The browser pairing changed.')
+  const expires = prepare ? now + FORM_REVIEW_TTL_MS : review.expires
+  const [injection] = await chrome.scripting.executeScript({
+    target: prepare ? { tabId, frameIds: [0] } : { tabId, documentIds: [review.documentId] },
+    world: 'ISOLATED',
+    func: formReviewPayload,
+    args: [prepare, reviewId, expires, tab.url, prepare ? params.buttonSelector : null, selectors],
+  })
+  if (!prepare) {
+    if (!injection) return { status: 'unverified', reason: 'Inspect the tab before attempting another click.' }
+    if (injection.result?.status === 'dispatched') return injection.result
+    return stale(injection.result?.reason ?? 'The reviewed document could no longer be checked.')
+  }
+  if (!sameFormReviewPairing(activeSession, session) || !injection?.documentId || !injection.result?.fields) {
+    throw new Error('Could not stage the top-level form')
+  }
+  formReviews.set(reviewId, { tabId, documentId: injection.documentId, url: tab.url, session, expires })
+  return { reviewId, ...injection.result }
+}
+
+/** Capture and compare in Chrome's isolated world. Raw comparison values stay in the document. */
+function formReviewPayload(prepare, id, expires, expectedUrl, buttonSelector, selectors) {
+  const stale = reason => ({ status: 'stale', reason })
+  if (window !== window.top || location.href !== expectedUrl) return stale('The document or URL changed.')
+  if (Date.now() >= expires) return stale('The review expired before the document check.')
+  const reviews = globalThis.__dshFormReviews ??= new Map()
+  const pack = element => JSON.stringify([
+    element.outerHTML,
+    element.value, element.checked, element.indeterminate, element.matches(':disabled'),
+    element instanceof HTMLSelectElement ? [...element.options].map(option => option.selected) : null,
+  ])
+  const ready = button => button.isConnected && !button.matches(':disabled, [aria-disabled="true"]')
+    && !button.closest('[inert], [hidden]') && button.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+  const formTarget = (form, button) => JSON.stringify([
+    form.action, form.method, form.enctype, form.target, form.noValidate,
+    button.formAction, button.formMethod, button.formEnctype, button.formTarget, button.formNoValidate,
+    form.getAttribute('action'), button.getAttribute('formaction'),
+  ])
+  if (!prepare) {
+    const draft = reviews.get(id)
+    if (!draft) return stale('The document no longer holds its review snapshot.')
+    draft.clear()
+    const { button, form, controls, state, target, selector } = draft
+    const matches = document.querySelectorAll(selector)
+    if (matches.length !== 1 || matches[0] !== button || button.form !== form) {
+      return stale('The pending button or its form was replaced.')
+    }
+    if (!ready(button)) return stale('The pending button is no longer available.')
+    if (formTarget(form, button) !== target) return stale('The form submission settings changed.')
+    if (pack(button) !== draft.buttonState) return stale('The pending button changed.')
+    const current = [...form.elements]
+    if (current.length !== controls.length || current.some((control, index) => control !== controls[index])) {
+      return stale('The set of form controls changed.')
+    }
+    if (current.some((control, index) => pack(control) !== state[index]
+      || (control.type === 'file' && control.files?.length))) return stale('A form control value, state, or markup changed.')
+    // Compare and dispatch in the same document task so another DOM task cannot intervene.
+    HTMLElement.prototype.click.call(button)
+    return { status: 'dispatched' }
+  }
+
+  const matches = document.querySelectorAll(buttonSelector)
+  const button = matches[0]
+  if (matches.length !== 1 || !(button instanceof HTMLButtonElement || button instanceof HTMLInputElement)
+    || !['button', 'submit'].includes(button.type) || !button.form || !ready(button)) return null
+  const form = button.form
+  const controls = [...form.elements]
+  if (controls.length > 200 || controls.some(control => control.type === 'file' && control.files?.length)) return null
+
+  const shorten = (value, max) => String(value ?? '').trim().slice(0, max)
+  const labelFor = field => [...(field.labels ?? [])].map(label => label.textContent).join(' ').trim()
+    || field.getAttribute('aria-label') || field.name || field.id || 'Field'
+  const fields = []
+  for (const selector of new Set(selectors)) {
+    const matches = document.querySelectorAll(selector)
+    const field = matches[0]
+    if (matches.length !== 1 || field.form !== form) return null
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement || field instanceof HTMLSelectElement)
+      || ['hidden', 'file', 'submit', 'reset', 'button', 'image'].includes(field.type)
+      || !field.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue
+    const label = labelFor(field)
+    const hints = [label, field.name, field.id, field.autocomplete, field.placeholder, field.type].join(' ')
+    const sensitive = /password|password|passcode|otp|one.?time|verification.?code|security.?code|token|secret|cc-|credit.?card|card.?(?:num|exp|name)|cv[cv]|csc|social.?security|ssn|\bpin\b/iu.test(hints)
+    const value = sensitive ? '[masked]' : ['checkbox', 'radio'].includes(field.type) ? String(field.checked)
+      : field instanceof HTMLSelectElement ? [...field.selectedOptions].map(option => option.label).join(', ') : field.value
+    fields.push({ label: shorten(label, 80), value: shorten(value, 160) })
+  }
+
+  const state = controls.map(pack)
+  const buttonState = pack(button)
+  if (state.reduce((length, control) => length + control.length, buttonState.length) > 128_000) return null
+  const clear = () => {
+    reviews.delete(id)
+    window.removeEventListener('pagehide', clear)
+    clearTimeout(timer)
+  }
+  const timer = setTimeout(clear, Math.max(0, expires - Date.now()))
+  window.addEventListener('pagehide', clear, { once: true })
+  reviews.set(id, {
+    button, form, controls, selector: buttonSelector, buttonState, state, target: formTarget(form, button), clear,
+  })
+  return {
+    title: shorten(document.title, 120),
+    origin: location.origin,
+    button: shorten(button.getAttribute('aria-label') || button.textContent || button.value, 120) || 'Form button',
+    fields,
+  }
+}
+
 function executeBrowserOperation(method, params, signal) {
   const tabId = Number.isSafeInteger(params?.tabId) ? params.tabId : undefined
   if (tabId === undefined) return executeBrowserOperationNow(method, params, signal)
@@ -1477,7 +1742,19 @@ function executeBrowserOperation(method, params, signal) {
 }
 
 async function executeBrowserOperationNow(method, params, signal) {
+  const policy = await getDomainFilter()
+  if (policy.mode === 'off' || !Number.isSafeInteger(params.tabId)) {
+    return dispatchBrowserOperation(method, params, signal, policy)
+  }
+  return withDomainTabAccess(params.tabId, policy, signal, guardedSignal =>
+    dispatchBrowserOperation(method, params, guardedSignal, policy), method === 'tabs.close')
+}
+
+async function dispatchBrowserOperation(method, params, signal, policy) {
   switch (method) {
+    case 'page.formReviewPrepare':
+    case 'page.formReviewClick':
+      return runFormReview(method, params, signal, policy)
     case 'page.sequence': {
       const settings = await getBehaviorSettings()
       const sequence = normalizeSequenceCommand(params, settings.sequenceDelayMs)
@@ -1597,10 +1874,15 @@ async function executeBrowserOperationNow(method, params, signal) {
       await chrome.downloads.cancel(params.downloadId)
       return { downloadId: params.downloadId, cancelled: true }
     case 'tabs.list':
-      return { tabs: await getTabs() }
+      return { tabs: await getTabs(policy) }
     case 'tabs.open': {
       const url = httpUrl(params.url)
-      const tab = await chrome.tabs.create({ url, active: params.active !== false })
+      requireDomainAccess(policy, url)
+      let tab = await chrome.tabs.create({ url, active: params.active !== false })
+      if (policy.mode !== 'off') {
+        tab = await navigateTabAndWait(tab.id, url, signal, true)
+        requireTabDomainAccess(policy, tab)
+      }
       return { tabId: tab.id, url: tab.url ?? url, title: tab.title ?? '' }
     }
     case 'tabs.activate': {
@@ -1617,11 +1899,147 @@ async function executeBrowserOperationNow(method, params, signal) {
       const tabId = requireTabId(params.tabId)
       return listFrames(tabId)
     }
+    case 'page.workbookStatus': {
+      const tabId = requireTabId(params.tabId)
+      const requestedFrameId = params.frameId === undefined ? undefined : requireFrameId(params.frameId)
+      const workbook = await resolveWorkbookFrame(tabId, requestedFrameId)
+      const state = workbook.state
+      return {
+        tabId,
+        frameId: workbook.frameId,
+        provider: state.provider,
+        capabilities: {
+          canReadStatus: state.recognized === true,
+          canNavigate: state.nameBoxReady === true && typeof state.activeSheetName === 'string' && state.editing !== true,
+          canConfirmSelection: state.nameBoxReady === true,
+        },
+        sheet: { activeName: state.activeSheetName ?? null },
+        editGuard: state.editGuard ?? null,
+        focusedControl: state.focusedControl ?? null,
+        editButtons: state.editButtons ?? null,
+        nameBox: {
+          address: state.address ?? null,
+          focused: state.focused === true,
+          ready: state.nameBoxReady === true,
+        },
+      }
+    }
+    case 'page.workbookNavigate': {
+      const tabId = requireTabId(params.tabId)
+      const requestedFrameId = params.frameId === undefined ? undefined : requireFrameId(params.frameId)
+      const parsedAddress = requireExcelA1Address(params.address)
+      if (params.sheetName !== undefined
+        && (typeof params.sheetName !== 'string' || params.sheetName.length < 1 || params.sheetName.length > 31)) {
+        throw new Error('sheetName must be a non-empty Excel sheet name of at most 31 characters')
+      }
+      const requestedSheetName = params.sheetName
+      const tab = await chrome.tabs.get(tabId)
+      if (tab.active !== true) throw new Error('Activate the target workbook tab before navigating')
+      return withDebugger(tabId, async target => {
+        signal?.throwIfAborted()
+        const workbook = await resolveWorkbookFrame(tabId, requestedFrameId)
+        const frameId = workbook.frameId
+        let expectedSheetName = workbook.state.activeSheetName
+        if (typeof expectedSheetName !== 'string' || expectedSheetName === '') {
+          throw new Error('The active sheet name is unavailable')
+        }
+        if (requestedSheetName !== undefined) {
+          if (requestedSheetName.toLowerCase() !== expectedSheetName.toLowerCase()) {
+            throw new Error('The requested sheet does not match the active Excel sheet; sheet switching is not supported')
+          }
+          expectedSheetName = requestedSheetName
+        }
+
+        let state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        requireWorkbookNavigationReady(state)
+        if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
+          throw new Error('The active sheet changed before navigation could start')
+        }
+        if (state.editing === true) {
+          throw workbookNavigationEditError(state)
+        }
+        const initialAddress = state.address
+        if (typeof initialAddress !== 'string' || initialAddress === '') {
+          throw new Error('The current workbook selection is unavailable in the name box')
+        }
+
+        if (workbook.state.provider === 'google-sheets') {
+          const preflight = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload,
+            ['locate', expectedSheetName, initialAddress], 'MAIN')
+          requireWorkbookNavigationReady(preflight)
+          const point = preflight.nameBoxPoint
+          if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
+            throw new Error('The Google Sheets name box has no clickable point')
+          }
+          signal?.throwIfAborted()
+          await dispatchClickAt(target, tabId, point.x, point.y)
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        } else {
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload,
+            ['focus', expectedSheetName, initialAddress], 'MAIN')
+        }
+        requireWorkbookNavigationFocused(state, expectedSheetName)
+        if (state.address !== initialAddress) {
+          throw new Error('The workbook selection changed before the name box was focused')
+        }
+
+        signal?.throwIfAborted()
+        await pressKey(target, { key: 'a', code: 'KeyA', virtualKey: 65, modifiers: 2 })
+        state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        requireWorkbookNavigationFocused(state, expectedSheetName)
+        if (state.address !== initialAddress) {
+          throw new Error('The workbook name box changed before address entry; Enter was not pressed')
+        }
+        if (state.selectionRangeAvailable === true
+          && (state.selectionStart !== 0 || state.selectionEnd !== initialAddress.length)) {
+          throw new Error('Ctrl+A did not select the complete workbook name-box value; Enter was not pressed')
+        }
+        let typedPrefix = ''
+        let previousCharacter = ''
+        for (const character of parsedAddress.address) {
+          signal?.throwIfAborted()
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+          requireWorkbookNavigationFocused(state, expectedSheetName)
+          if (state.address !== (typedPrefix === '' ? initialAddress : typedPrefix)) {
+            throw new Error('The workbook name box changed during navigation; Enter was not pressed')
+          }
+          await typeCharacter(target, character, previousCharacter, 0, FAST_TYPE_SETTINGS, signal)
+          typedPrefix += character
+          previousCharacter = character
+          state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+          requireWorkbookNavigationFocused(state, expectedSheetName)
+          if (state.address !== typedPrefix) {
+            throw new Error('The workbook name box lost the requested address during entry; Enter was not pressed')
+          }
+        }
+
+        signal?.throwIfAborted()
+        state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+        requireWorkbookNavigationFocused(state, expectedSheetName)
+        if (state.address !== parsedAddress.address) {
+          throw new Error('The workbook name box does not contain the requested address; Enter was not pressed')
+        }
+        await pressKey(target, KEYS.Enter)
+        return settleWorkbookNavigation(tabId, frameId, expectedSheetName, parsedAddress, signal)
+      })
+    }
     case 'page.workbookValues': {
       const tabId = requireTabId(params.tabId)
       const frameId = requireFrameId(params.frameId)
+      if (params.address !== undefined && typeof params.address !== 'string') {
+        throw new Error('address must be an A1 cell or rectangle string')
+      }
+      if (params.sheetName !== undefined && typeof params.sheetName !== 'string') {
+        throw new Error('sheetName must be a string')
+      }
+      const frame = await chrome.webNavigation.getFrame({ tabId, frameId })
+      if (frameId === 0 && isGoogleSheetsUrl(frame?.url)) {
+        throw new Error('Google Sheets supports workbook status and navigation. Workbook range reads are currently available only for Excel Online.')
+      }
+      if (!isExcelAppFrameUrl(frame?.url)) throw new Error('The requested frame is not an Excel Online workbook frame')
+      signal?.throwIfAborted()
       const payload = await runInFrame(tabId, frameId, frameWorkbookValuesPayload,
-        [MAX_WORKBOOK_CELLS, MAX_WORKBOOK_RESULT_CHARS], 'MAIN')
+        [MAX_WORKBOOK_CELLS, MAX_WORKBOOK_RESULT_CHARS, params.address ?? null, params.sheetName ?? null], 'MAIN')
       if (!isRecord(payload)) throw new Error('The frame returned no workbook data')
       if (typeof payload.error === 'string') throw new Error(payload.error)
       return { tabId, frameId, ...payload }
@@ -1642,15 +2060,20 @@ async function executeBrowserOperationNow(method, params, signal) {
       }
       if (action === 'start') requireCssSelector(selector, 'The watch selector')
       if (labelSelector !== null) requireCssSelector(labelSelector, 'The label selector')
-      const clear = params.clear === true
-      const func = action === 'start' ? frameElementWatchStartPayload
-        : action === 'stop' ? frameElementWatchStopPayload
-          : frameElementWatchReadPayload
-      const args = action === 'start' ? [selector, labelSelector] : [clear]
-      const payload = await runInFrame(tabId, frameId, func, args, 'MAIN')
+      const watchId = params.watchId
+      if (watchId !== undefined && (typeof watchId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(watchId))) {
+        throw new Error('watchId must be 1 to 64 letters, numbers, underscores, or hyphens, starting with a letter or number')
+      }
+      const payload = await runInFrame(tabId, frameId, frameElementWatchPayload, [{
+        action,
+        watchId: watchId ?? null,
+        selector: action === 'start' ? selector : null,
+        labelSelector: action === 'start' ? labelSelector : null,
+        clear: params.clear === true,
+      }])
       if (!isRecord(payload)) throw new Error('The frame returned no element watch result')
       if (typeof payload.error === 'string') throw new Error(payload.error)
-      return { tabId, frameId, action, ...payload }
+      return { tabId, frameId, action, ...(watchId === undefined ? {} : { watchId }), ...payload }
     }
     case 'page.workbookProbe': {
       const tabId = requireTabId(params.tabId)
@@ -1720,7 +2143,9 @@ async function executeBrowserOperationNow(method, params, signal) {
     case 'page.navigate': {
       const tabId = requireTabId(params.tabId)
       const url = httpUrl(params.url)
+      requireDomainAccess(policy, url)
       const tab = await navigateTabAndWait(tabId, url, signal)
+      requireTabDomainAccess(policy, tab)
       return { tabId, url: tab.url ?? url, title: tab.title ?? '', loaded: true }
     }
     case 'page.back':
@@ -1728,7 +2153,8 @@ async function executeBrowserOperationNow(method, params, signal) {
     case 'page.reload': {
       const tabId = requireTabId(params.tabId)
       const action = method === 'page.back' ? 'back' : method === 'page.forward' ? 'forward' : 'reload'
-      const { tab, navigationObserved, navigationMethod } = await historyTabAndWait(tabId, action, signal)
+      const { tab, navigationObserved, navigationMethod } = await historyTabAndWait(tabId, action, signal, policy)
+      requireTabDomainAccess(policy, tab)
       return {
         tabId,
         action,
@@ -1893,13 +2319,14 @@ async function executeBrowserOperationNow(method, params, signal) {
       throw new Error('Timed out waiting for the selected element to change')
     }
     case 'page.elementNotes':
-      return readElementNotes(params)
+      return readElementNotes(params, policy)
     case 'page.poiList':
-      return readPois(params)
+      return readPois(params, policy)
     case 'page.poiClick':
       return clickSavedPoi(params)
     case 'page.clipboardRead': {
-      const response = await clipboardOperation('read')
+      await requireClipboardAccess()
+      const response = await readClipboardFromActiveTab(policy, signal)
       let text = typeof response.text === 'string' ? response.text : ''
       const totalChars = typeof response.totalChars === 'number' ? response.totalChars : text.length
       const truncated = totalChars > MAX_CLIPBOARD_TEXT_CHARS
@@ -2196,20 +2623,23 @@ async function executeBrowserOperationNow(method, params, signal) {
         }
       })
     }
-    case 'page.scroll': {
+    case 'page.scroll':
+    case 'page.scrollTarget': {
       const tabId = requireTabId(params.tabId)
-      const hasSelector = params.selector !== undefined
-      const hasDelta = params.deltaX !== undefined || params.deltaY !== undefined
-      if (hasSelector === hasDelta) throw new Error('Provide a selector or one or both scroll deltas')
-      if (params.selector !== undefined) requireCssSelector(params.selector)
+      validateScrollParams(params)
       const deltaX = params.deltaX ?? 0
       const deltaY = params.deltaY ?? 0
-      if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)
-        || Math.abs(deltaX) > 10_000 || Math.abs(deltaY) > 10_000) {
-        throw new Error('Scroll deltas must be between -10000 and 10000')
+      if (params.frameId !== undefined || params.containerSelector !== undefined) {
+        const frameId = params.frameId ?? 0
+        const result = await runInFrame(tabId, frameId, scrollFramePayload, [
+          params.selector ?? null, params.containerSelector ?? null, deltaX, deltaY,
+        ])
+        if (!isRecord(result)) throw new Error('The frame returned no scroll result')
+        if (result.error) throw new Error(result.error)
+        return { tabId, frameId, ...result }
       }
       return withDebugger(tabId, async target => {
-        if (hasSelector) {
+        if (params.selector !== undefined) {
           const nodeId = await querySelectorNode(target, params.selector)
           const info = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
           if (!isRecord(info) || info.visible !== true) {
@@ -2558,10 +2988,58 @@ async function executeBrowserOperationNow(method, params, signal) {
   }
 }
 
-async function getTabs() {
+async function getDomainFilter() {
+  await ensureTrustedLocalStorage()
+  const stored = (await chrome.storage.local.get(DOMAIN_FILTER_KEY))[DOMAIN_FILTER_KEY]
+  if (stored === undefined || stored?.mode === 'off') return { mode: 'off', domains: [] }
+  if (['whitelist', 'blacklist'].includes(stored?.mode) && Array.isArray(stored.domains)
+    && stored.domains.every(domain => typeof domain === 'string' && domain !== '')) return stored
+  throw new Error('The browser domain filter is invalid. Save it again in the extension Settings.')
+}
+
+function requireDomainAccess(policy, url) {
+  if (!domainFilterAllows(policy, url)) throw domainFilterError(policy)
+}
+
+function domainFilterError(policy) {
+  return new Error('Blocked by the browser domain filter (' + policy.mode + '). Ask the user to review the extension Settings if this tab is needed.')
+}
+
+function tabDomainAllows(policy, tab) {
+  return domainFilterAllows(policy, tab.url) && (!tab.pendingUrl || domainFilterAllows(policy, tab.pendingUrl))
+}
+
+function requireTabDomainAccess(policy, tab) {
+  if (!tabDomainAllows(policy, tab)) throw domainFilterError(policy)
+}
+
+async function withDomainTabAccess(tabId, policy, signal, operation, closesTab = false) {
+  const controller = new AbortController()
+  const guardedSignal = signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal])
+  const onCommitted = ({ tabId: changedTabId, frameId, url, documentLifecycle }) => {
+    if (changedTabId !== tabId || frameId !== 0 || (documentLifecycle && documentLifecycle !== 'active')) return
+    if (!domainFilterAllows(policy, url)) controller.abort(domainFilterError(policy))
+  }
+  chrome.webNavigation.onCommitted.addListener(onCommitted)
+  try {
+    requireTabDomainAccess(policy, await chrome.tabs.get(tabId))
+    guardedSignal.throwIfAborted()
+    const result = await operation(guardedSignal)
+    if (!closesTab) requireTabDomainAccess(policy, await chrome.tabs.get(tabId))
+    guardedSignal.throwIfAborted()
+    return result
+  } catch (error) {
+    controller.signal.throwIfAborted()
+    throw error
+  } finally {
+    chrome.webNavigation.onCommitted.removeListener(onCommitted)
+  }
+}
+
+async function getTabs(policy) {
   const tabs = await chrome.tabs.query({})
   return tabs
-    .filter(tab => Number.isInteger(tab.id))
+    .filter(tab => Number.isInteger(tab.id) && tabDomainAllows(policy, tab))
     .map(tab => ({
       tabId: tab.id,
       windowId: tab.windowId,
@@ -2590,7 +3068,7 @@ function httpUrl(value) {
   return url.href
 }
 
-function navigateTabAndWait(tabId, url, signal) {
+function navigateTabAndWait(tabId, url, signal, alreadyOpening = false) {
   signal?.throwIfAborted()
   return new Promise((resolve, reject) => {
     let sawLoading = false
@@ -2610,7 +3088,7 @@ function navigateTabAndWait(tabId, url, signal) {
     const onUpdated = (updatedTabId, changeInfo, tab) => {
       if (updatedTabId !== tabId) return
       if (changeInfo.status === 'loading') sawLoading = true
-      if (changeInfo.status === 'complete' && sawLoading) finish(undefined, tab)
+      if (changeInfo.status === 'complete' && (sawLoading || alreadyOpening)) finish(undefined, tab)
     }
     const onAbort = () => finish(signal.reason ?? new Error('Navigation cancelled'))
     const timer = setTimeout(() => finish(new Error('Navigation did not finish before timeout')), NAVIGATION_TIMEOUT_MS)
@@ -2620,15 +3098,16 @@ function navigateTabAndWait(tabId, url, signal) {
       onAbort()
       return
     }
-    chrome.tabs.update(tabId, { url }).then(tab => {
+    const navigation = alreadyOpening ? chrome.tabs.get(tabId) : chrome.tabs.update(tabId, { url })
+    navigation.then(tab => {
       // Same-URL updates and fast navigations may already be complete by the
       // time tabs.update resolves, before the loading/complete events are seen.
-      if (tab?.status === 'complete' && tab.url === url) finish(undefined, tab)
+      if (tab?.status === 'complete' && (alreadyOpening ? tab.url && !tab.pendingUrl : tab.url === url)) finish(undefined, tab)
     }, error => finish(error))
   })
 }
 
-function historyTabAndWait(tabId, action, signal) {
+function historyTabAndWait(tabId, action, signal, policy) {
   signal?.throwIfAborted()
   return chrome.tabs.get(tabId).then(before => new Promise((resolve, reject) => {
     let sawLoading = false
@@ -2669,8 +3148,12 @@ function historyTabAndWait(tabId, action, signal) {
       return
     }
     let operation
+    const guardedHistory = action !== 'reload' && policy.mode !== 'off'
     try {
-      operation = action === 'back' ? chrome.tabs.goBack(tabId)
+      if (guardedHistory) {
+        navigationMethod = 'cdp-history'
+        operation = navigateHistoryViaDebugger(tabId, action, policy, signal).then(() => { navigationObserved = true })
+      } else operation = action === 'back' ? chrome.tabs.goBack(tabId)
         : action === 'forward' ? chrome.tabs.goForward(tabId)
           : chrome.tabs.reload(tabId)
     } catch (error) {
@@ -2678,7 +3161,7 @@ function historyTabAndWait(tabId, action, signal) {
       return
     }
     Promise.resolve(operation).catch(async error => {
-      if (action === 'reload') throw error
+      if (action === 'reload' || guardedHistory) throw error
       try {
         const historyResult = await navigateHistoryViaDebugger(tabId, action)
         navigationObserved = true
@@ -2706,7 +3189,7 @@ function historyTabAndWait(tabId, action, signal) {
   }))
 }
 
-async function navigateHistoryViaDebugger(tabId, action) {
+async function navigateHistoryViaDebugger(tabId, action, policy = { mode: 'off' }, signal) {
   return withDebugger(tabId, async target => {
     await debuggerCommand(target, 'Page.enable').catch(() => {})
     const history = await debuggerCommand(target, 'Page.getNavigationHistory')
@@ -2718,6 +3201,8 @@ async function navigateHistoryViaDebugger(tabId, action) {
         ? 'No previous page exists in the tab navigation history'
         : 'No next page exists in the tab navigation history')
     }
+    requireDomainAccess(policy, entry.url)
+    signal?.throwIfAborted()
     await debuggerCommand(target, 'Page.navigateToHistoryEntry', { entryId: entry.id })
     return { targetUrl: entry.url, targetTitle: entry.title }
   })
@@ -2762,6 +3247,193 @@ function requireFrameId(value) {
   return value
 }
 
+function requireExcelA1Address(value) {
+  if (typeof value !== 'string' || value.length > 32) {
+    throw new Error('address must be an A1 cell or range such as A1 or B2:D9')
+  }
+  const match = /^\$?([A-Za-z]{1,3})\$?([1-9]\d{0,6})(?::\$?([A-Za-z]{1,3})\$?([1-9]\d{0,6}))?$/u.exec(value)
+  if (match === null) throw new Error('address must be an A1 cell or range such as A1 or B2:D9')
+  const columnIndex = letters => Array.from(letters.toUpperCase()).reduce(
+    (total, character) => total * 26 + character.charCodeAt(0) - 64, 0)
+  const firstColumn = columnIndex(match[1])
+  const firstRow = Number(match[2])
+  const lastColumn = match[3] === undefined ? firstColumn : columnIndex(match[3])
+  const lastRow = match[4] === undefined ? firstRow : Number(match[4])
+  if (firstColumn > 16_384 || lastColumn > 16_384 || firstRow > 1_048_576 || lastRow > 1_048_576
+    || firstColumn > lastColumn || firstRow > lastRow) {
+    throw new Error('address is outside Excel limits or has its range bounds reversed')
+  }
+  return { address: value, normalized: value.replace(/\$/gu, '').toUpperCase() }
+}
+
+function normalizeExcelAddress(value) {
+  return typeof value === 'string' ? value.replace(/\$/gu, '').toUpperCase() : ''
+}
+
+function sameExcelSheetName(left, right) {
+  return typeof left === 'string' && typeof right === 'string'
+    && left.toLowerCase() === right.toLowerCase()
+}
+
+async function resolveWorkbookFrame(tabId, requestedFrameId) {
+  const inspect = async frameId => {
+    const state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+    if (!isRecord(state)) throw new Error('The frame returned no workbook status')
+    return state
+  }
+  const frameList = await listFrames(tabId)
+  const mainFrame = frameList.frames.find(frame => frame.frameId === 0)
+  if (isGoogleSheetsUrl(mainFrame?.url)) {
+    if (requestedFrameId !== undefined && requestedFrameId !== 0) {
+      throw new Error('Google Sheets workbook tools use the top-level frame (frameId 0)')
+    }
+    const state = await inspect(0)
+    if (state.recognized !== true || state.provider !== 'google-sheets') {
+      throw new Error('The Google Sheets editor is unavailable in the top-level frame')
+    }
+    return { frameId: 0, state }
+  }
+  if (requestedFrameId !== undefined) {
+    const requestedFrame = frameList.frames.find(frame => frame.frameId === requestedFrameId)
+    if (requestedFrame === undefined || !isExcelAppFrameUrl(requestedFrame.url)) {
+      throw new Error('frameId must identify the Excel Online app frame on excel.officeapps.live.com')
+    }
+    const state = await inspect(requestedFrameId)
+    if (state.recognized !== true) throw new Error('No Excel Online workbook was found in the requested frame')
+    return { frameId: requestedFrameId, state }
+  }
+
+  const matches = []
+  for (const frame of frameList.frames) {
+    if (!isExcelAppFrameUrl(frame.url)) continue
+    try {
+      const state = await inspect(frame.frameId)
+      if (state.recognized === true) matches.push({ frameId: frame.frameId, state })
+    } catch {
+      // Some cross-origin or transient frames cannot be probed at this moment.
+    }
+  }
+  if (matches.length === 0) throw new Error('No Excel Online or Google Sheets workbook was found in the tab')
+  const contextMatches = matches.filter(match => match.state.hasWorkbookContext === true)
+  const candidates = contextMatches.length > 0 ? contextMatches : matches
+  if (candidates.length !== 1) {
+    throw new Error('More than one Excel workbook frame was found; provide frameId from page.frames')
+  }
+  return candidates[0]
+}
+
+function isGoogleSheetsUrl(value) {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.origin === 'https://docs.google.com'
+      && /^\/spreadsheets\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+\/edit\/?$/u.test(url.pathname)
+  } catch {
+    return false
+  }
+}
+
+function isExcelAppFrameUrl(value) {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:'
+      && url.hostname.toLowerCase() === 'excel.officeapps.live.com'
+      && url.pathname.toLowerCase().includes('xlviewerinternal.aspx')
+  } catch {
+    return false
+  }
+}
+
+function workbookNavigationEditError(state) {
+  const details = JSON.stringify({
+    editGuard: state.editGuard ?? null,
+    focusedControl: state.focusedControl ?? null,
+  })
+  return new Error('Workbook navigation stopped because focus is in an editable control. ' + details)
+}
+
+function requireWorkbookNavigationReady(state) {
+  if (!isRecord(state) || state.recognized !== true) {
+    throw new Error('The workbook frame is no longer available')
+  }
+  if (typeof state.error === 'string') {
+    if (state.editing === true) throw workbookNavigationEditError(state)
+    throw new Error(state.error)
+  }
+  if (state.nameBoxReady !== true) {
+    throw new Error('The workbook name box is unavailable, hidden, disabled, or read-only')
+  }
+}
+
+function requireWorkbookNavigationFocused(state, expectedSheetName) {
+  requireWorkbookNavigationReady(state)
+  if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
+    throw new Error('The active sheet changed during navigation; Enter was not pressed')
+  }
+  if (state.editing === true) throw workbookNavigationEditError(state)
+  if (state.documentFocused !== true || state.focused !== true) {
+    throw new Error('The workbook name box lost focus during navigation; Enter was not pressed')
+  }
+}
+
+async function settleWorkbookNavigation(tabId, frameId, expectedSheetName, parsedAddress, signal) {
+  const deadline = Date.now() + EXCEL_NAVIGATION_SETTLE_TIMEOUT_MS
+  let previousKey
+  let stableSamples = 0
+  let lastState
+  let readError
+  while (Date.now() < deadline) {
+    signal?.throwIfAborted()
+    try {
+      const state = await runInFrame(tabId, frameId, frameWorkbookNavigationPayload, ['inspect'], 'MAIN')
+      if (!isRecord(state) || state.recognized !== true) {
+        readError = 'The Excel workbook frame stopped responding after Enter'
+        break
+      }
+      lastState = state
+      if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
+        readError = 'The active sheet changed before the selection could be confirmed'
+        break
+      }
+      if (state.nameBoxReady === true && state.documentFocused === true && state.focused !== true
+        && normalizeExcelAddress(state.address) === parsedAddress.normalized) {
+        const key = state.activeSheetName + '\u0000' + normalizeExcelAddress(state.address)
+        stableSamples = key === previousKey ? stableSamples + 1 : 1
+        previousKey = key
+        if (stableSamples >= 3) {
+          return {
+            tabId,
+            frameId,
+            requested: { sheetName: expectedSheetName, address: parsedAddress.address },
+            confirmed: true,
+            selection: { sheetName: state.activeSheetName, address: state.address },
+            confirmationSignal: 'stable-name-box-address-after-enter',
+          }
+        }
+      } else {
+        stableSamples = 0
+        previousKey = undefined
+      }
+    } catch {
+      readError = 'The workbook selection could not be re-read after Enter'
+      break
+    }
+    await delay(EXCEL_NAVIGATION_POLL_MS, signal ?? new AbortController().signal)
+  }
+  return {
+    tabId,
+    frameId,
+    requested: { sheetName: expectedSheetName, address: parsedAddress.address },
+    confirmed: false,
+    reason: readError ?? 'Excel did not expose a stable name-box selection matching the requested address',
+    selection: lastState === undefined
+      ? null
+      : { sheetName: lastState.activeSheetName ?? null, address: lastState.address ?? null },
+    confirmationSignal: 'name-box-readback-unconfirmed',
+  }
+}
+
 /** List every frame of a tab, including cross-origin frames, via an all-frames script probe. */
 async function listFrames(tabId) {
   const results = await chrome.scripting.executeScript({
@@ -2796,6 +3468,58 @@ async function runInFrame(tabId, frameId, func, args, world = 'ISOLATED') {
   const first = results[0]
   if (first === undefined) throw new Error('The frame returned no result')
   return first.result
+}
+
+function validateScrollParams({ selector, containerSelector, frameId, deltaX, deltaY }) {
+  const hasDeltas = deltaX !== undefined || deltaY !== undefined
+  if ((selector !== undefined) === hasDeltas) throw new Error('Provide a selector or one or both scroll deltas')
+  if (containerSelector !== undefined && !hasDeltas) throw new Error('containerSelector requires scroll deltas')
+  if (selector !== undefined) requireCssSelector(selector)
+  if (containerSelector !== undefined) requireCssSelector(containerSelector, 'The scroll container CSS selector')
+  if (frameId !== undefined) requireFrameId(frameId)
+  if ([deltaX, deltaY].some(value => value !== undefined && (!Number.isFinite(value) || Math.abs(value) > 10_000))) {
+    throw new Error('Scroll deltas must be between -10000 and 10000')
+  }
+}
+
+/** Runs inside the selected frame, so geometry and scroll offsets are frame-local. */
+function scrollFramePayload(selector, containerSelector, deltaX, deltaY) {
+  const query = selector ?? containerSelector
+  let target
+  if (query !== null) {
+    let matches
+    try {
+      matches = document.querySelectorAll(query)
+    } catch {
+      return { error: 'The CSS selector is invalid' }
+    }
+    if (matches.length !== 1) return { error: 'The scroll selector must match exactly one element in the selected frame' }
+    target = matches[0]
+  }
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+  if (selector !== null) {
+    target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+    const rect = target.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0
+      || rect.left >= viewportWidth || rect.top >= viewportHeight) {
+      return { error: 'The selected element could not be brought into the frame viewport' }
+    }
+    return {
+      scrolled: true, selector, viewportWidth, viewportHeight,
+      x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
+    }
+  }
+  const scroller = target ?? window
+  const beforeX = target?.scrollLeft ?? window.scrollX
+  const beforeY = target?.scrollTop ?? window.scrollY
+  scroller.scrollBy({ left: deltaX, top: deltaY, behavior: 'instant' })
+  const x = target?.scrollLeft ?? window.scrollX
+  const y = target?.scrollTop ?? window.scrollY
+  return {
+    scrolled: true, moved: x !== beforeX || y !== beforeY, x, y,
+    ...(containerSelector === null ? { width: viewportWidth, height: viewportHeight } : { containerSelector }),
+  }
 }
 
 /** Sample an element or manage its change history in Chrome's isolated world. */
@@ -3006,7 +3730,7 @@ function updatePoi(draft, action, text, area) {
   })
 }
 
-async function readPois(params) {
+async function readPois(params, policy) {
   const offset = params.offset ?? 0
   const limit = params.limit ?? 10
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
@@ -3016,7 +3740,7 @@ async function readPois(params) {
   let tabId
   let all
   if (scope === 'all') {
-    all = collectPois(await readPoiStore())
+    all = collectPois(await readPoiStore()).filter(point => domainFilterAllows(policy, point.pageUrl))
   } else {
     tabId = requireTabId(params.tabId)
     const tab = await chrome.tabs.get(tabId)
@@ -3703,7 +4427,7 @@ async function readNoteStore() {
   return isRecord(stored) ? stored : {}
 }
 
-async function readElementNotes(params) {
+async function readElementNotes(params, policy) {
   const offset = params.offset ?? 0
   const limit = params.limit ?? 10
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('offset must be a nonnegative integer')
@@ -3713,7 +4437,7 @@ async function readElementNotes(params) {
   let tabId
   let all
   if (scope === 'all') {
-    all = collectElementNotes(await readNoteStore())
+    all = collectElementNotes(await readNoteStore()).filter(note => domainFilterAllows(policy, note.pageUrl))
   } else {
     tabId = requireTabId(params.tabId)
     const tab = await chrome.tabs.get(tabId)
@@ -5298,163 +6022,355 @@ const ELEMENT_WATCH_MAX_VALUE_CHARS = 500
 // NOTE: the frame-injected payload functions below must stay self-contained; they inline
 // the 5000/500 limits as literals because module constants are not serialized into the frame.
 
-/**
- * Runs inside the target frame's MAIN world: start a generic element watcher that records
- * the watched element's text/value (and an optional label element's value) on every change.
- * Idempotent per selector pair; the log lives at window.__dshElementWatchLog.
- */
-function frameElementWatchStartPayload(selector, labelSelector) {
-  try {
-    const key = String(selector) + '|' + String(labelSelector ?? '')
-    const previousWatch = window.__dshElementWatch
-    if (previousWatch !== undefined && previousWatch.key === key && typeof previousWatch.stop === 'function') {
-      return { started: false, already: true, logged: (window.__dshElementWatchLog ?? []).length }
+/** Read workbook identity and the name-box state, or focus that box after preflight. */
+function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddress) {
+  const googleSheets = window === window.top && location.origin === 'https://docs.google.com'
+    && /^\/spreadsheets\/(?:u\/\d+\/)?d\/[A-Za-z0-9_-]+\/edit\/?$/u.test(location.pathname)
+  const provider = googleSheets ? 'google-sheets' : 'excel-online'
+  const nameBoxSelector = googleSheets ? '#t-name-box' : '#FormulaBar-NameBox-input'
+  const readState = () => {
+    const nameBox = document.querySelector(nameBoxSelector)
+    const context = document.querySelector('#m_excelWebRenderer_ewaCtl_m_workbookContextJson')
+    let activeSheetName = null
+    if (googleSheets) {
+      const activeTabs = document.querySelectorAll('.docs-sheet-active-tab .docs-sheet-tab-name')
+      if (activeTabs.length === 1) activeSheetName = activeTabs[0].textContent.trim() || null
+    } else if (context !== null) {
+      try {
+        const workbookContext = JSON.parse(context.value)
+        if (typeof workbookContext?.ActiveSheetName === 'string' && workbookContext.ActiveSheetName !== '') {
+          activeSheetName = workbookContext.ActiveSheetName
+        }
+      } catch {}
     }
-    const el = document.querySelector(String(selector))
-    if (el === null) return { error: 'No element matches selector: ' + String(selector).slice(0, 120) }
-    const labelEl = labelSelector ? document.querySelector(String(labelSelector)) : null
+    const active = document.activeElement
+    const documentFocused = document.hasFocus()
+    const formulaEditor = document.querySelector('#formulaBarTextDivId_textElement')
+    const formulaEditorFocused = formulaEditor !== null
+      && (active === formulaEditor || formulaEditor.contains(active))
+    let selectionStart = null
+    let selectionEnd = null
+    let selectionRangeAvailable = false
+    if (nameBox instanceof HTMLInputElement) {
+      try {
+        selectionStart = nameBox.selectionStart
+        selectionEnd = nameBox.selectionEnd
+        selectionRangeAvailable = Number.isInteger(selectionStart) && Number.isInteger(selectionEnd)
+      } catch {}
+    }
+    // Sheets focuses its zero-width editor for grid keyboard shortcuts even outside cell edit mode.
+    const idleSheetsGrid = googleSheets && active?.id === 'waffle-rich-text-editor'
+      && active.offsetWidth === 0 && active.textContent.trim() === ''
+    const focusedEditor = active !== null && active !== nameBox && !idleSheetsGrid && (
+      active instanceof HTMLTextAreaElement
+      || (active instanceof HTMLInputElement && active.type !== 'hidden'
+        && active.type !== 'button' && active.type !== 'checkbox' && active.type !== 'radio'
+        && active.disabled !== true && active.readOnly !== true && active.getClientRects().length > 0)
+      || active.isContentEditable === true
+      || active.getAttribute?.('role') === 'textbox'
+      || formulaEditorFocused
+    )
+    const isVisible = element => {
+      if (element === null || !element.isConnected || element.getClientRects().length === 0) return false
+      const style = getComputedStyle(element)
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0
+    }
+    const describeButton = selector => {
+      const button = document.querySelector(selector)
+      if (button === null) return null
+      return { visible: isVisible(button), enabled: !button.matches(':disabled, [aria-disabled="true"]') }
+    }
+    const focusedControl = focusedEditor ? {
+      tag: active.localName,
+      id: /^[A-Za-z_][A-Za-z0-9_:.-]{0,95}$/u.test(active.id) ? active.id : null,
+      visible: isVisible(active),
+      contentEditable: active.isContentEditable === true,
+      textboxRole: active.getAttribute('role') === 'textbox',
+    } : null
+    return {
+      provider,
+      recognized: googleSheets ? nameBox instanceof HTMLInputElement && activeSheetName !== null : context !== null || nameBox !== null,
+      hasWorkbookContext: context !== null,
+      activeSheetName,
+      address: nameBox instanceof HTMLInputElement ? nameBox.value : null,
+      selectionStart,
+      selectionEnd,
+      selectionRangeAvailable,
+      nameBoxAttached: nameBox instanceof HTMLInputElement && nameBox.isConnected,
+      nameBoxReady: nameBox instanceof HTMLInputElement && isVisible(nameBox)
+        && nameBox.disabled !== true && nameBox.readOnly !== true
+        && nameBox.getAttribute('aria-disabled') !== 'true',
+      documentFocused,
+      focused: documentFocused && nameBox !== null && active === nameBox,
+      editing: focusedEditor === true,
+      editGuard: focusedEditor ? (formulaEditorFocused ? 'formula-bar-focus' : 'editable-control-focus') : null,
+      focusedControl,
+      editButtons: {
+        ok: describeButton('#m_excelWebRenderer_ewaCtl_okboxButton'),
+        cancel: describeButton('#m_excelWebRenderer_ewaCtl_cancelboxButton'),
+      },
+    }
+  }
 
-    if (previousWatch !== undefined) {
-      if (typeof previousWatch.stop === 'function') previousWatch.stop()
-      else {
-        clearInterval(previousWatch.timer)
-        previousWatch.observer?.disconnect()
-        delete window.__dshElementWatch
+  let state = readState()
+  if (action !== 'focus' && action !== 'locate') return state
+  if (state.recognized !== true) return { ...state, error: 'No workbook was found in this frame' }
+  if (state.editing === true) {
+    return { ...state, error: 'Workbook navigation stopped because focus is in an editable control (' + state.editGuard + ')' }
+  }
+  if (state.nameBoxReady !== true) {
+    return { ...state, error: 'The workbook name box is unavailable, hidden, disabled, or read-only' }
+  }
+  if (typeof state.activeSheetName !== 'string'
+    || state.activeSheetName.toLowerCase() !== String(expectedSheetName).toLowerCase()) {
+    return { ...state, error: 'The active sheet changed before the name box was focused' }
+  }
+  if (state.address !== expectedAddress) {
+    return { ...state, error: 'The workbook selection changed before the name box was focused' }
+  }
+  const nameBox = document.querySelector(nameBoxSelector)
+  if (!(nameBox instanceof HTMLInputElement) || !nameBox.isConnected) {
+    return { ...state, error: 'The workbook name box was detached before focus' }
+  }
+  if (action === 'locate') {
+    if (!googleSheets) return { ...state, error: 'The Google Sheets editor is no longer available' }
+    const bounds = nameBox.getBoundingClientRect()
+    const x = bounds.left + bounds.width / 2
+    const y = bounds.top + bounds.height / 2
+    if (document.elementFromPoint(x, y) !== nameBox) {
+      return { ...state, error: 'The Google Sheets name box is covered or outside the viewport' }
+    }
+    return { ...state, nameBoxPoint: { x, y } }
+  }
+  nameBox.focus()
+  state = readState()
+  if (state.focused !== true || state.nameBoxAttached !== true) {
+    return { ...state, error: 'The workbook name box did not retain focus' }
+  }
+  return state
+}
+
+/** Run in the frame's isolated world. Every watch owns its observers and log. */
+function frameElementWatchPayload({ action, watchId, selector, labelSelector, clear }) {
+  try {
+    let watches = globalThis.__dshElementWatches
+    const named = watchId !== null
+    const existing = watches?.get(watchId)
+    existing?.checkAttached()
+
+    if (action === 'read') {
+      if (!existing && named) return { error: 'No such element watch in this frame document. Start it first.' }
+      const entries = existing?.log ?? []
+      if (clear && existing) existing.log = []
+      return {
+        running: existing?.active === true,
+        count: entries.length,
+        entries,
+        ...(existing?.reason ? { reason: existing.reason } : {}),
       }
     }
-
-    const log = []
-    window.__dshElementWatchLog = log
-    const watch = {
-      key,
-      timer: null,
-      observers: [],
-      listeners: [],
-      timeouts: new Set(),
-      active: true,
-      stop: null,
+    if (action === 'stop') {
+      if (!existing && named) return { error: 'No such element watch in this frame document. Start it first.' }
+      if (!existing?.active) {
+        return {
+          stopped: false,
+          wasRunning: false,
+          ...(existing?.reason ? { reason: existing.reason } : {}),
+        }
+      }
+      existing.stop()
+      return { stopped: true, wasRunning: true, logged: existing.log.length }
     }
-    const cleanup = () => {
+    if (existing?.active) {
+      if (existing.selector === selector && existing.labelSelector === labelSelector) {
+        return { started: false, already: true, logged: existing.log.length }
+      }
+      if (named) return { error: 'This watchId is already running with different selectors. Stop it before reusing the ID.' }
+    }
+
+    const resolveElement = (css, role) => {
+      if (!css) return null
+      if (!named) return document.querySelector(css)
+      const matches = document.querySelectorAll(css)
+      if (matches.length !== 1) throw new Error('The ' + role + ' selector must match exactly one element')
+      return matches[0]
+    }
+    const element = resolveElement(selector, 'watch')
+    if (!element) return { error: 'No element matches selector: ' + selector.slice(0, 120) }
+    const labelElement = resolveElement(labelSelector, 'label')
+
+    if (!watches) {
+      watches = globalThis.__dshElementWatches = new Map()
+      window.addEventListener('pagehide', () => {
+        for (const watch of watches.values()) watch.stop()
+        watches.clear()
+      })
+    }
+    const maxNamedWatches = 8
+    let evictId
+    if (named && !existing && watches.size - Number(watches.has(null)) >= maxNamedWatches) {
+      let oldestStop = Infinity
+      for (const [id, watch] of watches) {
+        if (id === null) continue
+        watch.checkAttached()
+        if (watch.stoppedAt < oldestStop) {
+          oldestStop = watch.stoppedAt
+          evictId = id
+        }
+      }
+      if (evictId === undefined) return { error: 'All eight named watches in this frame are running. Stop one first.' }
+    }
+
+    const watch = {
+      selector, labelSelector, log: [], active: true, reason: null, stoppedAt: Infinity,
+      stop, checkAttached,
+    }
+    const observer = new MutationObserver(() => record())
+    const timeouts = new Set()
+    let timer
+    let lastValue
+    let lastLabel
+    const clickListener = () => {
+      const timeout = setTimeout(() => {
+        timeouts.delete(timeout)
+        record()
+      }, 60)
+      timeouts.add(timeout)
+    }
+
+    function stop(reason = null) {
       if (!watch.active) return
       watch.active = false
-      if (watch.timer !== null) clearInterval(watch.timer)
-      for (const observer of watch.observers) observer.disconnect()
-      for (const { target, type, listener, options } of watch.listeners) {
-        target.removeEventListener(type, listener, options)
-      }
-      for (const timeout of watch.timeouts) clearTimeout(timeout)
-      watch.timeouts.clear()
-      if (window.__dshElementWatch === watch) delete window.__dshElementWatch
+      watch.reason = reason
+      watch.stoppedAt = performance.now()
+      observer.disconnect()
+      element.removeEventListener('input', record)
+      labelElement?.removeEventListener('input', record)
+      document.removeEventListener('click', clickListener, true)
+      clearInterval(timer)
+      for (const timeout of timeouts) clearTimeout(timeout)
+      timeouts.clear()
     }
-    watch.stop = cleanup
 
-    const readValue = () => {
-      const raw = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : el.textContent
-      return String(raw ?? '').slice(0, 500)
+    function checkAttached() {
+      if (named && watch.active) {
+        if (!element.isConnected || element.ownerDocument !== document) stop('target-detached')
+        else if (labelElement && (!labelElement.isConnected || labelElement.ownerDocument !== document)) stop('label-detached')
+      }
     }
-    const readLabel = () => {
-      if (labelEl === null) return ''
-      const raw = labelEl instanceof HTMLInputElement ? labelEl.value : labelEl.textContent
-      return String(raw ?? '').slice(0, 200)
-    }
-    let lastKey = ''
-    const record = () => {
+
+    function record() {
+      checkAttached()
       if (!watch.active) return
-      const value = readValue()
-      const label = readLabel()
-      const entryKey = label + '\n' + value
-      if (entryKey === lastKey) return
-      lastKey = entryKey
-      const currentLog = Array.isArray(window.__dshElementWatchLog)
-        ? window.__dshElementWatchLog
-        : (window.__dshElementWatchLog = [])
-      currentLog.push({ label, value, at: Date.now() })
-      if (currentLog.length > 5_000) currentLog.splice(0, currentLog.length - 5_000)
+      const rawValue = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+        ? element.value : element.textContent
+      const rawLabel = labelElement instanceof HTMLInputElement ? labelElement.value : labelElement?.textContent
+      const value = String(rawValue ?? '').slice(0, 500)
+      const label = String(rawLabel ?? '').slice(0, 200)
+      if (value === lastValue && label === lastLabel) return
+      lastValue = value
+      lastLabel = label
+      watch.log.push({ label, value, at: Date.now() })
+      if (watch.log.length > 5_000) watch.log.shift()
     }
 
     try {
-      const observer = new MutationObserver(() => record())
-      watch.observers.push(observer)
-      observer.observe(el, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
-      const inputListener = () => record()
-      watch.listeners.push({ target: el, type: 'input', listener: inputListener })
-      el.addEventListener('input', inputListener)
-      if (labelEl !== null) {
-        const labelObserver = new MutationObserver(() => record())
-        watch.observers.push(labelObserver)
-        labelObserver.observe(labelEl, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
-        const labelInputListener = () => record()
-        watch.listeners.push({ target: labelEl, type: 'input', listener: labelInputListener })
-        labelEl.addEventListener('input', labelInputListener)
+      const observerOptions = { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] }
+      observer.observe(element, observerOptions)
+      element.addEventListener('input', record)
+      if (labelElement) {
+        observer.observe(labelElement, observerOptions)
+        labelElement.addEventListener('input', record)
       }
-      const clickListener = () => {
-        const timeout = setTimeout(() => {
-          watch.timeouts.delete(timeout)
-          record()
-        }, 60)
-        watch.timeouts.add(timeout)
-      }
-      watch.listeners.push({ target: document, type: 'click', listener: clickListener, options: true })
       document.addEventListener('click', clickListener, true)
-      watch.timer = setInterval(record, 250)
-      window.__dshElementWatch = watch
+      timer = setInterval(record, 250)
       record()
     } catch (error) {
-      cleanup()
+      stop()
       throw error
     }
 
-    return { started: true, logged: log.length, selector: String(selector) }
+    existing?.stop()
+    if (evictId !== undefined) watches.delete(evictId)
+    watches.set(watchId, watch)
+    return { started: true, logged: watch.log.length, selector }
   } catch (error) {
-    return { error: 'element watch start failed: ' + String(error?.message ?? error).slice(0, 240) }
+    return { error: 'element watch ' + action + ' failed: ' + String(error?.message ?? error).slice(0, 240) }
   }
 }
 
-/** Runs inside the target frame's MAIN world: stop the element watcher. */
-function frameElementWatchStopPayload() {
-  try {
-    const watch = window.__dshElementWatch
-    if (watch === undefined) return { stopped: false, wasRunning: false }
-    const logged = (window.__dshElementWatchLog ?? []).length
-    if (typeof watch.stop === 'function') watch.stop()
-    else {
-      clearInterval(watch.timer)
-      watch.observer?.disconnect()
-      if (Array.isArray(window.__dshElementWatchLog)) {
-        window.__dshElementWatchLog = window.__dshElementWatchLog.slice()
-      }
-      delete window.__dshElementWatch
+async function frameWorkbookValuesPayload(maxCells, maxResultChars, requestedAddress, requestedSheetName) {
+  const parseA1 = (value, allowAbsolute = false) => {
+    if (typeof value !== 'string' || value.length > 24) throw new Error('address must be a bounded A1 cell or rectangle')
+    const source = allowAbsolute ? value.replace(/\$/gu, '') : value
+    const match = /^([A-Za-z]{1,3})([1-9][0-9]{0,6})(?::([A-Za-z]{1,3})([1-9][0-9]{0,6}))?$/u.exec(source)
+    if (match === null) throw new Error('address must be a single A1 cell or bounded A1 rectangle without a sheet prefix')
+    const columnNumber = letters => {
+      let number = 0
+      for (const letter of letters.toUpperCase()) number = number * 26 + letter.charCodeAt(0) - 64
+      if (number > 16_384) throw new Error('address column exceeds Excel bounds')
+      return number
     }
-    return { stopped: true, wasRunning: true, logged }
-  } catch (error) {
-    return { error: 'element watch stop failed: ' + String(error?.message ?? error).slice(0, 240) }
+    const startColumn = columnNumber(match[1])
+    const startRow = Number(match[2])
+    const endColumn = match[3] === undefined ? startColumn : columnNumber(match[3])
+    const endRow = match[4] === undefined ? startRow : Number(match[4])
+    if (startRow > 1_048_576 || endRow > 1_048_576) throw new Error('address row exceeds Excel bounds')
+    if (endRow < startRow || endColumn < startColumn) throw new Error('address rectangle endpoints must be in ascending order')
+    return { startRow, startColumn, endRow, endColumn }
   }
-}
-
-/** Runs inside the target frame's MAIN world: read (and optionally clear) the recorded log. */
-function frameElementWatchReadPayload(clear) {
+  const columnName = number => {
+    let value = number
+    let result = ''
+    while (value > 0) {
+      const remainder = (value - 1) % 26
+      result = String.fromCharCode(65 + remainder) + result
+      value = Math.floor((value - 1) / 26)
+    }
+    return result
+  }
+  const addressFor = rect => {
+    const first = columnName(rect.startColumn) + String(rect.startRow)
+    const last = columnName(rect.endColumn) + String(rect.endRow)
+    return first === last ? first : first + ':' + last
+  }
+  const cellCount = rect => (rect.endRow - rect.startRow + 1) * (rect.endColumn - rect.startColumn + 1)
+  const withinBudget = (rect, label) => {
+    if (!Number.isSafeInteger(cellCount(rect)) || cellCount(rect) > maxCells) {
+      throw new Error(label + ' exceeds the ' + String(maxCells) + '-cell read limit')
+    }
+  }
+  let requestedRect = null
   try {
-    const log = Array.isArray(window.__dshElementWatchLog) ? window.__dshElementWatchLog : []
-    const entries = log.map(entry => ({ label: String(entry.label ?? ''), value: String(entry.value ?? ''), at: entry.at }))
-    if (clear === true) window.__dshElementWatchLog = []
-    return { running: window.__dshElementWatch !== undefined, count: entries.length, entries }
+    if (requestedAddress !== null) {
+      requestedRect = parseA1(requestedAddress)
+      withinBudget(requestedRect, 'Requested address')
+    }
   } catch (error) {
-    return { error: 'element watch read failed: ' + String(error?.message ?? error).slice(0, 240) }
+    return { error: String(error?.message ?? error) }
   }
-}
+  if (requestedSheetName !== null
+    && (typeof requestedSheetName !== 'string' || requestedSheetName.length === 0 || requestedSheetName.length > 31)) {
+    return { error: 'sheetName must be an Excel worksheet name of 1 to 31 characters' }
+  }
 
-async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
   const input = document.querySelector('#m_excelWebRenderer_ewaCtl_m_workbookContextJson')
-  if (input === null) return { error: 'No Excel workbook context was found in this frame' }
-  let workbookContext
-  try {
-    workbookContext = JSON.parse(input.value)
-  } catch {
-    return { error: 'The Excel workbook context is not valid JSON' }
+  let workbookContext = null
+  let contextError = null
+  if (input === null) {
+    contextError = 'No Excel workbook context was found in this frame'
+  } else {
+    try {
+      workbookContext = JSON.parse(input.value)
+    } catch {
+      contextError = 'The Excel workbook context is not valid JSON'
+    }
   }
-  const sheetName = workbookContext?.ActiveSheetName
-  if (typeof sheetName !== 'string' || sheetName === '') {
-    return { error: 'The active Excel sheet name is unavailable' }
+  const activeSheetName = typeof workbookContext?.ActiveSheetName === 'string'
+    && workbookContext.ActiveSheetName !== '' ? workbookContext.ActiveSheetName : null
+  const sheetName = requestedSheetName ?? activeSheetName
+  if (sheetName === null) {
+    return { error: contextError ?? 'The active Excel sheet name is unavailable; provide sheetName to select a worksheet' }
   }
   const usedRange = workbookContext?.ActiveSheetProcessedDataResult?.UR
   const lastRow = Number(usedRange?.LastRow)
@@ -5465,7 +6381,7 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
   const describe = error => String(error?.message ?? error)
     .replace(/access_token=[^&\s"'<>]+/gi, 'access_token=<redacted>')
     .slice(0, 240)
-  const deadline = Date.now() + 25_000
+  const deadline = Date.now() + 24_000
   const timed = (operation, timeoutMs) => new Promise((resolve, reject) => {
     const remainingMs = Math.min(timeoutMs, Math.max(1, deadline - Date.now()))
     const timer = setTimeout(() => reject(new Error('timed out')), remainingMs)
@@ -5474,20 +6390,84 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
       error => { clearTimeout(timer); reject(error) },
     )
   })
-  const packageValues = (api, address, values, formulas) => {
+  const reportedSheet = address => {
+    if (typeof address !== 'string') return null
+    const bang = address.lastIndexOf('!')
+    if (bang < 0) return null
+    let name = address.slice(0, bang)
+    if (name.startsWith("'") && name.endsWith("'")) name = name.slice(1, -1).replace(/''/gu, "'")
+    const bookEnd = name.lastIndexOf(']')
+    if (bookEnd >= 0) name = name.slice(bookEnd + 1)
+    return name
+  }
+  const verifyReportedSheet = (address, requireQualified = false) => {
+    const actual = reportedSheet(address)
+    if (actual === null) {
+      if (requireQualified) throw new Error('The grid range address does not identify its worksheet')
+      return
+    }
+    if (actual !== sheetName) throw new Error('The workbook API returned a range for worksheet ' + actual)
+  }
+  const rectangleFromAddress = (address, requireQualified = false) => {
+    verifyReportedSheet(address, requireQualified)
+    const bang = typeof address === 'string' ? address.lastIndexOf('!') : -1
+    const a1 = bang < 0 ? address : address.slice(bang + 1)
+    return parseA1(a1, true)
+  }
+  const verifyAddressMatchesRect = (address, expected, requireQualified = false) => {
+    const actual = rectangleFromAddress(address, requireQualified)
+    if (actual.startRow !== expected.startRow || actual.startColumn !== expected.startColumn
+      || actual.endRow !== expected.endRow || actual.endColumn !== expected.endColumn) {
+      throw new Error('The workbook API returned address ' + String(address) + ' instead of ' + addressFor(expected))
+    }
+  }
+  const verifyActiveSheetContext = () => {
+    if (requestedSheetName !== null) return
+    if (input === null) throw new Error('The active Excel sheet context is unavailable')
+    let currentSheetName
+    try {
+      currentSheetName = JSON.parse(input.value)?.ActiveSheetName
+    } catch {
+      throw new Error('The active Excel sheet context is not valid JSON')
+    }
+    if (currentSheetName !== sheetName) throw new Error('The active Excel sheet changed during the workbook read')
+  }
+  const usedRangeRectangle = () => {
+    if (sheetName !== activeSheetName || !validBounds) {
+      throw new Error('EWA used-range bounds cannot verify the selected worksheet')
+    }
+    const rect = { startRow: 1, startColumn: 1, endRow: lastRow + 1, endColumn: lastColumn + 1 }
+    withinBudget(rect, 'EWA used range')
+    return rect
+  }
+  const packageValues = (api, address, values, displayedTextValues, formulaValues, expectedRect) => {
     if (!Array.isArray(values) || values.length === 0 || !Array.isArray(values[0])
       || values[0].length === 0 || values.some(row => !Array.isArray(row) || row.length !== values[0].length)) {
       throw new Error('The workbook API returned an invalid value matrix')
     }
     const rowCount = values.length
     const columnCount = values[0].length
-    if (rowCount * columnCount > maxCells) {
-      throw new Error('The used range exceeds the ' + String(maxCells) + '-cell read limit')
+    if (rowCount * columnCount > maxCells) throw new Error('The requested range exceeds the ' + String(maxCells) + '-cell read limit')
+    if (expectedRect !== undefined
+      && (rowCount !== expectedRect.endRow - expectedRect.startRow + 1
+        || columnCount !== expectedRect.endColumn - expectedRect.startColumn + 1)) {
+      throw new Error('The workbook API returned matrix dimensions that do not match the selected address')
     }
+    const matrixMatches = matrix => Array.isArray(matrix) && matrix.length === rowCount
+      && matrix.every(row => Array.isArray(row) && row.length === columnCount)
+    const hasDisplayedText = matrixMatches(displayedTextValues)
+    const hasFormulas = matrixMatches(formulaValues)
+    if (displayedTextValues !== null && !hasDisplayedText) throw new Error('The workbook API returned an invalid displayed-text matrix')
+    if (formulaValues !== null && !hasFormulas) throw new Error('The workbook API returned an invalid formula matrix')
+    const displayedText = hasDisplayedText
+      ? displayedTextValues.map(row => row.map(value => value === null || value === undefined ? '' : String(value)))
+      : null
+    const formulas = hasFormulas
+      ? formulaValues.map(row => row.map(value => typeof value === 'string' && value.startsWith('=') ? value : null))
+      : null
     const populated = values.map((row, rowIndex) => row.map((value, columnIndex) =>
       (value !== null && value !== undefined && value !== '')
-      || (typeof formulas?.[rowIndex]?.[columnIndex] === 'string'
-        && formulas[rowIndex][columnIndex].startsWith('='))))
+      || (typeof formulas?.[rowIndex]?.[columnIndex] === 'string')))
     const result = {
       api,
       sheetName,
@@ -5496,25 +6476,46 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
       columnCount,
       values,
       populated,
-      populationBasis: api === 'office-js' ? 'nonempty-value-or-formula' : 'nonempty-value',
+      populationBasis: hasFormulas ? 'nonempty-value-or-formula' : 'nonempty-value',
+      displayedText,
+      formulas,
+      fieldAvailability: { values: true, displayedText: hasDisplayedText, formulas: hasFormulas },
+      provenance: {
+        api,
+        sheetSelection: requestedSheetName === null ? 'active-sheet-context' : 'named-worksheet-lookup',
+        rangeSelection: requestedRect === null ? 'used-range' : 'requested-a1',
+        values: api === 'office-js' ? 'Excel JavaScript Range.values' : 'EWA Range.getValuesAsync',
+        displayedText: hasDisplayedText ? 'Excel JavaScript Range.text' : null,
+        formulas: hasFormulas ? 'Excel JavaScript Range.formulas' : null,
+      },
+      blankSemantics: {
+        emptyValue: 'null, undefined, and empty string are blank',
+        populated: hasFormulas ? 'nonempty value or formula' : 'nonempty value',
+        displayedText: hasDisplayedText ? 'empty string means no displayed text' : null,
+      },
+      limitations: hasFormulas && hasDisplayedText
+        ? []
+        : ['This API did not expose separate displayed text and formulas for the selected range.'],
     }
     if (JSON.stringify(result).length > maxResultChars) {
-      throw new Error('The used range exceeds the workbook response size limit')
+      throw new Error('The requested range exceeds the workbook response size limit')
     }
     return result
   }
 
-  const validateEwaBounds = () => {
-    if (!validBounds) throw new Error('EWA used-range bounds are unavailable')
-    if ((lastRow + 1) * (lastColumn + 1) > maxCells) {
-      throw new Error('EWA used range exceeds the ' + String(maxCells) + '-cell read limit')
-    }
-  }
-  const readEwaRange = async (api, range) => {
-    validateEwaBounds()
+  const selectedEwaRectangle = () => requestedRect ?? usedRangeRectangle()
+  const readEwaRange = async (api, range, rect, address, directSheetLookup = false, knownRangeAddress = null) => {
+    withinBudget(rect, 'Requested range')
     if (typeof range?.getValuesAsync !== 'function') throw new Error('EWA range has no getValuesAsync')
-    const address = typeof range.getAddressA1 === 'function'
-      ? await timed(() => range.getAddressA1(), 4_000) : null
+    let returnedAddress = knownRangeAddress
+    const hasAddressMethod = typeof range.getAddressA1 === 'function'
+    if (returnedAddress === null && hasAddressMethod) {
+      returnedAddress = await timed(() => range.getAddressA1(), 4_000)
+    }
+    if (hasAddressMethod && typeof returnedAddress !== 'string') throw new Error('EWA range returned no A1 address')
+    if (returnedAddress !== null) verifyAddressMatchesRect(returnedAddress, rect, !directSheetLookup)
+    else if (!directSheetLookup) throw new Error('EWA range has no verifiable worksheet address')
+    verifyActiveSheetContext()
     const values = await timed(() => new Promise((resolve, reject) => {
       range.getValuesAsync(0, result => {
         try {
@@ -5527,15 +6528,19 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
         }
       }, null)
     }), 12_000)
-    return packageValues(api, address, values)
+    verifyActiveSheetContext()
+    return packageValues(api, address, values, null, null, rect)
   }
   const readEwaSheets = async (api, sheets) => {
-    validateEwaBounds()
     if (typeof sheets?.getItemByName !== 'function') throw new Error('EWA sheets have no getItemByName')
+    const rect = selectedEwaRectangle()
+    verifyActiveSheetContext()
     const sheet = await timed(() => sheets.getItemByName(sheetName), 4_000)
     if (typeof sheet?.getRange !== 'function') throw new Error('EWA sheet has no getRange')
-    const range = await timed(() => sheet.getRange(0, 0, lastRow + 1, lastColumn + 1), 4_000)
-    return readEwaRange(api, range)
+    verifyActiveSheetContext()
+    const range = await timed(() => sheet.getRange(rect.startRow - 1, rect.startColumn - 1,
+      rect.endRow - rect.startRow + 1, rect.endColumn - rect.startColumn + 1), 4_000)
+    return readEwaRange(api, range, rect, addressFor(rect), true)
   }
   const readEwaWorkbook = async (api, workbook) => {
     if (typeof workbook?.getSheets !== 'function') {
@@ -5552,6 +6557,37 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
     }
     const workbook = await timed(() => control.getActiveWorkbook(), 4_000)
     return readEwaWorkbook(api, workbook)
+  }
+
+  if (typeof globalThis.Excel?.run === 'function') {
+    try {
+      return await timed(() => globalThis.Excel.run(async context => {
+        verifyActiveSheetContext()
+        const sheet = context.workbook.worksheets.getItem(sheetName)
+        const range = requestedRect === null
+          ? sheet.getUsedRange(true)
+          : sheet.getRange(addressFor(requestedRect))
+        range.load('address,rowCount,columnCount')
+        await context.sync()
+        verifyActiveSheetContext()
+        const rect = requestedRect ?? rectangleFromAddress(range.address)
+        verifyAddressMatchesRect(range.address, rect)
+        withinBudget(rect, requestedRect === null ? 'Office JavaScript used range' : 'Requested range')
+        if (Number(range.rowCount) !== rect.endRow - rect.startRow + 1
+          || Number(range.columnCount) !== rect.endColumn - rect.startColumn + 1) {
+          throw new Error('Office JavaScript returned dimensions that do not match the selected range')
+        }
+        range.load('values,text,formulas')
+        await context.sync()
+        verifyActiveSheetContext()
+        return packageValues('office-js', requestedRect === null ? range.address : addressFor(requestedRect),
+          range.values, range.text, range.formulas, rect)
+      }), 20_000)
+    } catch (error) {
+      failures.push('Office JavaScript read failed: ' + describe(error))
+    }
+  } else {
+    failures.push('Office JavaScript Excel.run is unavailable in the workbook frame')
   }
 
   const seenEwa = new Set()
@@ -5571,21 +6607,8 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
     if (exported !== undefined) {
       const returned = typeof exported === 'function' ? exported.call(crossFrame) : exported
       const resolved = await timed(() => Promise.resolve(returned), 8_000)
-      let control = resolved
-      if (typeof control?.getActiveWorkbook !== 'function'
-        && control !== null && ['object', 'function'].includes(typeof control)) {
-        const names = Object.getOwnPropertyNames(control).slice(0, 40)
-        for (const name of names) {
-          const descriptor = Object.getOwnPropertyDescriptor(control, name)
-          if (!descriptor || !Object.hasOwn(descriptor, 'value')) continue
-          if (typeof descriptor.value?.getActiveWorkbook === 'function') {
-            control = descriptor.value
-            break
-          }
-        }
-      }
-      if (typeof control?.getActiveWorkbook === 'function') {
-        return await readEwaControl('ewa-cross-frame', control)
+      if (typeof resolved?.getActiveWorkbook === 'function') {
+        return await readEwaControl('ewa-cross-frame', resolved)
       }
       const workbook = await timed(() => Promise.resolve(resolved?.wkb), 4_000)
       if (typeof workbook?.getSheets === 'function') {
@@ -5595,7 +6618,7 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
         throw new Error('Cross-frame wkb has no getSheets (type '
           + (workbook === null ? 'null' : typeof workbook) + ')')
       }
-      return await readEwaControl('ewa-cross-frame', control)
+      throw new Error('Cross-frame export did not return a verifiable EWA control or workbook')
     }
   } catch (error) {
     failures.push('ewa-cross-frame read failed: ' + describe(error))
@@ -5611,20 +6634,26 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
         throw new Error('Grid export did not return an object')
       }
       const directFailures = []
-      let usedRange
-      try {
-        usedRange = await timed(() => Promise.resolve(grid.usedRange), 4_000)
-        if (typeof usedRange?.getValuesAsync === 'function') {
-          const result = await readEwaRange('ewa-cross-frame-grid-usedRange', usedRange)
-          return { ...result, gridMember: 'usedRange' }
+      if (requestedRect === null) {
+        try {
+          const usedRange = await timed(() => Promise.resolve(grid.usedRange), 4_000)
+          if (typeof usedRange?.getValuesAsync === 'function') {
+            if (typeof usedRange.getAddressA1 !== 'function') {
+              throw new Error('Grid usedRange has no verifiable A1 address')
+            }
+            const address = await timed(() => usedRange.getAddressA1(), 4_000)
+            const rect = rectangleFromAddress(address, true)
+            withinBudget(rect, 'Grid used range')
+            const result = await readEwaRange('ewa-cross-frame-grid-usedRange', usedRange, rect, address, false, address)
+            return { ...result, gridMember: 'usedRange' }
+          }
+          directFailures.push('usedRange.getValuesAsync=' + typeof usedRange?.getValuesAsync)
+        } catch (error) {
+          directFailures.push('usedRange: ' + describe(error))
         }
-        directFailures.push('usedRange.getValuesAsync=' + typeof usedRange?.getValuesAsync)
-      } catch (error) {
-        directFailures.push('usedRange: ' + describe(error))
       }
-      let sheets
       try {
-        sheets = await timed(() => Promise.resolve(grid.mc?.sheets), 4_000)
+        const sheets = await timed(() => Promise.resolve(grid.mc?.sheets), 4_000)
         if (typeof sheets?.getItemByName === 'function') {
           const result = await readEwaSheets('ewa-cross-frame-grid-mc-sheets', sheets)
           return { ...result, gridMember: 'mc.sheets' }
@@ -5633,160 +6662,18 @@ async function frameWorkbookValuesPayload(maxCells, maxResultChars) {
       } catch (error) {
         directFailures.push('mc.sheets: ' + describe(error))
       }
-      const candidates = [{ name: 'grid', value: grid }]
-      for (const name of Object.getOwnPropertyNames(grid).slice(0, 300)) {
-        const descriptor = Object.getOwnPropertyDescriptor(grid, name)
-        if (!descriptor || !Object.hasOwn(descriptor, 'value')) continue
-        const value = descriptor.value
-        if (value !== null && ['object', 'function'].includes(typeof value)) {
-          candidates.push({ name, value })
-        }
-      }
-      const seen = new Set()
-      const candidateFailures = []
-      for (const candidate of candidates) {
-        if (seen.has(candidate.value)) continue
-        seen.add(candidate.value)
-        try {
-          let result
-          if (typeof candidate.value.getActiveWorkbook === 'function') {
-            result = await readEwaControl('ewa-cross-frame-grid', candidate.value)
-          } else if (typeof candidate.value.getSheets === 'function') {
-            result = await readEwaWorkbook('ewa-cross-frame-grid', candidate.value)
-          } else continue
-          return { ...result, gridMember: candidate.name }
-        } catch (error) {
-          if (candidateFailures.length < 3) {
-            candidateFailures.push(candidate.name + ': ' + describe(error))
-          }
-          if (candidateFailures.length >= 3) break
-        }
-      }
-      throw new Error(candidateFailures.length > 0
-        ? 'Grid workbook candidates failed: ' + candidateFailures.join('; ')
-        : directFailures.join('; ') + '; Grid has no EWA workbook method')
+      throw new Error(directFailures.length > 0
+        ? directFailures.join('; ') + '; no verified direct grid worksheet lookup'
+        : 'Grid has no verified direct worksheet lookup')
     }
   } catch (error) {
     failures.push('ewa-cross-frame-grid read failed: ' + describe(error))
   }
 
-  if (typeof globalThis.Excel?.run === 'function') {
-    try {
-      return await timed(() => globalThis.Excel.run(async context => {
-        const sheet = context.workbook.worksheets.getItem(sheetName)
-        const range = sheet.getUsedRange(true)
-        range.load('address,rowCount,columnCount')
-        await context.sync()
-        if (range.rowCount * range.columnCount > maxCells) {
-          throw new Error('The used range exceeds the ' + String(maxCells) + '-cell read limit')
-        }
-        range.load('values,formulas')
-        await context.sync()
-        return packageValues('office-js', range.address, range.values, range.formulas)
-      }), 12_000)
-    } catch (error) {
-      failures.push('Office JavaScript read failed: ' + describe(error))
-    }
-  }
-
-  // Path: sheet model under grid.nGi (Sheet*) read cell-by-cell via its getCell method.
-  try {
-    const imports = globalThis._Ewa?.CrossFrameStaticMethods?.imports
-    const grid = typeof imports?.grid === 'function' ? imports.grid() : null
-    const nGi = grid?.nGi
-    const modelName = nGi ? Object.keys(nGi).find(k => /^Sheet/.test(k)) : undefined
-    const model = modelName ? nGi[modelName] : null
-    if (model !== null && model !== undefined && typeof model.getCell === 'function') {
-      if (!validBounds) throw new Error('used-range bounds are unavailable')
-      if ((lastRow + 1) * (lastColumn + 1) > maxCells) {
-        throw new Error('The used range exceeds the ' + String(maxCells) + '-cell read limit')
-      }
-      const colName = i => {
-        let s = ''
-        i += 1
-        while (i > 0) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26) }
-        return s
-      }
-      const valueNames = ['value', 'text', 'displayValue', 'formattedValue', 'cellValue', 'v', 'result', 'data']
-      const cellValue = cell => {
-        if (cell === null || cell === undefined) return null
-        if (typeof cell !== 'object') return cell
-        const proto = Object.getPrototypeOf(cell)
-        const names = Object.keys(cell)
-        if (proto !== null) names.push(...Object.getOwnPropertyNames(proto))
-        for (const n of valueNames) {
-          if (!names.includes(n)) continue
-          try {
-            const v = cell[n]
-            if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
-          } catch { /* ignore accessor errors */ }
-        }
-        for (const n of names) {
-          if (!/^get[a-z]/i.test(n)) continue
-          try {
-            const d = Object.getOwnPropertyDescriptor(cell, n)
-              ?? (proto !== null ? Object.getOwnPropertyDescriptor(proto, n) : undefined)
-            const fn = typeof d?.value === 'function' && d.value.length === 0 ? d.value
-              : typeof cell[n] === 'function' && cell[n].length === 0 ? cell[n]
-                : null
-            if (fn === null) continue
-            const v = fn.call(cell)
-            if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
-          } catch { /* ignore */ }
-        }
-        return null
-      }
-      // Detect the getCell calling convention: 'A1' address string vs numeric (row, col).
-      let useAddress = false
-      let zeroBased = false
-      let cellSample = null
-      const probeLog = []
-      const resolveMaybe = v => (v !== null && typeof v === 'object' && typeof v.then === 'function')
-        ? v.then(x => x, () => null)
-        : v
-      for (const args of [[], ['A1'], [1, 1], [0, 0], [0], [{ row: 1, column: 1 }]]) {
-        try {
-          let c = await resolveMaybe(model.getCell(...args))
-          probeLog.push(JSON.stringify(args) + '=>' + (c === null || c === undefined ? String(c) : typeof c))
-          if (c !== null && typeof c === 'object') {
-            cellSample = c
-            useAddress = typeof args[0] === 'string'
-            zeroBased = args[0] === 0
-            break
-          }
-        } catch (error) {
-          probeLog.push(JSON.stringify(args) + '=>throw:' + describe(error).slice(0, 80))
-        }
-      }
-      if (cellSample === null) throw new Error('sheet model getCell returned no cell object; probes: ' + probeLog.join(', '))
-      const row0 = useAddress || !zeroBased ? 1 : 0
-      const col0 = row0
-      const values = []
-      for (let r = row0; r < row0 + lastRow; r++) {
-        const row = []
-        for (let c = col0; c < col0 + lastColumn; c++) {
-          let cell = null
-          try {
-            cell = useAddress ? model.getCell(colName(c - col0) + r) : model.getCell(r, c)
-          } catch { cell = null }
-          row.push(cellValue(cell))
-        }
-        values.push(row)
-      }
-      const sampleNames = Object.keys(cellSample)
-      const sampleProto = Object.getPrototypeOf(cellSample)
-      if (sampleProto !== null) sampleNames.push(...Object.getOwnPropertyNames(sampleProto))
-      const result = packageValues('ewa-sheetmodel-getCell', 'A1:' + colName(lastColumn - 1) + lastRow, values, null)
-      return { ...result, gridMember: modelName, cellMemberNames: sampleNames.slice(0, 80) }
-    }
-  } catch (error) {
-    failures.push('ewa-sheetmodel-getCell read failed: ' + describe(error))
-  }
-
+  failures.push('EWA sheet-model getCell fallback skipped because its worksheet identity and address semantics are unverified')
   return { error: failures.length > 0 ? failures.join('; ')
     : 'No compatible EWA or Office JavaScript API is available in this frame; run dsh_browser_workbook_probe' }
 }
-
 /**
  * Runs inside an Office Online (WAC) frame: extract the WOPI source and access token from the
  * hidden workbook-context input. The result stays inside the extension process (service worker);
@@ -6494,6 +7381,7 @@ async function debuggerCommand(target, method, params = {}) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  startConfiguredConnection()
   chrome.contextMenus.remove(ELEMENT_NOTE_MENU_ID, () => {
     void chrome.runtime.lastError
     chrome.contextMenus.create({
@@ -6523,13 +7411,21 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   })
 })
 
-chrome.runtime.onStartup.addListener(() => {
-  void readConnectionSettings().then(async settings => {
+function startConfiguredConnection() {
+  // Chrome startup and extension load events can overlap. Run one startup check.
+  startupConnectionTask ??= (async () => {
+    await restoreSession()
+    if (activeSession !== undefined) return
+    const settings = await readConnectionSettings()
     if (!settings.autoConnect || !PAIRING_CODE_PATTERN.test(settings.pairingCode)) return
     await scheduleReconnect()
     await attemptAutoReconnect()
-  }).catch(() => {})
-})
+  })().catch(() => {})
+}
+
+chrome.runtime.onStartup.addListener(startConfiguredConnection)
+// On Chrome versions that expose this event, it also covers re-enabling an extension.
+chrome.runtime.onExtensionLoaded?.addListener(startConfiguredConnection)
 
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === RECONNECT_ALARM) {
@@ -6542,6 +7438,14 @@ chrome.alarms.onAlarm.addListener(alarm => {
 })
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'DSH_TYPING_PREVIEW') {
+    const optionsUrl = chrome.runtime.getURL('options.html')
+    if (sender.id !== chrome.runtime.id || sender.url?.split(/[?#]/u, 1)[0] !== optionsUrl) return false
+    sendResponse(message.example === undefined
+      ? { steps: typingPreviewSteps(message.settings) }
+      : { plans: typingExamplePlans(message.example, message.settings) })
+    return false
+  }
   if (['DSH_POI_MODE', 'DSH_POI_LIST', 'DSH_POI_ALL', 'DSH_POI_SELECTED',
     'DSH_POI_OPEN_SAVED', 'DSH_POI_DELETE_SAVED', 'DSH_POI_EDITOR',
     'DSH_POI_ENTER_FRAME', 'DSH_POI_LEAVE_FRAME'].includes(message?.type)) {
