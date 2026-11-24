@@ -141,6 +141,7 @@ let restoreTask
 let keepaliveInterval
 let reconnectWanted = false
 let reconnectTask
+let startupConnectionTask
 let trustedStorageTask
 let behaviorSettingsCache = { ...DEFAULT_BEHAVIOR_SETTINGS }
 let behaviorSettingsLoaded = false
@@ -1203,7 +1204,7 @@ function stopReconnect() {
 
 /**
  * Re-pair automatically after an unexpected session loss (host restart, expired
- * token, network drop), on Chrome startup when autoConnect is enabled, or when the
+ * token, network drop), on Chrome startup or extension load when enabled, or when the
  * user clicks Connect. Uses the saved origin and code without creating a tab.
  */
 async function attemptAutoReconnect() {
@@ -2059,15 +2060,20 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       }
       if (action === 'start') requireCssSelector(selector, 'The watch selector')
       if (labelSelector !== null) requireCssSelector(labelSelector, 'The label selector')
-      const clear = params.clear === true
-      const func = action === 'start' ? frameElementWatchStartPayload
-        : action === 'stop' ? frameElementWatchStopPayload
-          : frameElementWatchReadPayload
-      const args = action === 'start' ? [selector, labelSelector] : [clear]
-      const payload = await runInFrame(tabId, frameId, func, args, 'MAIN')
+      const watchId = params.watchId
+      if (watchId !== undefined && (typeof watchId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(watchId))) {
+        throw new Error('watchId must be 1 to 64 letters, numbers, underscores, or hyphens, starting with a letter or number')
+      }
+      const payload = await runInFrame(tabId, frameId, frameElementWatchPayload, [{
+        action,
+        watchId: watchId ?? null,
+        selector: action === 'start' ? selector : null,
+        labelSelector: action === 'start' ? labelSelector : null,
+        clear: params.clear === true,
+      }])
       if (!isRecord(payload)) throw new Error('The frame returned no element watch result')
       if (typeof payload.error === 'string') throw new Error(payload.error)
-      return { tabId, frameId, action, ...payload }
+      return { tabId, frameId, action, ...(watchId === undefined ? {} : { watchId }), ...payload }
     }
     case 'page.workbookProbe': {
       const tabId = requireTabId(params.tabId)
@@ -6144,148 +6150,152 @@ function frameWorkbookNavigationPayload(action, expectedSheetName, expectedAddre
   return state
 }
 
-/**
- * Runs inside the target frame's MAIN world: start a generic element watcher that records
- * the watched element's text/value (and an optional label element's value) on every change.
- * Idempotent per selector pair; the log lives at window.__dshElementWatchLog.
- */
-function frameElementWatchStartPayload(selector, labelSelector) {
+/** Run in the frame's isolated world. Every watch owns its observers and log. */
+function frameElementWatchPayload({ action, watchId, selector, labelSelector, clear }) {
   try {
-    const key = String(selector) + '|' + String(labelSelector ?? '')
-    const previousWatch = window.__dshElementWatch
-    if (previousWatch !== undefined && previousWatch.key === key && typeof previousWatch.stop === 'function') {
-      return { started: false, already: true, logged: (window.__dshElementWatchLog ?? []).length }
-    }
-    const el = document.querySelector(String(selector))
-    if (el === null) return { error: 'No element matches selector: ' + String(selector).slice(0, 120) }
-    const labelEl = labelSelector ? document.querySelector(String(labelSelector)) : null
+    let watches = globalThis.__dshElementWatches
+    const named = watchId !== null
+    const existing = watches?.get(watchId)
+    existing?.checkAttached()
 
-    if (previousWatch !== undefined) {
-      if (typeof previousWatch.stop === 'function') previousWatch.stop()
-      else {
-        clearInterval(previousWatch.timer)
-        previousWatch.observer?.disconnect()
-        delete window.__dshElementWatch
+    if (action === 'read') {
+      if (!existing && named) return { error: 'No such element watch in this frame document. Start it first.' }
+      const entries = existing?.log ?? []
+      if (clear && existing) existing.log = []
+      return {
+        running: existing?.active === true,
+        count: entries.length,
+        entries,
+        ...(existing?.reason ? { reason: existing.reason } : {}),
       }
     }
-
-    const log = []
-    window.__dshElementWatchLog = log
-    const watch = {
-      key,
-      timer: null,
-      observers: [],
-      listeners: [],
-      timeouts: new Set(),
-      active: true,
-      stop: null,
+    if (action === 'stop') {
+      if (!existing && named) return { error: 'No such element watch in this frame document. Start it first.' }
+      if (!existing?.active) {
+        return {
+          stopped: false,
+          wasRunning: false,
+          ...(existing?.reason ? { reason: existing.reason } : {}),
+        }
+      }
+      existing.stop()
+      return { stopped: true, wasRunning: true, logged: existing.log.length }
     }
-    const cleanup = () => {
+    if (existing?.active) {
+      if (existing.selector === selector && existing.labelSelector === labelSelector) {
+        return { started: false, already: true, logged: existing.log.length }
+      }
+      if (named) return { error: 'This watchId is already running with different selectors. Stop it before reusing the ID.' }
+    }
+
+    const resolveElement = (css, role) => {
+      if (!css) return null
+      if (!named) return document.querySelector(css)
+      const matches = document.querySelectorAll(css)
+      if (matches.length !== 1) throw new Error('The ' + role + ' selector must match exactly one element')
+      return matches[0]
+    }
+    const element = resolveElement(selector, 'watch')
+    if (!element) return { error: 'No element matches selector: ' + selector.slice(0, 120) }
+    const labelElement = resolveElement(labelSelector, 'label')
+
+    if (!watches) {
+      watches = globalThis.__dshElementWatches = new Map()
+      window.addEventListener('pagehide', () => {
+        for (const watch of watches.values()) watch.stop()
+        watches.clear()
+      })
+    }
+    const maxNamedWatches = 8
+    let evictId
+    if (named && !existing && watches.size - Number(watches.has(null)) >= maxNamedWatches) {
+      let oldestStop = Infinity
+      for (const [id, watch] of watches) {
+        if (id === null) continue
+        watch.checkAttached()
+        if (watch.stoppedAt < oldestStop) {
+          oldestStop = watch.stoppedAt
+          evictId = id
+        }
+      }
+      if (evictId === undefined) return { error: 'All eight named watches in this frame are running. Stop one first.' }
+    }
+
+    const watch = {
+      selector, labelSelector, log: [], active: true, reason: null, stoppedAt: Infinity,
+      stop, checkAttached,
+    }
+    const observer = new MutationObserver(() => record())
+    const timeouts = new Set()
+    let timer
+    let lastValue
+    let lastLabel
+    const clickListener = () => {
+      const timeout = setTimeout(() => {
+        timeouts.delete(timeout)
+        record()
+      }, 60)
+      timeouts.add(timeout)
+    }
+
+    function stop(reason = null) {
       if (!watch.active) return
       watch.active = false
-      if (watch.timer !== null) clearInterval(watch.timer)
-      for (const observer of watch.observers) observer.disconnect()
-      for (const { target, type, listener, options } of watch.listeners) {
-        target.removeEventListener(type, listener, options)
-      }
-      for (const timeout of watch.timeouts) clearTimeout(timeout)
-      watch.timeouts.clear()
-      if (window.__dshElementWatch === watch) delete window.__dshElementWatch
+      watch.reason = reason
+      watch.stoppedAt = performance.now()
+      observer.disconnect()
+      element.removeEventListener('input', record)
+      labelElement?.removeEventListener('input', record)
+      document.removeEventListener('click', clickListener, true)
+      clearInterval(timer)
+      for (const timeout of timeouts) clearTimeout(timeout)
+      timeouts.clear()
     }
-    watch.stop = cleanup
 
-    const readValue = () => {
-      const raw = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el.value : el.textContent
-      return String(raw ?? '').slice(0, 500)
+    function checkAttached() {
+      if (named && watch.active) {
+        if (!element.isConnected || element.ownerDocument !== document) stop('target-detached')
+        else if (labelElement && (!labelElement.isConnected || labelElement.ownerDocument !== document)) stop('label-detached')
+      }
     }
-    const readLabel = () => {
-      if (labelEl === null) return ''
-      const raw = labelEl instanceof HTMLInputElement ? labelEl.value : labelEl.textContent
-      return String(raw ?? '').slice(0, 200)
-    }
-    let lastKey = ''
-    const record = () => {
+
+    function record() {
+      checkAttached()
       if (!watch.active) return
-      const value = readValue()
-      const label = readLabel()
-      const entryKey = label + '\n' + value
-      if (entryKey === lastKey) return
-      lastKey = entryKey
-      const currentLog = Array.isArray(window.__dshElementWatchLog)
-        ? window.__dshElementWatchLog
-        : (window.__dshElementWatchLog = [])
-      currentLog.push({ label, value, at: Date.now() })
-      if (currentLog.length > 5_000) currentLog.splice(0, currentLog.length - 5_000)
+      const rawValue = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+        ? element.value : element.textContent
+      const rawLabel = labelElement instanceof HTMLInputElement ? labelElement.value : labelElement?.textContent
+      const value = String(rawValue ?? '').slice(0, 500)
+      const label = String(rawLabel ?? '').slice(0, 200)
+      if (value === lastValue && label === lastLabel) return
+      lastValue = value
+      lastLabel = label
+      watch.log.push({ label, value, at: Date.now() })
+      if (watch.log.length > 5_000) watch.log.shift()
     }
 
     try {
-      const observer = new MutationObserver(() => record())
-      watch.observers.push(observer)
-      observer.observe(el, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
-      const inputListener = () => record()
-      watch.listeners.push({ target: el, type: 'input', listener: inputListener })
-      el.addEventListener('input', inputListener)
-      if (labelEl !== null) {
-        const labelObserver = new MutationObserver(() => record())
-        watch.observers.push(labelObserver)
-        labelObserver.observe(labelEl, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] })
-        const labelInputListener = () => record()
-        watch.listeners.push({ target: labelEl, type: 'input', listener: labelInputListener })
-        labelEl.addEventListener('input', labelInputListener)
+      const observerOptions = { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['value'] }
+      observer.observe(element, observerOptions)
+      element.addEventListener('input', record)
+      if (labelElement) {
+        observer.observe(labelElement, observerOptions)
+        labelElement.addEventListener('input', record)
       }
-      const clickListener = () => {
-        const timeout = setTimeout(() => {
-          watch.timeouts.delete(timeout)
-          record()
-        }, 60)
-        watch.timeouts.add(timeout)
-      }
-      watch.listeners.push({ target: document, type: 'click', listener: clickListener, options: true })
       document.addEventListener('click', clickListener, true)
-      watch.timer = setInterval(record, 250)
-      window.__dshElementWatch = watch
+      timer = setInterval(record, 250)
       record()
     } catch (error) {
-      cleanup()
+      stop()
       throw error
     }
 
-    return { started: true, logged: log.length, selector: String(selector) }
+    existing?.stop()
+    if (evictId !== undefined) watches.delete(evictId)
+    watches.set(watchId, watch)
+    return { started: true, logged: watch.log.length, selector }
   } catch (error) {
-    return { error: 'element watch start failed: ' + String(error?.message ?? error).slice(0, 240) }
-  }
-}
-
-/** Runs inside the target frame's MAIN world: stop the element watcher. */
-function frameElementWatchStopPayload() {
-  try {
-    const watch = window.__dshElementWatch
-    if (watch === undefined) return { stopped: false, wasRunning: false }
-    const logged = (window.__dshElementWatchLog ?? []).length
-    if (typeof watch.stop === 'function') watch.stop()
-    else {
-      clearInterval(watch.timer)
-      watch.observer?.disconnect()
-      if (Array.isArray(window.__dshElementWatchLog)) {
-        window.__dshElementWatchLog = window.__dshElementWatchLog.slice()
-      }
-      delete window.__dshElementWatch
-    }
-    return { stopped: true, wasRunning: true, logged }
-  } catch (error) {
-    return { error: 'element watch stop failed: ' + String(error?.message ?? error).slice(0, 240) }
-  }
-}
-
-/** Runs inside the target frame's MAIN world: read (and optionally clear) the recorded log. */
-function frameElementWatchReadPayload(clear) {
-  try {
-    const log = Array.isArray(window.__dshElementWatchLog) ? window.__dshElementWatchLog : []
-    const entries = log.map(entry => ({ label: String(entry.label ?? ''), value: String(entry.value ?? ''), at: entry.at }))
-    if (clear === true) window.__dshElementWatchLog = []
-    return { running: window.__dshElementWatch !== undefined, count: entries.length, entries }
-  } catch (error) {
-    return { error: 'element watch read failed: ' + String(error?.message ?? error).slice(0, 240) }
+    return { error: 'element watch ' + action + ' failed: ' + String(error?.message ?? error).slice(0, 240) }
   }
 }
 
@@ -7371,6 +7381,7 @@ async function debuggerCommand(target, method, params = {}) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  startConfiguredConnection()
   chrome.contextMenus.remove(ELEMENT_NOTE_MENU_ID, () => {
     void chrome.runtime.lastError
     chrome.contextMenus.create({
@@ -7400,13 +7411,21 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   })
 })
 
-chrome.runtime.onStartup.addListener(() => {
-  void readConnectionSettings().then(async settings => {
+function startConfiguredConnection() {
+  // Chrome startup and extension load events can overlap. Run one startup check.
+  startupConnectionTask ??= (async () => {
+    await restoreSession()
+    if (activeSession !== undefined) return
+    const settings = await readConnectionSettings()
     if (!settings.autoConnect || !PAIRING_CODE_PATTERN.test(settings.pairingCode)) return
     await scheduleReconnect()
     await attemptAutoReconnect()
-  }).catch(() => {})
-})
+  })().catch(() => {})
+}
+
+chrome.runtime.onStartup.addListener(startConfiguredConnection)
+// On Chrome versions that expose this event, it also covers re-enabling an extension.
+chrome.runtime.onExtensionLoaded?.addListener(startConfiguredConnection)
 
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === RECONNECT_ALARM) {

@@ -24,7 +24,7 @@ The first debugger attachment can show Chrome's debugging notice and change the 
 
 Use only tools present in the browser tool list. Tab listing and activation are actions of `dsh_browser_tabs`; there is no separate `dsh_browser_activate` or `dsh_browser_wait_for` tool. Use the exact `dsh_browser_wait_for_element` tool name for element waits. `dsh_browser_navigate` waits for page loading. If a site renders more content afterward, inspect it with another snapshot rather than inventing a wait tool.
 
-The extension connects to the DSH Web origin configured in its Settings (default `http://127.0.0.1:3080`, or a remote HTTPS DSH Web address) through its service worker. Initial setup requires the user to open authenticated DSH Web themselves, choose Settings then Chrome browser, and copy the origin and code into extension Settings. The direct code page is `/api/dsh-browser-extension/pairing`. After setup, **Connect** opens no DSH tab. When **Connect automatically** is enabled, reconnection on Chrome start or after interruptions also opens no DSH tab. If a browser tool reports disconnection and automatic connection is enabled, wait for the 30-second reconnect alarm instead of retrying in a tight loop. If it stays disconnected, tell the user to check that DSH Web is running and that the origin and pairing code match. If automatic connection is disabled, the user can click **Connect**. The code is a credential: do not ask the user to paste it into chat or a tool result. Re-list tabs before each browser batch because a tab can close between turns.
+The extension connects to the DSH Web origin configured in its Settings (default `http://127.0.0.1:3080`, or a remote HTTPS DSH Web address) through its service worker. Initial setup requires the user to open authenticated DSH Web themselves, choose Settings then Chrome browser, and copy the origin and code into extension Settings. The direct code page is `/api/dsh-browser-extension/pairing`. After setup, **Connect** opens no DSH tab. When **Connect automatically** is enabled, reconnection on Chrome startup, extension reload, or after interruptions also opens no DSH tab. If a browser tool reports disconnection and automatic connection is enabled, wait for the 30-second reconnect alarm instead of retrying in a tight loop. If it stays disconnected, tell the user to check that DSH Web is running and that the origin and pairing code match. If automatic connection is disabled, the user can click **Connect**. The code is a credential: do not ask the user to paste it into chat or a tool result. Re-list tabs before each browser batch because a tab can close between turns.
 
 ## Inspect, act, and verify
 
@@ -363,12 +363,24 @@ Excel for the web notes:
 
 ## Element watcher (record values while navigating)
 
-`dsh_browser_element_watch` records an element's value into an in-frame log as you interact, so a click-through needs no per-item reads. It works in any frame (pass a `frameId` from `dsh_browser_frames`, including cross-origin app frames); the watcher is injected into the frame's main world as a static function (no eval, so MV3 CSP does not block it).
+`dsh_browser_element_watch` records an element's value into an in-frame log as you interact, so a click-through needs no per-item reads. Pass `frameId: 0` for the main document or use `dsh_browser_frames` to find an accessible iframe, including nested and cross-origin frames.
 
-Parameters: `tabId`, `frameId`, `action` = `start` | `stop` | `read` (default `read`), `selector` (CSS of the element to watch, required for `start` unless a preset is used), optional `labelSelector` (a second element whose value is stored as each entry's `label`), optional `preset`, and `clear` (with `read`, reset the log after reading).
+Parameters: `tabId`, `frameId`, `action` = `start` | `stop` | `read` (default `read`), `selector` (CSS of the element to watch, required for `start` unless a preset is used), optional `labelSelector` (a second element whose value is stored as each entry's `label`), optional `preset`, optional `watchId` for independent watches, and `clear` (with `read`, reset that log after reading).
 
 - Generic use (any site/element): `action: "start"`, `selector: "#some-element"`, optional `labelSelector`. Entries are `{label, value, at}`; `value` is the element's `value` for inputs/textareas, else its `textContent` (capped at 500 chars); at most 5000 entries are kept.
 - Excel for the web preset: `action: "start"`, `preset: "excel-online"` — watches `#formulaBarTextDivId_textElement` (the formula bar) with `#FormulaBar-NameBox-input` (the name box) as the label, so each visited cell is logged as `{label: "P6", value: "891"}`.
+
+To watch two targets inside the same iframe, make two separate start calls. For example, if `dsh_browser_frames` reports frame 13 in tab 42:
+
+```json
+{"tabId":42,"frameId":13,"action":"start","watchId":"status","selector":"#status"}
+```
+
+```json
+{"tabId":42,"frameId":13,"action":"start","watchId":"row-count","selector":"#row-count"}
+```
+
+Pass the same IDs with `action: "read"` or `action: "stop"`. Named watch selectors must each match one element. Stopping preserves the log until the ID is restarted, the document changes, or a new watch reclaims the slot. Each frame supports eight named watches plus the default watch. If a target or its label is detached, the named watch stops and `read` reports why. After navigation or reload, discover the frame again and restart its watches.
 
 Workflow for a spreadsheet scan:
 
