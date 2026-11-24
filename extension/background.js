@@ -1799,7 +1799,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
           throw new Error('The active Excel sheet changed before navigation could start')
         }
         if (state.editing === true) {
-          throw new Error('Excel navigation stopped because focus is in an editable control (' + state.editGuard + ')')
+          throw workbookNavigationEditError(state)
         }
         const initialAddress = state.address
         if (typeof initialAddress !== 'string' || initialAddress === '') {
@@ -3145,11 +3145,22 @@ function isExcelAppFrameUrl(value) {
   }
 }
 
+function workbookNavigationEditError(state) {
+  const details = JSON.stringify({
+    editGuard: state.editGuard ?? null,
+    focusedControl: state.focusedControl ?? null,
+  })
+  return new Error('Excel navigation stopped because focus is in an editable control. ' + details)
+}
+
 function requireWorkbookNavigationReady(state) {
   if (!isRecord(state) || state.recognized !== true) {
     throw new Error('The Excel workbook frame is no longer available')
   }
-  if (typeof state.error === 'string') throw new Error(state.error)
+  if (typeof state.error === 'string') {
+    if (state.editing === true) throw workbookNavigationEditError(state)
+    throw new Error(state.error)
+  }
   if (state.nameBoxReady !== true) {
     throw new Error('The Excel name box is unavailable, hidden, disabled, or read-only')
   }
@@ -3160,11 +3171,9 @@ function requireWorkbookNavigationFocused(state, expectedSheetName) {
   if (!sameExcelSheetName(state.activeSheetName, expectedSheetName)) {
     throw new Error('The active Excel sheet changed during navigation; Enter was not pressed')
   }
+  if (state.editing === true) throw workbookNavigationEditError(state)
   if (state.documentFocused !== true || state.focused !== true) {
     throw new Error('The Excel name box lost focus during navigation; Enter was not pressed')
-  }
-  if (state.editing === true) {
-    throw new Error('Excel entered an edit field during navigation; Enter was not pressed')
   }
 }
 
