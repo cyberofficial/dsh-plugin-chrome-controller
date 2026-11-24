@@ -2,7 +2,7 @@
 
 Use a Chrome extension to give DeepSeek Harness browser tools for the Chrome window you are already using. The extension pairs with a DSH Web instance, local or remote, and controls tabs through Chrome's debugger API.
 
-https://github.com/user-attachments/assets/373984df-aae8-426e-9ea8-f5a92344567e
+https://github.com/user-attachments/assets/ce72343e-1abb-431f-9be5-6c90a1bb6c60
 
 ## Requirements
 
