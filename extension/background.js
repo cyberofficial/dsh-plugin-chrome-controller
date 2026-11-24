@@ -1572,6 +1572,158 @@ async function dispatchClickAt(target, tabId, x, y) {
   })
 }
 
+const FORM_REVIEW_TTL_MS = 120_000
+const formReviews = new Map()
+
+// Restoring a pairing from Chrome storage creates a new object for the same session.
+function sameFormReviewPairing(left, right) {
+  return Boolean(left && right && left.origin === right.origin && left.sessionToken === right.sessionToken)
+}
+
+async function runFormReview(method, params, signal, policy) {
+  const tabId = requireTabId(params.tabId)
+  const prepare = method === 'page.formReviewPrepare'
+  const session = activeSession
+  const now = Date.now()
+  const stale = reason => ({ status: 'stale', reason: reason + ' Request a fresh review.' })
+  for (const [id, review] of formReviews) {
+    if (id !== params.reviewId && (review.expires <= now || !sameFormReviewPairing(review.session, session))) formReviews.delete(id)
+  }
+  if (!session) return stale('The browser pairing is no longer active.')
+  if (prepare && formReviews.size >= 32) throw new Error('Too many pending form reviews')
+  const reviewId = prepare ? crypto.randomUUID() : params.reviewId
+  const review = formReviews.get(reviewId)
+  if (!prepare) {
+    if (!review || review.tabId !== tabId) return stale('The extension no longer holds this pending review.')
+    formReviews.delete(reviewId)
+    if (!sameFormReviewPairing(review.session, session)) return stale('The browser pairing changed.')
+    if (review.expires <= now) return stale('The review expired before the click.')
+  }
+
+  const selectors = prepare ? params.previewSelectors : []
+  const validSelector = value => typeof value === 'string' && value.trim() !== '' && value.length <= 512
+  if (prepare && (!validSelector(params.buttonSelector) || !Array.isArray(selectors)
+    || selectors.length > 8 || !selectors.every(validSelector))) {
+    throw new Error('Provide a button selector and up to eight preview selectors')
+  }
+  const tab = await chrome.tabs.get(tabId).catch(() => null)
+  if (!tab || tab.pendingUrl || !/^https?:\/\//u.test(tab.url ?? '') || !tabDomainAllows(policy, tab)) return stale('The tab is unavailable, navigating, or blocked by the domain filter.')
+  if (!prepare) {
+    const frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }).catch(() => null)
+    if (tab.url !== review.url) return stale('The tab URL changed.')
+    if (!frame?.documentId) return stale('Chrome could no longer identify the reviewed document.')
+    if (frame.documentId !== review.documentId) return stale('The reviewed document was replaced.')
+  }
+  signal?.throwIfAborted()
+  if (!sameFormReviewPairing(activeSession, session)) return stale('The browser pairing changed.')
+  const expires = prepare ? now + FORM_REVIEW_TTL_MS : review.expires
+  const [injection] = await chrome.scripting.executeScript({
+    target: prepare ? { tabId, frameIds: [0] } : { tabId, documentIds: [review.documentId] },
+    world: 'ISOLATED',
+    func: formReviewPayload,
+    args: [prepare, reviewId, expires, tab.url, prepare ? params.buttonSelector : null, selectors],
+  })
+  if (!prepare) {
+    if (!injection) return { status: 'unverified', reason: 'Inspect the tab before attempting another click.' }
+    if (injection.result?.status === 'dispatched') return injection.result
+    return stale(injection.result?.reason ?? 'The reviewed document could no longer be checked.')
+  }
+  if (!sameFormReviewPairing(activeSession, session) || !injection?.documentId || !injection.result?.fields) {
+    throw new Error('Could not stage the top-level form')
+  }
+  formReviews.set(reviewId, { tabId, documentId: injection.documentId, url: tab.url, session, expires })
+  return { reviewId, ...injection.result }
+}
+
+/** Capture and compare in Chrome's isolated world. Raw comparison values stay in the document. */
+function formReviewPayload(prepare, id, expires, expectedUrl, buttonSelector, selectors) {
+  const stale = reason => ({ status: 'stale', reason })
+  if (window !== window.top || location.href !== expectedUrl) return stale('The document or URL changed.')
+  if (Date.now() >= expires) return stale('The review expired before the document check.')
+  const reviews = globalThis.__dshFormReviews ??= new Map()
+  const pack = element => JSON.stringify([
+    element.outerHTML,
+    element.value, element.checked, element.indeterminate, element.matches(':disabled'),
+    element instanceof HTMLSelectElement ? [...element.options].map(option => option.selected) : null,
+  ])
+  const ready = button => button.isConnected && !button.matches(':disabled, [aria-disabled="true"]')
+    && !button.closest('[inert], [hidden]') && button.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+  const formTarget = (form, button) => JSON.stringify([
+    form.action, form.method, form.enctype, form.target, form.noValidate,
+    button.formAction, button.formMethod, button.formEnctype, button.formTarget, button.formNoValidate,
+    form.getAttribute('action'), button.getAttribute('formaction'),
+  ])
+  if (!prepare) {
+    const draft = reviews.get(id)
+    if (!draft) return stale('The document no longer holds its review snapshot.')
+    draft.clear()
+    const { button, form, controls, state, target, selector } = draft
+    const matches = document.querySelectorAll(selector)
+    if (matches.length !== 1 || matches[0] !== button || button.form !== form) {
+      return stale('The pending button or its form was replaced.')
+    }
+    if (!ready(button)) return stale('The pending button is no longer available.')
+    if (formTarget(form, button) !== target) return stale('The form submission settings changed.')
+    if (pack(button) !== draft.buttonState) return stale('The pending button changed.')
+    const current = [...form.elements]
+    if (current.length !== controls.length || current.some((control, index) => control !== controls[index])) {
+      return stale('The set of form controls changed.')
+    }
+    if (current.some((control, index) => pack(control) !== state[index]
+      || (control.type === 'file' && control.files?.length))) return stale('A form control value, state, or markup changed.')
+    // Compare and dispatch in the same document task so another DOM task cannot intervene.
+    HTMLElement.prototype.click.call(button)
+    return { status: 'dispatched' }
+  }
+
+  const matches = document.querySelectorAll(buttonSelector)
+  const button = matches[0]
+  if (matches.length !== 1 || !(button instanceof HTMLButtonElement || button instanceof HTMLInputElement)
+    || !['button', 'submit'].includes(button.type) || !button.form || !ready(button)) return null
+  const form = button.form
+  const controls = [...form.elements]
+  if (controls.length > 200 || controls.some(control => control.type === 'file' && control.files?.length)) return null
+
+  const shorten = (value, max) => String(value ?? '').trim().slice(0, max)
+  const labelFor = field => [...(field.labels ?? [])].map(label => label.textContent).join(' ').trim()
+    || field.getAttribute('aria-label') || field.name || field.id || 'Field'
+  const fields = []
+  for (const selector of new Set(selectors)) {
+    const matches = document.querySelectorAll(selector)
+    const field = matches[0]
+    if (matches.length !== 1 || field.form !== form) return null
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement || field instanceof HTMLSelectElement)
+      || ['hidden', 'file', 'submit', 'reset', 'button', 'image'].includes(field.type)
+      || !field.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue
+    const label = labelFor(field)
+    const hints = [label, field.name, field.id, field.autocomplete, field.placeholder, field.type].join(' ')
+    const sensitive = /password|password|passcode|otp|one.?time|verification.?code|security.?code|token|secret|cc-|credit.?card|card.?(?:num|exp|name)|cv[cv]|csc|social.?security|ssn|\bpin\b/iu.test(hints)
+    const value = sensitive ? '[masked]' : ['checkbox', 'radio'].includes(field.type) ? String(field.checked)
+      : field instanceof HTMLSelectElement ? [...field.selectedOptions].map(option => option.label).join(', ') : field.value
+    fields.push({ label: shorten(label, 80), value: shorten(value, 160) })
+  }
+
+  const state = controls.map(pack)
+  const buttonState = pack(button)
+  if (state.reduce((length, control) => length + control.length, buttonState.length) > 128_000) return null
+  const clear = () => {
+    reviews.delete(id)
+    window.removeEventListener('pagehide', clear)
+    clearTimeout(timer)
+  }
+  const timer = setTimeout(clear, Math.max(0, expires - Date.now()))
+  window.addEventListener('pagehide', clear, { once: true })
+  reviews.set(id, {
+    button, form, controls, selector: buttonSelector, buttonState, state, target: formTarget(form, button), clear,
+  })
+  return {
+    title: shorten(document.title, 120),
+    origin: location.origin,
+    button: shorten(button.getAttribute('aria-label') || button.textContent || button.value, 120) || 'Form button',
+    fields,
+  }
+}
+
 function executeBrowserOperation(method, params, signal) {
   const tabId = Number.isSafeInteger(params?.tabId) ? params.tabId : undefined
   if (tabId === undefined) return executeBrowserOperationNow(method, params, signal)
@@ -1599,6 +1751,9 @@ async function executeBrowserOperationNow(method, params, signal) {
 
 async function dispatchBrowserOperation(method, params, signal, policy) {
   switch (method) {
+    case 'page.formReviewPrepare':
+    case 'page.formReviewClick':
+      return runFormReview(method, params, signal, policy)
     case 'page.sequence': {
       const settings = await getBehaviorSettings()
       const sequence = normalizeSequenceCommand(params, settings.sequenceDelayMs)
