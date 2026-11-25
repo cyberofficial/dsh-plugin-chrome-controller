@@ -308,7 +308,13 @@ Saving a blob: URL: some "Download" buttons build the file in the page with `URL
 {"tabId":42,"url":"blob:https://example.com/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11","filename":"invoice.pdf"}
 ```
 
-If the page gives you a `data:` URL instead (an `<a href="data:…">` or an image source), do not pass it to the tool or copy it out of the page: convert it in place with `dsh_browser_evaluate`, `fetch(dataUrl).then(r => r.blob()).then(b => { window.__u = URL.createObjectURL(b) })`, then save `window.__u`.
+If the page gives you a `data:` URL instead (an `<a href="data:…">` or an image source), do not pass it to the tool or copy it out of the page. Decode it into a blob in place with `dsh_browser_evaluate` on the top-level page (no `frameId`), then save the returned `blob:` URL. Adjust the selector to the element that holds the `data:` URL. The recipe decodes the URL instead of fetching it, so a page's Content Security Policy cannot block it:
+
+```json
+{"tabId":42,"expression":"(u => { const i = u.indexOf(','), meta = u.slice(5, i), body = u.slice(i + 1); const bytes = /;base64$/i.test(meta) ? Uint8Array.from(atob(body), c => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(body)); return window.__u = URL.createObjectURL(new Blob([bytes], { type: meta.split(';')[0] })) })(document.querySelector('a[download]').href)"}
+```
+
+This only works in the top-level page: `dsh_browser_evaluate` with a `frameId` cannot run it, since the extension's content security policy blocks compiling an expression in a frame. For a `data:` URL inside an iframe, ask the user to download the file instead.
 
 ## Browser diagnostics
 

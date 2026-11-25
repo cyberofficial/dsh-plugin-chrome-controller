@@ -7267,7 +7267,7 @@ function fileSourceUrl(value) {
     return downloadUrl(value)
   }
   if (url.protocol === 'data:') {
-    throw new Error('data: URLs are not supported. Turn it into a blob: URL in the page with fetch(dataUrl).then(r => r.blob()).then(b => URL.createObjectURL(b)), then pass that blob: URL.')
+    throw new Error('data: URLs are not supported. Decode it into a Blob with dsh_browser_evaluate on the top-level page (no frameId), call URL.createObjectURL on it, then pass that blob: URL. The chrome-browser skill has the recipe.')
   }
   if (url.protocol !== 'blob:') return downloadUrl(value)
   // A blob: URL's origin is the inner URL's origin when that is HTTP(S), else "null".
