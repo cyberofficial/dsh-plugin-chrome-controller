@@ -1,149 +1,64 @@
-# dsh-plugin-chrome-controller
-
-Use a Chrome extension to give DeepSeek Harness browser tools for the Chrome window you are already using. The extension pairs with a DSH Web instance, local or remote, and controls tabs through Chrome's debugger API.
+# Chrome Controller for DeepSeek Harness
 
 https://github.com/user-attachments/assets/ce72343e-1abb-431f-9be5-6c90a1bb6c60
 
-## Requirements
+Put your DeepSeek Harness agent to work in the Chrome window you already use. Watch it fill a form, check a worksheet, or trace a broken request in the tabs and apps where you're signed in.
 
-- DeepSeek Harness Web, reachable from Chrome either at a loopback URL such as `http://127.0.0.1:3080`, or over HTTPS at an address DSH Web trusts (see [Remote DSH Web](#remote-dsh-web)). Open it once to copy the origin and pairing code during setup.
-- Chrome 116 or later.
+[Get started](#get-started) | [What you can do](#what-you-can-do) | [Release downloads](https://github.com/cyberofficial/dsh-plugin-chrome-controller/releases) | [Browser skill](skills/chrome-browser/SKILL.md)
 
-The first version supports DSH Web. Headless and CLI profiles do not provide the authenticated browser pairing route. The default Web profile includes the credential store; custom compositions must provide one. The linked package has no extra runtime package dependencies to install.
+## How it works
 
-## Install the DSH plugin
+- The **Chrome extension** pairs your Chrome profile to DSH Web and carries out actions through Chrome's debugger API. You can see the virtual cursor sweep between controls along a Bézier arc and watch text appear keystroke by keystroke.
+- The **DSH plugin** adds the browser tools, pairing settings, and the `/chrome-browser` skill to DeepSeek Harness. Actions on a tab run in order, and work on different tabs can run in parallel. DSH sessions share the paired browser.
 
-From a terminal with DSH installed:
+## What you can do
 
-```powershell
-dsh plugin --profile web install "link:C:/path/to/dsh-plugin-chrome-controller"
-```
+| Workflow | What it looks like |
+| --- | --- |
+| **Forms and review** | Fill drafts across tabs and stage up to four Save or Submit clicks for review in DSH Web. Choose **Approve once**, **Skip**, or **Needs changes** for each tab. |
+| **Workbooks** | Check the active sheet and select cells or ranges in Excel Online and Google Sheets. In Excel Online, read ranges when the editor exposes a compatible API, or watch the formula bar with cell addresses. |
+| **Notes and click targets** | Attach instructions to an element with **Note Mode**, or mark a place for the agent to click with **Points of Interest**. Browse saved notes and points for the current site or across all sites. |
+| **Embedded apps and live updates** | Inspect and scroll inside accessible frames, including cross-origin frames. Watch several elements in one iframe, or arm a main-page wait before triggering a change. |
+| **Automation and debugging** | Run a sequence of clicks, typing, scrolling, and waits. Take screenshots, inspect page content, or capture console errors and network activity during a reproduction. |
+| **Signed-in downloads** | Save supported files of up to 10 MiB from a signed-in tab to your DSH session workspace. A credentialed cross-origin retry requires approval. Regular Chrome downloads go to the browser's computer. |
 
-Restart DSH Web and reload its page after installation or an update.
+Form review covers the staged click on a standard HTML form in the main document. The extension rechecks the form and button before clicking. Some sites autosave during entry. Recognized sensitive values are masked in the review, and other previewed values may appear in the DSH session transcript.
 
-## Load the Chrome extension
+## Get started
 
-1. Open `chrome://extensions`.
-2. Turn on Developer mode.
-3. Select **Load unpacked** and choose this package's `extension` folder. Approve HTTP and HTTPS site access when Chrome asks.
-4. Open DSH Web yourself in an authenticated browser. Choose **Settings**, then **Chrome browser**, and copy the DSH Web origin and pairing code. The direct page is `http://127.0.0.1:3080/api/dsh-browser-extension/pairing` (use your DSH Web origin if it differs).
-5. Open the extension popup, choose **Settings**, enter the DSH Web origin and pairing code, and save.
-6. Click **Connect to DSH Web** in the popup. Connecting does not open a DSH tab.
+You'll need **Chrome 116 or later** and **DeepSeek Harness Web**. [DeepSeek Harness setup](https://github.com/deepseek-ai/deepseek-harness#run)
 
-DSH stores the pairing code in its credential store. The Chrome browser section in DSH Settings shows and rotates it. The extension saves it in Chrome's local extension storage, which is restricted to trusted extension contexts but is not encrypted on disk. The service worker exchanges the code for a short-lived, single-use token, then a browser session token kept in Chrome's session storage. Tokens travel in JSON bodies, not URLs, and neither side writes them to logs. With **Connect automatically** enabled, the extension connects when Chrome starts or the extension reloads. It retries after interruptions and opens no tabs. Rotating the code disconnects the extension; save the new code in extension Settings before reconnecting. **Disconnect** stops current retries. Turn off automatic connection in Settings to keep it disconnected after Chrome starts or the extension reloads.
+1. **Install the DSH plugin.** Clone or download this repository on the machine running DSH. Replace the example path with the full path to your checkout.
 
-The extension requests access to HTTP and HTTPS websites so it can inject the virtual cursor overlay on tabs you ask it to control. Chrome warns that the debugger permission can control browser tabs and that the downloads permission can manage downloads. The overlay is cosmetic; page input is sent through Chrome's debugger API.
+   ```sh
+   dsh plugin --profile web add "link:C:/path/to/dsh-plugin-chrome-controller"
+   ```
 
-Open the extension popup and select **Settings** to customize typing delays and key holds, longer pauses, cursor speed and arc, drag duration, and the delay between sequence steps. In **Interaction timing**, use **Play preview** to time your current typing settings on three sentences before saving. Expand **Compare** under a group of controls to play side-by-side examples using preset values and your current edits. The moving playhead shows the timing of the typing, cursor, drag, or sequence sample. Each setting has a description and allowed range. The defaults are the project's tested baseline. Changing them may cause sites to flag or restrict activity; no settings guarantee a site will accept interactions.
+   Restart DSH Web and reload its page.
+2. **Load the Chrome extension.** On the computer running Chrome, open `chrome://extensions`, turn on **Developer mode**, and use **Load unpacked** to select the repository's `extension` folder.
+3. **Copy the pairing details.** In signed-in DSH Web, open **Settings** > **Chrome browser** and copy the **DSH Web origin** and **Pairing code**. You can also open `/api/dsh-browser-extension/pairing` on the DSH Web origin.
+4. **Connect from Chrome.** Open **Settings** in the extension popup, enter the origin and code in **Connection**, and click **Save connection**. Return to the popup and click **Connect to DSH Web**. The popup shows **Connected to DSH Web** when pairing succeeds, and the connection runs in the background.
 
-The extension Settings page has a **DSH Web connection** section for the DSH Web origin, saved pairing code, and automatic connection toggle. The code field stays blank after saving; leave it blank to keep the saved code, or paste a new code after rotation. The page shows the DSH pairing page address for the current origin. The popup's **Connect** button uses these saved settings without opening a DSH tab.
+### Remote DSH Web
 
-Once paired, the extension keeps its Manifest V3 service worker alive on its own: a 30-second heartbeat alarm wakes the worker if Chrome suspends it, and a 25-second `chrome.runtime.getPlatformInfo()` call resets the worker's idle timer while it runs. Browser tools therefore respond without opening the extension popup. After updating the extension, reload it on `chrome://extensions` and click **Connect** again. The saved pairing code remains in extension Settings; copy a new one if it was rotated. Reload any page that had an element watcher running before the update.
+The default local origin is `http://127.0.0.1:3080`. For remote DSH Web, use an HTTPS origin reachable from Chrome. DSH must trust that host, which you can configure with `--trusted-host <host>`. If you use a reverse proxy, preserve the original `Host` header and forward `/api/dsh-browser-extension/` on that origin to DSH. [DSH deployment guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/public-deployments.md)
 
-## Element notes
+## Try it in DSH Web
 
-1. Open the extension popup and click **Note Mode**, or right-click an element and choose **DSH Note Mode**. When the right-click target is available, the picker highlights it and shows **Add note**. Otherwise, select an element with the picker.
-2. Point at an element. Press Up to select a larger container or Down to narrow the selection, then click to use the highlighted area. Use the position menu to move the controls to any corner of the viewport.
-3. Write your note and click **Save note**. The note is saved together with the element's viewport point (X,Y), so DSH can point the LLM at where to click — for example inside an iframe such as Excel Online, where X,Y identifies the element's position in that frame. Note Mode resumes so you can select another element. Click **Done** or press Escape when you're finished.
-4. In DSH, ask "Read my notes for this site" to find notes from any page on the same hostname and port, or ask for notes on this exact page.
+Ask the agent to use `/chrome-browser`. Give it the tab titles and the details to enter, then set a review checkpoint.
 
-**Page Notes** lists notes from the current site and shows numbered outlines for notes on the exact page you are viewing. Use **Locate** to scroll to a marked element, or follow the page link for a note saved on another page. **All Notes** shows the source URL on each note and lets you filter, edit, and delete notes across sites. Ask DSH to "Read my master list of notes" to see that list in chat. In either list, click **Delete** twice within 200 milliseconds to remove a note.
+> Use my open request tabs. Read my saved page notes, then fill the forms with the details below. Show me the pending Save clicks in DSH Web so I can review each tab. After I decide, verify the outcome for each form I approved.
 
-Older notes are listed under **Unknown page** until you open the original page in Note Mode or Page Notes, or ask DSH to read notes from that exact page. You can edit or delete those notes from All Notes at any time. All Notes shows the original address when Chrome has recorded it. Page Notes and the DSH tool show source addresses without query strings or fragments.
+The included skill has examples for choosing the right tab and frame, watching changes, working in spreadsheets, and verifying what a site did after an action. [Read the browser skill](skills/chrome-browser/SKILL.md)
 
-The picker works on HTML pages and can select an iframe or shadow host as a whole. If the page layout changes, check that the XPath still identifies the intended element.
+## Extension settings
 
-## Remote DSH Web
+- In **Connection**, turn on **Connect automatically** to pair at Chrome startup or extension reload and retry after interruptions. To replace a pairing code, rotate it in DSH Web, then save the new one in the extension.
+- In **Site access**, set a **Whitelist** or **Blacklist** to control which domains DSH can open or operate on. The filter is off by default. It checks top-level tab addresses and tool-requested destinations. Entries include subdomains, and permitted pages can still use embedded frames.
+- System **Clipboard** access is off by default. Acknowledge and enable it to let DSH read or replace the clipboard and paste with Ctrl+V. The paste tool can fall back to fast typing when clipboard access is off or the paste fails.
+- In **Interaction timing**, adjust typing pauses, cursor movement, drag duration, and the spacing between sequence steps. Play previews to see how your settings feel before saving.
 
-DSH Web does not have to run on the same computer as Chrome. For example, it can run in a container or on a NAS behind a reverse proxy or a tailnet name such as `https://dsh.example.ts.net`. Requirements:
-
-- **HTTPS.** The extension accepts plain HTTP only for loopback addresses (`127.0.0.1`, `localhost`, `[::1]`), so the pairing code and session tokens never travel unencrypted.
-- **A trusted authority.** The extension routes accept a request when its `Host` is loopback on a loopback connection, or when DSH Web's own `/api` Host fence accepts it: the listener's bind address or an authority passed with `dsh --profile web --trusted-host <host>` (the `connection` row's `trustedHosts`). If the DSH Web UI works at that address, the extension routes do too.
-- **The proxy forwards the original `Host` header**, as it must for DSH Web itself.
-
-Enter the HTTPS origin shown in DSH **Settings → Chrome browser** in the extension Settings. The extension routes do not use the DSH Web login cookie; the pairing code authenticates them. After 10 wrong pairing codes within a minute, every pairing attempt is refused with a "wait a minute" message (HTTP 429) until the minute has passed; the extension popup shows that message when Connect fails. The counter is global, because behind a proxy every peer looks local, so anyone who can reach a trusted address can also hold the limit open and block pairing. Only expose DSH Web on networks you trust, as for DSH Web itself.
-
-## Browser domain filter
-
-In the extension's **Settings**, open **Browser domain filter**. Enter one domain or URL per line, choose **Whitelist** to permit only listed domains or **Blacklist** to block listed domains, then save. **Off** is the default. The same list is kept when you switch modes. Each entry includes its subdomains, regardless of port or path.
-
-The filter checks the main tab address and the destinations passed to tab-opening and navigation tools. Blocked tabs are omitted from DSH's tab list. Chrome can still load a page reached by a link or redirect. If the main tab lands on a blocked domain, DSH denies access to it. Embedded frames in an allowed tab continue to work.
-
-## Clipboard access
-
-The extension can read and write the system clipboard, but **only after you opt in** on the extension Settings page: first check **I understand the risks and want to allow clipboard access**, then check **Allow DSH to read the clipboard and paste text into pages**, and save. Both checkboxes must be on; unchecking the acknowledgement also turns the toggle off. While disabled, every clipboard tool returns an error.
-
-**Risk:** with clipboard access enabled, DSH can read everything currently on your clipboard (which may contain passwords, tokens, or other private data) and can place text on the clipboard and paste it into pages with a real Ctrl+V. Keep it off unless you need it, and never let the model read the clipboard unless the task requires it.
-
-- `dsh_browser_clipboard_read` returns the clipboard as text (capped at 1,000,000 characters). Use it to read what the user copied, for example a large spreadsheet selection copied in Excel or Google Sheets.
-- `dsh_browser_clipboard_write` places text on the clipboard (1 to 1,000,000 characters).
-- `dsh_browser_paste` writes `text` to the clipboard, optionally focuses a CSS `selector`, and sends a real Ctrl+V key event to paste it into the page field.
-
-The clipboard operations run in a dedicated offscreen document (Chrome's `clipboardRead`, `clipboardWrite`, and `offscreen` permissions), which Chrome warns about when the extension is loaded.
-
-## Browser tools
-
-- `dsh_browser_tabs` lists tabs or opens, activates, and closes one.
-- `dsh_browser_frames` lists every frame of a tab, including cross-origin app frames, with its integer `frameId`, URL, origin, and title. Pass that `frameId` to frame-aware snapshot, HTML, evaluation, element-watch, or workbook tools. Frame IDs change on navigation.
-- `dsh_browser_element_watch` logs text or value changes in the main page or an accessible iframe. Start one watcher per call. For example, in the same iframe start `watchId: "status"` on `#status` and `watchId: "row-count"` on `#row-count`. Read or stop each with the original tab ID, frame ID, and watch ID. Each log holds up to 5,000 entries with values capped at 500 characters. Omit `watchId` for the default watch, or use `preset: "excel-online"` to log the formula bar with cell addresses.
-- `dsh_browser_workbook_status` reads the active sheet and selection in Excel Online and Google Sheets. Omit `frameId` for automatic detection.
-- `dsh_browser_workbook_navigate` enters a cell or range address in the active sheet's name box and presses Enter. Check the result for selection confirmation before using the destination.
-- `dsh_browser_workbook_values` reads a cell or bounded range such as `B2:F20` from an Excel Online app frame. Pass the `frameId` reported by workbook status or `dsh_browser_frames`. Omitting the address requests the active sheet's used range. The result identifies the sheet, range, and read method and reports whether displayed text and formulas are available. Reads are limited to 10,000 cells and 1,000,000 result characters. If the live frame exposes no compatible workbook API, use the element watcher and verify readings against the settled selection.
-- `dsh_browser_workbook_probe` reports Excel API globals and selected WAC internals in the app frame. It includes the full grid controller prototype, one level of its object members, and the shapes of `grid.usedRange`, `grid.mc.sheets`, and sheet model entries under `grid.nGi`. It does not return property values, cell contents, or access tokens. Use it when `dsh_browser_workbook_values` reports that no compatible API is available.
-- `dsh_browser_workbook_file` tries Excel's used-range text endpoint when available and then the WOPI file endpoint from an Office Online app frame. It returns either text or base64 file bytes. Excel Online may reject both requests, so prefer `dsh_browser_workbook_values` or the element watcher. The access token stays inside the extension process.
-- `dsh_browser_navigate` opens an HTTP or HTTPS URL in a tab and waits for loading to finish before returning the final URL.
-- `dsh_browser_back`, `dsh_browser_forward`, and `dsh_browser_reload` operate on tab history and wait for the resulting load. Back and forward report whether navigation was observed.
-- `dsh_browser_wait_for_change` waits for a unique element's text, form value, or attribute to change. Use `action: "arm"` before triggering an update, then wait with the returned `watchId` to catch changes that already happened. Each watch retains the last 30 changes. The watch expires after 10 minutes without a wait call, and the default wait is 10 minutes or the harness timeout if it is shorter.
-- `dsh_browser_wait` waits for a fixed duration. `dsh_browser_wait_for_element` waits for a CSS selector to become visible, hidden, attached, or detached, with a timeout.
-- `dsh_browser_snapshot` returns the tab title, URL, visible text, and links. With a `frameId`, the snapshot is read inside that frame and also reports input fields (name box, formula bar), element/canvas rects, the parsed spreadsheet used range when present, and a best-effort grid-cell dump. Frame snapshots mask common `access_token` and `Authorization: Bearer` patterns, including in URLs, but redaction is not comprehensive; other secrets may appear.
-- `dsh_browser_find` searches the main page DOM with CSS or XPath and returns ordered candidates with text, links, visibility, and viewport locations. Use it to distinguish repeated matches before clicking.
-- `dsh_browser_get_source` returns the original main-document content retained by Chrome, if available. It does not refetch the page or fall back to the live DOM.
-- `dsh_browser_get_html` returns current live DOM HTML, optionally for a CSS-selected element and character limit. It does not fetch the original server response bytes. With a `frameId`, the HTML is read inside that frame.
-- `dsh_browser_evaluate` runs JavaScript in the selected page context and returns synchronous values or resolved Promise results. It can read or change page state and send requests as the page; `timeoutMs` is capped at 30 seconds. With a `frameId`, the expression runs inside that frame; MV3 CSP blocks `eval`-style evaluation in frames, so the result reports that clearly instead of returning null.
-- `dsh_browser_click` clicks a CSS-selected element or a viewport coordinate, showing the virtual cursor sweeping to the point first.
-- `dsh_browser_mouse_move` hovers a unique CSS-selected element or moves to viewport coordinates, showing the virtual cursor and dispatching a real `mouseMoved`.
-- `dsh_browser_drag` performs a real left-button drag between two visible elements or viewport coordinates, with intermediate mouse-move events. Activate the target tab first; mouse movement can stall on background tabs.
-- `dsh_browser_scroll` brings a CSS-selected element into view or scrolls by horizontal and vertical deltas. Use `frameId` to scroll inside a frame and `containerSelector` with deltas to scroll an open menu, panel, or list.
-- `dsh_browser_fill` replaces the text in a CSS-selected field by typing it character by character. `dsh_browser_type_human` does the same into the focused or a CSS-selected field and types the entire supplied string in one run (up to 2000 characters). Bulk pasting-style insertion is not available: instant text injection is a banned action, so `page.type` refuses to run.
-- `dsh_browser_submit` submits a CSS-selected form with `requestSubmit()`, preserving native validation. Its result reports whether submission was attempted and the form's validity, not whether the site completed the submission.
-- `dsh_browser_keypress` presses a supported key, optionally with modifiers as a chord joined by `+` (e.g. `Ctrl+L`, `Control+Shift+ArrowRight`, `Cmd+A`). Chords that close the browser or tab (`Alt+F4`, `Ctrl+W`, `Cmd+W`, `Ctrl+Shift+Q`) are refused.
-- `dsh_browser_screenshot` captures the visible tab and returns it as an image.
-- `dsh_browser_sequence` runs up to 32 planned actions on one tab in order, including drag, history navigation, and waits, with a configurable pause between actions (120 ms by default). It returns each step's result and stops at the first failed step.
-- `dsh_browser_network` captures request and response metadata from one tab, optionally while running up to 10 planned actions. Sensitive values such as cookies and authorization headers require `includeSensitiveData: true`; request bodies are then included only when Chrome exposes them. Text response bodies require the separate `includeResponseBodies: true` option. Both options can expose credentials or private page data, so keep captures task-scoped. Capture is bounded to 200 requests, 500 cookies for observed URLs, 10 request bodies, and 10 response bodies of at most 256 KB each.
-- `dsh_browser_console` captures console messages, browser log entries, and uncaught exceptions for a short period, optionally while planned actions run.
-- `dsh_browser_extract` returns bounded structured table rows, links, or list items.
-- `dsh_browser_focus`, `dsh_browser_blur`, and `dsh_browser_select` control standard page focus and native select elements. Selection dispatches input and change events but does not submit the form.
-- `dsh_browser_upload` attaches user-authorized local files to a file input. The site's change handler may upload immediately; the tool does not submit the form.
-- `dsh_browser_download` starts a download, reports its status, or cancels it. Starting defaults to Chrome's Save As dialog. The file lands on the browser's computer.
-- `dsh_browser_save_file` fetches a URL from inside a chosen tab, so the request uses that page's cookies and signed-in session, and writes the file into `.tmp/downloads/` under the DSH session workspace. That directory is fixed: the model cannot choose another one, and DSH loads no skills, instructions, or configuration from it. Names DSH reads as instructions (`AGENTS.md`, `CLAUDE.md` and their `.local.md` variants) are renamed. The directory and the file are created by processes confined with the DSH sandbox provider (`ctx.sandbox`: bwrap, Landlock, Seatbelt, or Windows ACLs), the file write confined to the download directory alone, so a symlink or directory swapped during the save cannot redirect it. A read-only session policy, or a profile without the working-directory, sandbox-policy, and sandbox services, refuses the save. The bytes travel over the extension's existing connection to DSH; cookies and tokens never leave Chrome, and the model only sees the saved path, size, and SHA-256. Files are limited to 10 MB and never overwrite existing files. When the server answers but the page may not read a cross-origin response (no CORS headers), the user is asked through DSH's approval prompt before the extension's service worker fetches that exact URL with the browser's cookies. That fetch does not follow redirects on its own: each redirect target is shown in a new approval prompt, up to 5 hops. The approval token is a one-time value bound to the tab and URL, exchanged between the plugin and the extension; the model never sees it. Without an approval channel, or under the `never` approval policy, such saves are refused. Network failures are reported, not retried. A save may take up to 3 minutes before it times out.
-- `dsh_browser_element_notes` reads the user's saved element notes (see above), now including each note's stored viewport point (X,Y).
-- `dsh_browser_clipboard_read`, `dsh_browser_clipboard_write`, and `dsh_browser_paste` use the system clipboard — see **Clipboard access** above. They fail with a clear error until the user enables the setting in extension Settings.
-- `dsh_browser_wait_user` marks a human handoff. The model should tell the user what to do and stop browser actions until the user replies.
-
-For Excel Online, start with `dsh_browser_workbook_status`. Use `dsh_browser_workbook_navigate` to select a cell or range, and prefer a bounded `dsh_browser_workbook_values` read when the user supplies a range. The `chrome-browser` skill describes the watcher fallback and how to verify a cell edit.
-
-All live DSH Sessions share the paired browser: operations on the same tab are serialized in order, while different tabs can be driven in parallel. The extension keeps 4 long-polls open (Chrome allows only ~6 connections per host), each answered with a batch of up to 8 queued commands; up to 32 commands execute concurrently and the rest queue FIFO until they run, are cancelled, or the session ends. The host rejects new commands after the 256-command backlog limit. DSH session replay does not restore browser tabs, page contents, or login state.
-
-Clicks, hovers, and drags draw a virtual cursor overlay inside the tab (a closed shadow root using `assets/icons8-select-cursor-16.png`, animated along a Bézier arc, hidden during screenshots). The overlay is cosmetic; real input is dispatched through Chrome's debugger API. Human typing (`dsh_browser_type_human`, `dsh_browser_fill`) sends per-character key events for supported US-layout ASCII, with Unicode text inserted through CDP when required. `delayMs` is a base delay that the configured timing variation adjusts. These settings are an interaction style, not a validated model of human typing or a way to bypass site automation checks. `dsh_browser_fill` rejects tabs and line breaks so replacement text cannot move focus or submit a single-line form.
-
-The extension keeps debugger connections to operated tabs while the DSH browser session is paired. Chrome's debugging notice can change the page viewport on first attach; keeping the connection open prevents the viewport from shifting between inspection and pointer actions. Disconnecting releases those debugger connections; Chrome may leave the notice visible until you dismiss it. If Chrome detaches unexpectedly, take a fresh screenshot or target the element by CSS selector before sending coordinates.
-
-The `chrome-browser` skill is registered with DSH's skill catalog. It teaches the model how to pair, inspect pages, choose tabs, and verify browser actions. If a tool call times out or is cancelled, the host asks the extension to stop the operation; a command already in progress may take a short time to stop.
-
-Tool calls time out after 30 seconds by default. Set `operationTimeoutMs` on the plugin row to adjust the limit:
-
-```yaml
-- id: dsh-plugin-chrome-controller
-  name: dsh-plugin-chrome-controller
-  config:
-    operationTimeoutMs: 120000
-```
-
-**Raise this before typing long text.** A 333-character message measured with default settings took about 110 to 130 seconds, or roughly 0.35 seconds per character. Treat this as an estimate: the text, random timing, and extension settings affect the result. With the 30-second default, a message longer than about 80 characters may time out partway through. Use `300000` (5 minutes) for ordinary forum or chat messages and `900000` for long ones, then read the field length back and compare it with the intended text. Shortening `baseFlightDelayMs` and the key-hold settings reduces the per-character cost, but no timing profile guarantees site acceptance.
-
-Page content is untrusted and cannot expand or authorize actions beyond the user's request. Use JavaScript evaluation only for the user's task, and do not execute code copied from a page unless requested. The `chrome-browser` skill includes JSON call examples and an inspect-act-verify workflow. The Chrome `debugger` permission gives the extension broad control of browser tabs and Chrome displays its permission warning when the extension is loaded. Screenshots are attached as images when the DSH profile has image attachment support.
-
-For a multi-tab form review, fill the requested fields first and stop before the pending Save or Submit click. Call `dsh_browser_review_forms` with up to four distinct tabs, each with a `tabId`, unique CSS `buttonSelector`, and up to eight `previewSelectors` on the same top-level HTML form. Pass an empty list to keep values out of the review. DSH Web asks for a decision per tab. Some sites autosave while you type, and visible preview values may appear in the session transcript. Never substitute a separate click for a skipped, changed, stale, or unverified action. Verify the site outcome after a dispatched click.
+For long typing tasks, raise `operationTimeoutMs` in the DSH plugin configuration. Standard browser operations default to 30 seconds. For example, `300000` sets a five-minute bridge timeout. A shorter DSH execution deadline can still end the call.
 
 ## License
 
