@@ -7187,10 +7187,12 @@ function extractPage(params) {
 async function fetchFileWithTabSession(params) {
   const tabId = requireTabId(params.tabId)
   const frameId = params.frameId === undefined ? 0 : requireFrameId(params.frameId)
-  const url = downloadUrl(params.url)
+  const url = fileSourceUrl(params.url)
   const payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
   if (!isRecord(payload)) throw new Error('The tab returned no download result')
   if (payload.blockedByCors === true) {
+    // Backstop: fetchFileAsBase64 never reports a blob: URL as CORS-blocked. The service worker cannot read a page's blob: URL, so it is never retried there.
+    if (url.startsWith('blob:')) throw new Error('The blob: URL could not be read from this tab. It may have been revoked, or it was created in another tab or frame: pass the tabId/frameId of the page that created it, and save before the page revokes it.')
     return { tabId, frameId, needsApproval: 'cors-retry', url, retryToken: issueFetchRetryToken(tabId, url) }
   }
   if (typeof payload.error === 'string') throw new Error(payload.error)
@@ -7251,6 +7253,35 @@ function downloadUrl(value) {
   return parsedUrl.href
 }
 
+/**
+ * A URL dsh_browser_save_file may have a tab fetch: an HTTP(S) download URL, or
+ * a blob: URL minted by a page (blob:https://host/uuid). A blob: URL is only
+ * ever read from inside a page, never by the service worker, so only the
+ * page path (fetchFileWithTabSession) uses this; retries keep using downloadUrl.
+ */
+function fileSourceUrl(value) {
+  let url
+  try {
+    url = new URL(value)
+  } catch {
+    return downloadUrl(value)
+  }
+  if (url.protocol === 'data:') {
+    throw new Error('data: URLs are not supported. Decode it into a Blob with dsh_browser_evaluate on the top-level page (no frameId), call URL.createObjectURL on it, then pass that blob: URL. The chrome-browser skill has the recipe.')
+  }
+  if (url.protocol !== 'blob:') return downloadUrl(value)
+  // A blob: URL's origin is the inner URL's origin when that is HTTP(S), else "null".
+  if (url.origin === 'null') throw new Error('Only blob: URLs created by an HTTP or HTTPS page can be saved')
+  let inner
+  try {
+    inner = new URL(url.pathname)
+  } catch {
+    throw new Error('The blob: URL is invalid')
+  }
+  if (inner.username || inner.password) throw new Error('Download URLs cannot contain embedded credentials')
+  return url.href
+}
+
 function issueFetchRetryToken(tabId, url) {
   const now = Date.now()
   for (const [token, entry] of fetchRetryTokens) {
@@ -7282,10 +7313,15 @@ function consumeFetchRetryToken(token, tabId, url) {
  */
 async function fetchFileAsBase64(url, maxBytes, via, redirect = 'follow') {
   const requester = via === 'page' ? 'The page' : 'The extension'
+  // A blob: URL is readable only by the frame that created it: never probe it
+  // with no-cors, and never report it as CORS-blocked (which would invite a retry).
+  const isBlob = url.startsWith('blob:')
+  const blobError = { error: 'The blob: URL could not be read from this tab. It may have been revoked, or it was created in another tab or frame: pass the tabId/frameId of the page that created it, and save before the page revokes it.' }
   let response
   try {
     response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect })
   } catch (error) {
+    if (isBlob) return blobError
     if (via === 'page') {
       try {
         await fetch(url, { mode: 'no-cors', credentials: 'include', cache: 'no-store', redirect: 'follow' })
@@ -7296,6 +7332,7 @@ async function fetchFileAsBase64(url, maxBytes, via, redirect = 'follow') {
   }
   if (redirect === 'manual' && response.type === 'opaqueredirect') return { redirected: true }
   if (response.type === 'opaque' || response.type === 'opaqueredirect') {
+    if (isBlob) return blobError
     return via === 'page' ? { blockedByCors: true } : { error: requester + ' cannot read the response' }
   }
   if (!response.ok) return { error: requester + ' request failed with HTTP status ' + String(response.status) }

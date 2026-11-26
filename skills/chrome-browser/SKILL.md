@@ -291,7 +291,7 @@ Example for `dsh_browser_element_watch` to sample the formula bar while visiting
 | --- | --- | --- |
 | `dsh_browser_upload` | Give `tabId`, a unique main-document file input `selector`, and `paths` containing 1 to 10 explicitly authorized absolute paths on the Chrome computer. Multiple files require a multiple-file input. Selecting a file can trigger a site's automatic upload. | Check `selectedCount` and file names, then check the site's upload or attachment state. |
 | `dsh_browser_download` | For `action: "start"`, pass an HTTP or HTTPS `url`, optional simple `filename`, and optional `saveAs`. Save As defaults to true. For `status` or `cancel`, pass `downloadId`. | Check `state`, received bytes, and any interruption. The file is a Chrome download on the browser computer. Ask the user to handle the Save As dialog if it appears. Cancelling is a download action and does not delete a completed file. |
-| `dsh_browser_save_file` | Give `tabId`, an HTTP or HTTPS file `url`, and optional `frameId` or simple `filename`. Fetches through the page, using its signed-in session subject to Chrome's rules. Saves up to 10 MiB in `.tmp/downloads/` in the DSH session workspace when the profile and workspace policy allow writing. | Check `saved`, `path`, `bytes`, and `sha256`. The tool returns metadata and chooses a numbered suffix if the name already exists. |
+| `dsh_browser_save_file` | Give `tabId`, an HTTP or HTTPS file `url` (or a `blob:` URL the page created, see below), and optional `frameId` or simple `filename`. Fetches through the page, using its signed-in session subject to Chrome's rules. Saves up to 10 MiB in `.tmp/downloads/` in the DSH session workspace when the profile and workspace policy allow writing. | Check `saved`, `path`, `bytes`, and `sha256`. The tool returns metadata and chooses a numbered suffix if the name already exists. |
 | `dsh_browser_wait_user` | Supply a short `reason` and optionally `tabId` when the user needs to interact with Chrome, choose a file, or handle a verification prompt. | It returns `awaitingUser: true`. Explain the specific next action and wait for the user, then inspect the refreshed state. |
 
 If the page cannot read a file because of cross-origin restrictions, `dsh_browser_save_file` may request one-time approval for a credentialed extension fetch. Each redirect in that extension fetch requires its own approval. If approval is rejected or unavailable, explain the failure and leave the fetch stopped. Keep pairing codes, cookies, and authorization tokens out of tool arguments and reports.
@@ -301,6 +301,20 @@ Example for `dsh_browser_save_file` to save a verified link into the workspace w
 ```json
 {"tabId":42,"url":"https://example.com/report.pdf","filename":"report.pdf"}
 ```
+
+Saving a blob: URL: some "Download" buttons build the file in the page with `URL.createObjectURL`, so no URL exists that you could refetch. If the page exposes the `blob:` URL (for example an `<a href="blob:…">`, or one you read with `dsh_browser_evaluate`), pass it to `dsh_browser_save_file` with the `tabId` of the page, and the `frameId` when an iframe created it. It is read from inside that page and needs no approval. A blob URL gives no name, so pass the original `filename` the page offers, often the link's `download` attribute (for example `report.csv` or `report.xlsx`). Without it, the extension comes from the detected content family: a CSV is saved as `.txt`, an XLSX or DOCX as `.zip`, and unrecognisable content is refused. When the name does not matter and the content is an exact format such as PDF or PNG, you can omit it. A revoked blob, or one that tab or frame cannot read, fails with an explicit error: save before the page revokes it, and do not reload the page, which destroys the blob. Never read or log bearer tokens.
+
+```json
+{"tabId":42,"url":"blob:https://example.com/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11","filename":"invoice.pdf"}
+```
+
+If the page gives you a `data:` URL instead (an `<a href="data:…">` or an image source), do not pass it to the tool or copy it out of the page. Decode it into a blob in place with `dsh_browser_evaluate` on the top-level page (no `frameId`), then save the returned `blob:` URL. Adjust the selector to the element that holds the `data:` URL. The recipe decodes the URL instead of fetching it, so a page's Content Security Policy cannot block it:
+
+```json
+{"tabId":42,"expression":"(u => { const i = u.indexOf(','), meta = u.slice(5, i), body = u.slice(i + 1); const bytes = /;base64$/i.test(meta) ? Uint8Array.from(atob(body), c => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(body)); return window.__u = URL.createObjectURL(new Blob([bytes], { type: meta.split(';')[0] })) })(document.querySelector('a[download]').href)"}
+```
+
+This only works in the top-level page: `dsh_browser_evaluate` with a `frameId` cannot run it, since the extension's content security policy blocks compiling an expression in a frame. For a `data:` URL inside an iframe, ask the user to download the file instead.
 
 ## Browser diagnostics
 
