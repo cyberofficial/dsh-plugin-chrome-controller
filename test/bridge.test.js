@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, it, mock } from 'node:test'
 import { BrowserExtensionBridge } from '../lib/bridge.js'
+import { apply } from '../lib/index.js'
 
 const EXTENSION_ORIGIN = 'chrome-extension://' + 'a'.repeat(32)
 const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
@@ -203,6 +204,45 @@ describe('BrowserExtensionBridge authority admission', () => {
     bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
     assert.ok(context.routes.has('/dsh-browser-extension/connect'))
   })
+})
+
+it('lets a change wait reach its extension deadline and honors harness cancellation', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const context = fakeContext()
+  const tools = new Map()
+  context.tools = { register(tool) { tools.set(tool.name, tool) } }
+  context.systemPrompt = { section() {}, getSectionOrder: () => 0 }
+  context.skills = { register() {} }
+  context.effect = factory => t.after(factory())
+
+  await apply(context)
+  const sessionToken = await connect(context)
+  const waitForChange = tools.get('dsh_browser_wait_for_change')
+  const args = { tabId: 42, selector: '#status' }
+  const result = waitForChange.execute(args, { signal: new AbortController().signal }).catch(error => error)
+  const firstPoll = await call(context, 'poll', { body: { sessionToken } })
+  const [command] = firstPoll.json.commands
+  assert.equal(command.method, 'page.waitForChange')
+  assert.equal(command.params.timeoutMs, 600_000)
+
+  t.mock.timers.tick(600_000)
+  const message = 'Timed out waiting for the selected element to change'
+  await call(context, 'respond', {
+    body: { sessionToken, id: command.id, ok: false, error: { message } },
+  })
+  assert.equal((await result).message, message)
+
+  const controller = new AbortController()
+  const pending = waitForChange.execute({ ...args, timeoutMs: 45_000 }, { signal: controller.signal })
+  const secondPoll = await call(context, 'poll', { body: { sessionToken } })
+  const [shortWait] = secondPoll.json.commands
+  assert.equal(shortWait.params.timeoutMs, 45_000)
+
+  t.mock.timers.tick(5_000)
+  controller.abort(new Error('Harness deadline reached'))
+  await assert.rejects(pending, { message: 'Harness deadline reached' })
+  const cancelled = await call(context, 'poll', { body: { sessionToken } })
+  assert.deepEqual(cancelled.json.cancelled, [shortWait.id])
 })
 
 describe('BrowserExtensionBridge pairing failure limit', () => {

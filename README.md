@@ -41,7 +41,7 @@ You'll need **Chrome 116 or later** and **DeepSeek Harness Web**. [DeepSeek Harn
 
 ### Remote DSH Web
 
-The default local origin is `http://127.0.0.1:3080`. For remote DSH Web, use an HTTPS origin reachable from Chrome. DSH must trust that host, which you can configure with `--trusted-host <host>`. If you use a reverse proxy, preserve the original `Host` header and forward `/api/dsh-browser-extension/` on that origin to DSH. [DSH deployment guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/public-deployments.md)
+The default local origin is `http://127.0.0.1:3080`. For remote DSH Web, use an HTTPS origin reachable from Chrome. DSH must trust that host, which you can configure with `--trusted-host <host>`. If you use a reverse proxy, preserve the original `Host` header and forward both `/api/dsh-browser-extension/` and `/dsh-browser-extension/` on that origin to DSH. [DSH deployment guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/public-deployments.md)
 
 ## Try it in DSH Web
 
@@ -58,7 +58,7 @@ The included skill has examples for choosing the right tab and frame, watching c
 - System **Clipboard** access is off by default. Acknowledge and enable it to let DSH read or replace the clipboard and paste with Ctrl+V. The paste tool can fall back to fast typing when clipboard access is off or the paste fails.
 - In **Interaction timing**, adjust typing pauses, cursor movement, drag duration, and the spacing between sequence steps. Play previews to see how your settings feel before saving.
 
-For long typing tasks, raise `operationTimeoutMs` in the DSH plugin configuration. Standard browser operations default to 30 seconds. For example, `300000` sets a five-minute bridge timeout. A shorter DSH execution deadline can still end the call.
+For long typing tasks, raise `operationTimeoutMs` in the DSH plugin configuration. Standard browser operations default to 30 seconds. For example, `300000` sets a five-minute bridge timeout. Change waits have a separate 10-minute default. A shorter DSH execution deadline can end either kind of operation.
 
 ## License
 
