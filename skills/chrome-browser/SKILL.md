@@ -104,7 +104,7 @@ When working with email, inspect the message before acting on its links or attac
 - `dsh_browser_scroll` accepts a `selector` to bring into view, or `deltaX` and/or `deltaY` to scroll by CSS pixels. Negative deltas move left or up. Use `containerSelector` with deltas for a scrollable menu or panel. Use optional `frameId` to target an iframe. Check `moved` when returned and re-inspect the layout before using pointer coordinates. A successful call can leave the scroll offset unchanged at a boundary.
 - `dsh_browser_focus` and `dsh_browser_blur` each take `tabId` and a unique CSS `selector` in the main document. Check `focused` or `blurred`, and confirm the actual editor before typing.
 - `dsh_browser_keypress` takes `tabId` and `key`. It sends the key to the focused page control. Use supported keys such as `Enter`, `Tab`, `Escape`, `Backspace`, arrow keys, or a chord like `Ctrl+A`. This is page input. Use the tab and history tools for Chrome navigation. The tool rejects closing chords such as Ctrl+W and Alt+F4.
-- `dsh_browser_select` targets a native HTML `select` by `tabId` and unique CSS `selector`. Supply exactly one of `value`, `label` (one exact label after trimming the option's whitespace), zero-based `index`, or `values` (an array of 1 to 100 strings for a multiple select). It dispatches input and change events and returns `selected`. For a custom dropdown, inspect the menu and use pointer or keyboard controls instead.
+- `dsh_browser_select` takes `tabId` and a unique CSS `selector`. For a native HTML `select`, supply exactly one of `value`, `label` (one exact label after trimming the option's whitespace), zero-based `index`, or `values` (an array of 1 to 100 strings for a multiple select). Native select dispatches input and change events and returns `selected`. For a supported custom dropdown, use `label` and optionally `search`.
 - `dsh_browser_submit` takes `tabId`, a unique CSS `selector` for the form or one of its controls, and an optional CSS `submitter` from that form. It calls the browser's `requestSubmit()` and reports `attempted`, `valid`, and `validationSkipped`. Inspect the result page or app state to verify submission. If the site's Save control relies on a button click handler, use a verified click on that button.
 
 The first debugger attachment can show Chrome's debugging notice and shift the viewport. DevTools or another debugger can detach the extension from that tab. If the tool reports that coordinates need refreshing, take a new `dsh_browser_screenshot`. Coordinates from a prior scroll position, zoom level, frame, or tab are unsafe to reuse. If a click is blocked, inspect the obstruction before choosing another action. Use the pointer tool for link clicks. If it cannot reach the link and navigation is appropriate, verify the destination before passing it to the navigation tool.
@@ -119,6 +119,20 @@ Example for `dsh_browser_click` using a uniquely matched control in the main doc
 
 ```json
 {"tabId":42,"selector":"button[data-action='expand']"}
+```
+
+### Select a custom dropdown option
+
+Pass `tabId`, a unique CSS `selector` for the control in the main document, and the exact option `label`. Supported controls include single-choice ARIA listboxes and comboboxes or listbox triggers associated with their popup through `aria-controls` or `aria-owns`. The popup can be rendered elsewhere on the page. The tool matches an option's ARIA label or text after normalizing whitespace.
+
+For an editable combobox, add `search` to filter the menu. Use 1 to 200 characters of single-line text. A short search such as `Can` lets the tool distinguish the search text from the committed value `Canada`.
+
+A successful custom selection returns `selected`, `verified: true`, and the verification signal. An ambiguous, disabled, replaced, or unverified option stops the action. If the result says the option was clicked and the selection could not be verified, inspect the current page before retrying.
+
+Example for `dsh_browser_select` on a searchable custom dropdown.
+
+```json
+{"tabId":42,"selector":"#country","label":"Canada","search":"Can"}
 ```
 
 ### Enter text and check the result
@@ -155,7 +169,7 @@ Example for `dsh_browser_fill` to replace one verified field.
 Use `dsh_browser_sequence` for 1 to 32 known steps on one tab. Pass `tabId`, an ordered `steps` array, and optionally `interActionDelayMs` from 0 to 1,000. The extension's built-in delay is 120 ms unless changed in Settings. Each step has an `action` and its own arguments. Put `tabId` on the call. Reuse the individual tool's arguments for supported actions, subject to the exceptions below.
 
 - Pointer and scroll actions are `click`, `mouse_move`, `drag`, and `scroll`.
-- Text and field actions are `type_human`, `type_fast`, `fill`, `paste`, `keypress`, `focus`, `blur`, and `select`. The `select` step accepts `value`, `label`, or `index`. Use the standalone select tool for `values`.
+- Text and field actions are `type_human`, `type_fast`, `fill`, `paste`, `keypress`, `focus`, `blur`, and `select`. The `select` step accepts `value`, `label`, or `index`, with optional `search` for a custom-dropdown `label` selection. Use the standalone select tool for `values`.
 - Navigation and waiting actions are `navigate`, `back`, `forward`, `reload`, `wait`, and `wait_for_element`.
 - Inspection actions are `snapshot`, `get_html`, `get_source`, `evaluate`, and `extract`. Use standalone tools for a frame-specific snapshot, HTML read, or evaluation. Within a sequence, `frameId` is accepted by `scroll`.
 

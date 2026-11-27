@@ -59,6 +59,8 @@ const MAX_ELEMENT_WAIT_TIMEOUT_MS = 25_000
 const MIN_ELEMENT_WAIT_POLL_INTERVAL_MS = 50
 const MAX_ELEMENT_WAIT_POLL_INTERVAL_MS = 2_000
 const MAX_EXPLICIT_WAIT_MS = 25_000
+const DROPDOWN_OPTION_WAIT_MS = 3_000
+const DROPDOWN_VERIFY_WAIT_MS = 1_500
 const MAX_HUMAN_TEXT_CHARS = 2_000
 // Timing values are interaction defaults, not a validated human-typing model
 // and not a way to bypass site automation checks.
@@ -767,11 +769,17 @@ async function callNodeFunction(target, nodeId, functionDeclaration, args = []) 
   const resolved = await debuggerCommand(target, 'DOM.resolveNode', { nodeId })
   const objectId = resolved.object?.objectId
   if (typeof objectId !== 'string') throw new Error('The selected element cannot be controlled')
+  const result = await callRemoteFunction(target, objectId, functionDeclaration, args.map(value => ({ value })))
+  return result?.value
+}
+
+async function callRemoteFunction(target, objectId, functionDeclaration, args, options = {}) {
   const response = await debuggerCommand(target, 'Runtime.callFunctionOn', {
     objectId,
     functionDeclaration,
-    arguments: args.map(value => ({ value })),
+    arguments: args,
     returnByValue: true,
+    ...options,
   })
   if (response.exceptionDetails !== undefined) {
     const detail = response.exceptionDetails.exception?.description
@@ -779,7 +787,7 @@ async function callNodeFunction(target, nodeId, functionDeclaration, args = []) 
       ?? 'The selected element could not be inspected'
     throw new Error(String(detail))
   }
-  return response.result?.value
+  return response.result
 }
 
 const CLICK_INFO_FUNCTION = `function () {
@@ -822,6 +830,203 @@ const SCROLL_TO_VIEW_FUNCTION = `function () {
       && rect.left < width && rect.top < height,
   }
 }`
+
+/** Resolve the current visible click point of a particular DOM node. */
+async function resolveNodeClickPoint(target, nodeId) {
+  const scrollInfo = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
+  if (!isRecord(scrollInfo) || scrollInfo.visible !== true) {
+    throw new Error('The selected element could not be brought into the viewport')
+  }
+  const info = await callNodeFunction(target, nodeId, CLICK_INFO_FUNCTION)
+  if (!isRecord(info)) throw new Error('The selected element could not be inspected')
+  if (info.disabled === true) throw new Error('The selected element is disabled')
+  if (info.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
+  const box = await debuggerCommand(target, 'DOM.getBoxModel', { nodeId })
+  const quad = box?.model?.content ?? box?.model?.border
+  if (!Array.isArray(quad) || quad.length !== 8 || !quad.every(Number.isFinite)) {
+    throw new Error('The selected element has no clickable area')
+  }
+  const x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+  const y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+  const viewportWidth = Number.isFinite(info.viewportWidth) ? info.viewportWidth : scrollInfo.width
+  const viewportHeight = Number.isFinite(info.viewportHeight) ? info.viewportHeight : scrollInfo.height
+  if (x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) {
+    throw new Error('The selected element is outside the viewport after scrolling')
+  }
+  const hitTarget = await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y])
+  if (hitTarget !== true) throw new Error('The selected element is covered at its click point')
+  debuggerTargetsNeedingFreshCoordinates.delete(target)
+  return { x, y }
+}
+
+/** Runs on the original control and follows its ARIA references to the popup. */
+function inspectCustomDropdown(label, part, expectedElement) {
+  if (!this.isConnected) throw new Error('The dropdown control was replaced')
+  const listbox = this.getAttribute('role') === 'listbox'
+  if (!listbox && this.getAttribute('role') !== 'combobox' && this.getAttribute('aria-haspopup') !== 'listbox') {
+    throw new Error('Select requires a native select, an ARIA combobox with a listbox, or a listbox control')
+  }
+
+  const disabled = element => element.matches(':disabled')
+    || element.closest('[aria-disabled="true"], [inert]') !== null
+  if (disabled(this) || this.getAttribute('aria-readonly') === 'true') {
+    throw new Error('The dropdown control is disabled or read-only')
+  }
+
+  const visible = element => element.closest('[hidden], [aria-hidden="true"], [inert]') === null
+    && element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+  const normalize = value => String(value ?? '').replace(/\s+/gu, ' ').trim()
+  const refs = (element, attr) => normalize(element.getAttribute(attr)).split(' ')
+    .map(id => id && element.getRootNode().getElementById(id)).filter(Boolean)
+  const editable = element => element instanceof HTMLInputElement
+    && ['text', 'search'].includes(element.type) && !element.readOnly
+    && element.getAttribute('aria-readonly') !== 'true' && !disabled(element)
+
+  const popups = [...new Set([...refs(this, 'aria-controls'), ...refs(this, 'aria-owns')])]
+  const boxes = listbox ? [this] : [...new Set(popups.flatMap(popup =>
+    popup.matches('[role="listbox"]') ? [popup] : [...popup.querySelectorAll('[role="listbox"]')]))]
+  const visibleBoxes = boxes.filter(visible)
+  if (visibleBoxes.length > 1) throw new Error('The dropdown is linked to more than one visible listbox')
+  const box = visibleBoxes[0] ?? (boxes.length === 1 ? boxes[0] : undefined)
+  if (box?.getAttribute('aria-multiselectable') === 'true') {
+    throw new Error('Custom dropdown selection requires a single-choice listbox')
+  }
+
+  if (part === 'search' || part === 'checkSearch') {
+    let input = this
+    if (!editable(this) || !visible(this)) {
+      const inputs = [...new Set(popups.flatMap(popup => [...popup.querySelectorAll('input[role="combobox"]')]))]
+        .filter(candidate => editable(candidate) && visible(candidate))
+      if (inputs.length > 1) throw new Error('The popup has more than one editable combobox')
+      input = inputs[0] ?? null
+    }
+    if (part === 'search') return input
+    return input !== null && input === expectedElement && input.getRootNode().activeElement === input
+  }
+
+  const optionLabel = option => normalize(refs(option, 'aria-labelledby').map(node => node.textContent).join(' '))
+    || normalize(option.getAttribute('aria-label')) || normalize(option.innerText || option.textContent)
+  const boxOptions = selector => box ? [...box.querySelectorAll(selector)]
+    .filter(option => option.closest('[role="listbox"]') === box) : []
+  if (part === 'state' || part === 'verify') {
+    const valueText = this.getAttribute('aria-valuetext')
+    const input = this instanceof HTMLInputElement
+    const selected = part === 'verify' ? boxOptions('[role="option"][aria-selected="true"]') : []
+    return {
+      listbox,
+      visible: visible(this),
+      open: this.getAttribute('aria-expanded') === 'true' || visibleBoxes.length === 1,
+      displayedLabel: normalize(valueText ?? (input ? this.value : this.innerText || this.textContent)),
+      editableValue: valueText === null && editable(this),
+      selectedLabel: selected.length === 1 ? optionLabel(selected[0]) : null,
+    }
+  }
+
+  const matches = visibleBoxes.length === 1 && !box.closest('[aria-busy="true"]')
+    && this.getAttribute('aria-busy') !== 'true'
+    ? boxOptions('[role="option"]').filter(option => visible(option) && optionLabel(option) === label) : []
+  if (matches.length > 1) throw new Error('More than one visible option matches the exact label')
+  const option = matches[0] ?? null
+  if (option !== null && disabled(option)) throw new Error('The matching option is disabled')
+  return part === 'checkOption' ? option === expectedElement : option
+}
+
+async function waitForDropdown(read, timeoutMs, signal) {
+  const deadline = Date.now() + timeoutMs
+  const waitSignal = signal ?? new AbortController().signal
+  while (true) {
+    waitSignal.throwIfAborted()
+    const result = await read()
+    waitSignal.throwIfAborted()
+    if (result !== null) return result
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return null
+    await delay(Math.min(remaining, DEFAULT_ELEMENT_WAIT_POLL_INTERVAL_MS), waitSignal)
+  }
+}
+
+async function selectCustomDropdown(target, controlNodeId, { tabId, selector, label, search }, signal) {
+  const exactLabel = typeof label === 'string' ? label.replace(/\s+/gu, ' ').trim() : ''
+  if (exactLabel === '') throw new Error('Custom dropdowns require an exact option label')
+  const objectGroup = 'dsh-dropdown-' + crypto.randomUUID()
+  const functionDeclaration = inspectCustomDropdown.toString()
+  try {
+    const { object } = await debuggerCommand(target, 'DOM.resolveNode', { nodeId: controlNodeId, objectGroup })
+    if (typeof object?.objectId !== 'string') throw new Error('The dropdown control is unavailable')
+
+    const inspect = async (part, { reference = false, elementId } = {}) => {
+      const args = [{ value: exactLabel }, { value: part }]
+      if (elementId !== undefined) args.push({ objectId: elementId })
+      const result = await callRemoteFunction(target, object.objectId, functionDeclaration, args, {
+        objectGroup, returnByValue: !reference,
+      })
+      return reference ? result?.objectId ?? null : result?.value
+    }
+    const click = async (nodeId, ready) => {
+      signal?.throwIfAborted()
+      const { x, y } = await resolveNodeClickPoint(target, nodeId)
+      await dispatchClickAt(target, tabId, x, y, async () => {
+        if (await ready() === false) return false
+        if (await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y]) !== true) {
+          throw new Error('The dropdown target moved or became covered before the click')
+        }
+        signal?.throwIfAborted()
+        return true
+      })
+    }
+
+    const initial = await inspect('state')
+    if (!initial.visible) throw new Error('The dropdown control is hidden')
+    if (!initial.open) await click(controlNodeId, async () => !(await inspect('state')).open)
+    if (search !== undefined) {
+      const searchId = await waitForDropdown(() => inspect('search', { reference: true }), DROPDOWN_OPTION_WAIT_MS, signal)
+      if (searchId === null) throw new Error('The dropdown has no visible editable combobox for search')
+      const { nodeId } = await debuggerCommand(target, 'DOM.requestNode', { objectId: searchId })
+      signal?.throwIfAborted()
+      await callNodeFunction(target, nodeId, FILL_PREPARE_FUNCTION)
+      for (const character of search) {
+        signal?.throwIfAborted()
+        if (await inspect('checkSearch', { elementId: searchId }) !== true) {
+          throw new Error('Dropdown search lost focus or its field changed. Inspect it before retrying.')
+        }
+        await typeCharacter(target, character, '', 0, FAST_TYPE_SETTINGS, signal)
+      }
+    }
+
+    const optionId = await waitForDropdown(() => inspect('option', { reference: true }), DROPDOWN_OPTION_WAIT_MS, signal)
+    if (optionId === null) throw new Error('No visible option matches the exact label in the dropdown listbox')
+    const { nodeId } = await debuggerCommand(target, 'DOM.requestNode', { objectId: optionId })
+    let before
+    await click(nodeId, async () => {
+      before = await inspect('state')
+      if (await inspect('checkOption', { elementId: optionId }) !== true) {
+        throw new Error('The matching dropdown option changed before the click')
+      }
+      return true
+    })
+
+    const verification = await waitForDropdown(async () => {
+      const state = await inspect('verify')
+      // Editable text can be the search query itself. Require a value change
+      // after the click or a committed ARIA selection.
+      if ((state.listbox || !state.open) && state.selectedLabel !== null) {
+        return state.selectedLabel === exactLabel ? 'aria-selected' : null
+      }
+      if (!state.listbox && !state.open && state.displayedLabel === exactLabel
+        && (!state.editableValue || before.displayedLabel !== exactLabel)) return 'displayed-label'
+      return null
+    }, DROPDOWN_VERIFY_WAIT_MS, signal).catch(() => {
+      signal?.throwIfAborted()
+      return null
+    })
+    if (verification === null) {
+      throw new Error('The dropdown option was clicked, but its selection could not be verified. Inspect the page before retrying.')
+    }
+    return { tabId, selector, selected: [{ label: exactLabel }], verified: true, verification }
+  } finally {
+    await debuggerCommand(target, 'Runtime.releaseObjectGroup', { objectGroup }).catch(() => {})
+  }
+}
 
 /** Runs with `this` bound to the selected field; validates it and selects its text. */
 const FILL_PREPARE_FUNCTION = `function () {
@@ -1331,7 +1536,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     extract: { method: 'page.extract', required: ['kind'], allowed: ['kind', 'selector', 'maxItems', 'maxChars'] },
     focus: { method: 'page.focus', required: ['selector'], allowed: ['selector'] },
     blur: { method: 'page.blur', required: ['selector'], allowed: ['selector'] },
-    select: { method: 'page.selectOption', required: ['selector'], allowed: ['selector', 'value', 'label', 'index'] },
+    select: { method: 'page.selectOption', required: ['selector'], allowed: ['selector', 'value', 'label', 'index', 'search'] },
   }
   const steps = params.steps.map((step, index) => {
     if (!isRecord(step) || typeof step.action !== 'string' || !isRecord(step.params)) {
@@ -1567,7 +1772,7 @@ function requireClipboardText(value) {
 }
 
 /** Shared real-pointer click dispatch used by ordinary and saved-point clicks. */
-async function dispatchClickAt(target, tabId, x, y) {
+async function dispatchClickAt(target, tabId, x, y, beforePress) {
   const signal = activeTabOperations.get(tabId)?.signal
   signal?.throwIfAborted()
   await visualCursorMove(tabId, x, y, true)
@@ -1575,6 +1780,7 @@ async function dispatchClickAt(target, tabId, x, y) {
   await debuggerCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
   })
+  if (beforePress !== undefined && await beforePress() === false) return
   signal?.throwIfAborted()
   await debuggerCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mousePressed', x, y, button: 'left', clickCount: 1,
@@ -1911,10 +2117,15 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       const selector = requireCssSelector(params.selector)
       const matchCount = ['value', 'label', 'index'].filter(key => params[key] !== undefined).length
       if (matchCount !== 1) throw new Error('Provide exactly one of value, label, or index')
+      if (params.search !== undefined && (typeof params.search !== 'string' || params.search.trim() === ''
+        || params.search.length > 200 || /[\u0000-\u001f\u007f]/u.test(params.search))) {
+        throw new Error('search must be 1 to 200 characters of single-line text')
+      }
       return withDebugger(tabId, async target => {
         const nodeId = await querySelectorNode(target, selector)
-        const result = await callNodeFunction(target, nodeId, `function (value, label, index) {
-          if (!(this instanceof HTMLSelectElement)) throw new Error('The selected element is not a select control')
+        const result = await callNodeFunction(target, nodeId, `function (value, label, index, hasSearch) {
+          if (!(this instanceof HTMLSelectElement)) return null
+          if (hasSearch) throw new Error('search requires an editable custom combobox')
           const options = Array.from(this.options)
           let matches
           if (index !== undefined && index !== null) {
@@ -1937,7 +2148,8 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
           this.dispatchEvent(new Event('input', { bubbles: true }))
           this.dispatchEvent(new Event('change', { bubbles: true }))
           return Array.from(this.selectedOptions, option => ({ value: option.value, label: option.label }))
-        }`, [params.value ?? null, params.label ?? null, params.index ?? null])
+        }`, [params.value ?? null, params.label ?? null, params.index ?? null, params.search !== undefined])
+        if (result === null) return selectCustomDropdown(target, nodeId, params, signal)
         return { tabId, selector, selected: result }
       })
     }
@@ -2785,29 +2997,9 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
         let y = params.y
         if (hasSelector) {
           const nodeId = await querySelectorNode(target, params.selector)
-          const scrollInfo = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
-          if (!isRecord(scrollInfo) || scrollInfo.visible !== true) {
-            throw new Error('The selected element could not be brought into the viewport')
-          }
-          const info = await callNodeFunction(target, nodeId, CLICK_INFO_FUNCTION)
-          if (!isRecord(info)) throw new Error('The selected element could not be inspected')
-          if (info.disabled === true) throw new Error('The selected element is disabled')
-          if (info.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
-          const box = await debuggerCommand(target, 'DOM.getBoxModel', { nodeId })
-          const quad = box?.model?.content ?? box?.model?.border
-          if (!Array.isArray(quad) || quad.length !== 8 || !quad.every(Number.isFinite)) {
-            throw new Error('The selected element has no clickable area')
-          }
-          x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
-          y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
-          const viewportWidth = Number.isFinite(info.viewportWidth) ? info.viewportWidth : scrollInfo.width
-          const viewportHeight = Number.isFinite(info.viewportHeight) ? info.viewportHeight : scrollInfo.height
-          if (x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) {
-            throw new Error('The selected element is outside the viewport after scrolling')
-          }
-          const hitTarget = await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y])
-          if (hitTarget !== true) throw new Error('The selected element is covered at its click point')
-          debuggerTargetsNeedingFreshCoordinates.delete(target)
+          const point = await resolveNodeClickPoint(target, nodeId)
+          x = point.x
+          y = point.y
         } else {
           if (debuggerTargetsNeedingFreshCoordinates.has(target)) {
             throw new Error('Chrome changed the page viewport when browser control connected. Take a fresh screenshot or use a CSS selector, then retry.')

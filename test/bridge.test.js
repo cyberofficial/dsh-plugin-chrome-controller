@@ -248,13 +248,13 @@ it('lets a change wait reach its extension deadline and honors harness cancellat
   assert.deepEqual(cancelled.json.cancelled, [shortWait.id])
 })
 
-async function mountDialogTools(t, ask) {
+async function mountBrowserTools(t, ask) {
   const context = fakeContext()
   const tools = new Map()
   context.tools = { register(tool) { tools.set(tool.name, tool) } }
   context.systemPrompt = { section() {}, getSectionOrder: () => 0 }
   context.skills = { register() {} }
-  context.get = key => key === 'userQuestions' ? { ask } : undefined
+  context.get = key => key === 'userQuestions' && ask ? { ask } : undefined
   context.effect = factory => t.after(factory())
   await apply(context)
   const sessionToken = await connect(context)
@@ -277,7 +277,7 @@ async function mountDialogTools(t, ask) {
 it('asks the user when a click opens a dialog and responds while the tab queue is held', { timeout: 2_000 }, async t => {
   const asked = Promise.withResolvers()
   const answered = Promise.withResolvers()
-  const plugin = await mountDialogTools(t, request => {
+  const plugin = await mountBrowserTools(t, request => {
     asked.resolve(request.questions[0])
     return answered.promise
   })
@@ -307,7 +307,7 @@ it('asks the user when a click opens a dialog and responds while the tab queue i
 
 it('takes explicit prompt text from the user and leaves ambiguous answers open', { timeout: 2_000 }, async t => {
   let answer
-  const plugin = await mountDialogTools(t, async () => ({ answers: [answer] }))
+  const plugin = await mountBrowserTools(t, async () => ({ answers: [answer] }))
   for (const type of ['confirm', 'prompt']) {
     const dialog = { id: 'dialog-' + type, type, origin: 'https://example.com', message: 'Enter or confirm the name' }
     answer = { id: dialog.id, selected: [], custom: 'Draft A' }
@@ -327,10 +327,14 @@ it('takes explicit prompt text from the user and leaves ambiguous answers open',
   }
 })
 
-it('unblocks a suspended Chrome command without running the rest of its sequence', { timeout: 2_000 }, async () => {
+async function browserWorkerSource() {
   const source = await readFile(new URL('../extension/background.js', import.meta.url), 'utf8')
-  const worker = source.slice(0, source.indexOf('chrome.runtime.onInstalled.addListener'))
+  return source.slice(0, source.indexOf('chrome.runtime.onInstalled.addListener'))
     .replace(/^import .*\r?$/gmu, '')
+}
+
+it('unblocks a suspended Chrome command without running the rest of its sequence', { timeout: 2_000 }, async () => {
+  const worker = await browserWorkerSource()
   const calls = []
   const suspended = Promise.withResolvers()
   let pendingHandler
@@ -397,6 +401,203 @@ it('unblocks a suspended Chrome command without running the rest of its sequence
   assert.equal(calls.filter(call => call.method === 'Page.handleJavaScriptDialog').length, 1)
   assert.equal(calls.filter(call => call.params?.expression === 'confirm("Save?")').length, 1)
   assert.equal(calls.some(call => call.params?.expression === 'nextStep()'), false)
+})
+
+it('routes custom dropdown search through the regular select and sequence tools', { timeout: 2_000 }, async t => {
+  const plugin = await mountBrowserTools(t)
+  const input = { tabId: 42, selector: '#country', label: 'Canada', search: 'Can' }
+  const direct = plugin.run('select', input)
+  const select = await plugin.receive('page.selectOption')
+  assert.deepEqual(select.params, input)
+  const selection = { selected: [{ label: 'Canada' }], verified: true }
+  await plugin.respond(select, selection)
+  assert.deepEqual(await direct, selection)
+
+  const { tabId, ...fields } = input
+  const pending = plugin.run('sequence', { tabId, steps: [{ action: 'select', ...fields }] })
+  const sequence = await plugin.receive('page.sequence')
+  assert.deepEqual(sequence.params.steps, [{ action: 'select', method: 'page.selectOption', params: input }])
+  await plugin.respond(sequence, { ok: true })
+  assert.deepEqual(await pending, { ok: true })
+  await assert.rejects(plugin.run('select', { ...input, search: 'Can\n' }), /single-line/u)
+})
+
+/** Minimal page and debugger for exercising real injected functions and pointer input. */
+async function dropdownFixture({ searchable = false, replaceOnHover = false, commit = true, native = false, duplicate = false, disabled = false } = {}) {
+  const nodes = new Map()
+  const clicks = []
+  let now = 0
+  const document = {
+    activeElement: null,
+    getElementById: id => nodes.get(id) ?? null,
+    elementFromPoint(x) {
+      return [...nodes.values()].find(element => element.x === x && element.checkVisibility()) ?? null
+    },
+  }
+
+  class Element {
+    constructor(id, tag, x, attributes, label = '') {
+      Object.assign(this, { id, tag, x, attributes, label, isConnected: true, children: [], parent: null })
+      nodes.set(id, this)
+    }
+    get textContent() { return this.label }
+    get innerText() { return this.label }
+    getAttribute(name) { return this.attributes[name] ?? null }
+    getRootNode() { return document }
+    matches(selector) {
+      return selector.split(',').some(item => {
+        const query = item.trim()
+        if (query === ':disabled') return this.disabled === true
+        const tag = /^[a-z]+/u.exec(query)?.[0]
+        return (!tag || tag === this.tag) && [...query.matchAll(/\[([-\w]+)(?:="?([^"\]]+)"?)?\]/gu)]
+          .every(([, attr, value]) => value === undefined ? this.getAttribute(attr) !== null : this.getAttribute(attr) === value)
+      })
+    }
+    closest(selector) { return this.matches(selector) ? this : this.parent?.closest(selector) ?? null }
+    querySelectorAll(selector) {
+      return this.children.flatMap(child => [
+        ...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector),
+      ])
+    }
+    contains(node) { return this === node || this.children.some(child => child.contains(node)) }
+    checkVisibility() { return this.isConnected && !this.closest('[hidden]') }
+    getBoundingClientRect() { return { left: this.x - 2, right: this.x + 2, top: 8, bottom: 12, width: 4, height: 4 } }
+    scrollIntoView() {}
+    focus() { document.activeElement = this }
+    select() { this.replaceText = true }
+    dispatchEvent() {}
+  }
+
+  class Input extends Element {}
+  class Select extends Element {
+    get selectedOptions() { return [this.options[this.selectedIndex]] }
+  }
+  const Control = native ? Select : searchable ? Input : Element
+  const control = new Control('country', searchable ? 'input' : 'button', 20, {
+    role: 'combobox', 'aria-controls': 'country-list', 'aria-expanded': 'false',
+  }, 'Select country')
+  control.options = [{ label: 'Canada', value: 'ca' }]
+  if (searchable) Object.assign(control, { type: 'text', value: '' })
+  const list = new Element('country-list', 'ul', 0, { role: 'listbox', hidden: '' })
+  const option = new Element('target', 'li', 40, { role: 'option', ...(disabled ? { 'aria-disabled': 'true' } : {}) }, 'Canada')
+  option.parent = list
+  list.children = [option]
+  const otherList = new Element('other-list', 'ul', 0, { role: 'listbox' })
+  const sameLabel = new Element('other-option', 'li', 60, { role: 'option' }, 'Canada')
+  sameLabel.parent = duplicate ? list : otherList
+  sameLabel.parent.children.push(sameLabel)
+  if (searchable) option.attributes.hidden = ''
+
+  const context = createContext({
+    AbortController, AbortSignal, crypto, performance, clearTimeout, Event,
+    Date: class extends Date { static now() { return now } },
+    setTimeout(callback, ms) { return setTimeout(() => { now += ms; callback() }, 0) },
+    document, window: { innerWidth: 800, innerHeight: 600 },
+    HTMLInputElement: Input, HTMLSelectElement: Select, HTMLTextAreaElement: class {},
+    ShadowRoot: class {}, getComputedStyle: () => ({ pointerEvents: 'auto' }),
+    DOMAIN_FILTER_KEY, domainFilterAllows,
+    chrome: {
+      storage: { onChanged: { addListener() {} }, local: { async setAccessLevel() {}, async get() { return {} } } },
+      debugger: {
+        async sendCommand(_target, method, params) {
+          switch (method) {
+            case 'DOM.getDocument': return { root: { nodeId: 1 } }
+            case 'DOM.querySelectorAll': return { nodeIds: [2] }
+            case 'DOM.resolveNode': return { object: { objectId: params.nodeId === 2 ? 'country' : 'target' } }
+            case 'DOM.requestNode': return { nodeId: params.objectId === 'country' ? 2 : 3 }
+            case 'DOM.getBoxModel': {
+              const x = params.nodeId === 2 ? 20 : 40
+              return { model: { content: [x - 2, 8, x + 2, 8, x + 2, 12, x - 2, 12] } }
+            }
+            case 'Runtime.callFunctionOn': {
+              const fn = runInContext('(' + params.functionDeclaration + ')', context)
+              const args = params.arguments.map(arg => arg.objectId ? nodes.get(arg.objectId) : arg.value ?? undefined)
+              const value = fn.apply(nodes.get(params.objectId), args)
+              return { result: !params.returnByValue && value instanceof Element ? { objectId: value.id } : { value } }
+            }
+            case 'Input.dispatchMouseEvent':
+              if (replaceOnHover && params.type === 'mouseMoved' && params.x === 40) option.label = 'Mexico'
+              if (params.type === 'mouseReleased') {
+                clicks.push(params.x)
+                if (params.x === 20) {
+                  delete list.attributes.hidden
+                  control.attributes['aria-expanded'] = 'true'
+                }
+                if (params.x === 40) {
+                  list.attributes.hidden = ''
+                  control.attributes['aria-expanded'] = 'false'
+                  if (commit === 'aria') option.attributes['aria-selected'] = 'true'
+                  else if (commit) {
+                    if (searchable) control.value = option.label
+                    else control.label = option.label
+                  }
+                }
+              }
+              return {}
+            case 'Input.dispatchKeyEvent':
+              if (params.type === 'char') {
+                assert.equal(document.activeElement, control)
+                control.value = (control.replaceText ? '' : control.value) + params.text
+                control.replaceText = false
+                if ('Canada'.startsWith(control.value)) delete option.attributes.hidden
+              }
+              return {}
+            case 'Runtime.releaseObjectGroup': return {}
+            default: throw new Error('Unexpected debugger command ' + method)
+          }
+        },
+      },
+    },
+  })
+  const worker = await browserWorkerSource()
+  const run = runInContext(worker + '\nactiveDebuggerTargets.set(42, { tabId: 42 })\n;executeBrowserOperation', context)
+  return {
+    clicks,
+    select: (params = {}) => run('page.selectOption', { tabId: 42, selector: '#country', label: 'Canada', ...params }),
+  }
+}
+
+it('clicks the exact option in the linked listbox and reads back the selected label', async () => {
+  const dropdown = await dropdownFixture()
+  const result = await dropdown.select()
+  assert.equal(result.selected[0].label, 'Canada')
+  assert.equal(result.verified, true)
+  assert.equal(result.verification, 'displayed-label')
+  assert.deepEqual(dropdown.clicks, [20, 40])
+
+  const ariaOnly = await dropdownFixture({ commit: 'aria' })
+  assert.equal((await ariaOnly.select()).verification, 'aria-selected')
+})
+
+it('filters an editable dropdown and distinguishes search text from a committed value', async () => {
+  const dropdown = await dropdownFixture({ searchable: true })
+  assert.equal((await dropdown.select({ search: 'Can' })).selected[0].label, 'Canada')
+
+  const ignoredClick = await dropdownFixture({ searchable: true, commit: false })
+  await assert.rejects(ignoredClick.select({ search: 'Canada' }), /could not be verified/u)
+  assert.deepEqual(ignoredClick.clicks, [20, 40])
+})
+
+it('skips option clicks when the target changes, is disabled, or is ambiguous', async () => {
+  const cases = [
+    [{ replaceOnHover: true }, /changed before the click/u],
+    [{ disabled: true }, /matching option is disabled/u],
+    [{ duplicate: true }, /More than one visible option/u],
+  ]
+  for (const [settings, error] of cases) {
+    const dropdown = await dropdownFixture(settings)
+    await assert.rejects(dropdown.select(), error)
+    assert.deepEqual(dropdown.clicks, [20])
+  }
+})
+
+it('keeps the native select result shape and value', async () => {
+  const dropdown = await dropdownFixture({ native: true })
+  const result = await dropdown.select({ label: undefined, value: 'ca' })
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    tabId: 42, selector: '#country', selected: [{ label: 'Canada', value: 'ca' }],
+  })
+  assert.deepEqual(dropdown.clicks, [])
 })
 
 describe('BrowserExtensionBridge pairing failure limit', () => {
