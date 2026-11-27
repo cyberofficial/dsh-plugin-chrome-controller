@@ -1,5 +1,6 @@
 export const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 export const DOMAIN_FILTER_KEY = 'dshBrowserDomainFilter'
+export const NOTE_CONTEXT_MATCHING_KEY = 'dshNoteContextMatching'
 
 /**
  * Normalize a user-supplied DSH Web origin. Loopback hosts may use HTTP or

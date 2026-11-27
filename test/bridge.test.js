@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, it, mock } from 'node:test'
 import { createContext, runInContext } from 'node:vm'
-import { DOMAIN_FILTER_KEY, domainFilterAllows } from '../extension/origin.js'
+import { DOMAIN_FILTER_KEY, NOTE_CONTEXT_MATCHING_KEY, domainFilterAllows } from '../extension/origin.js'
 import { BrowserExtensionBridge } from '../lib/bridge.js'
 import { apply } from '../lib/index.js'
 
@@ -790,6 +790,309 @@ it('avoids a changed Next control and a link outside the table origin', async ()
     assert.equal(result.pagesRead, 1)
     assert.equal(fixture.clicks, 0)
   }
+})
+
+async function noteContextFixture(url = 'https://notes.example/settings') {
+  const tab = { id: 42, url }
+  const savedPath = '/html[1]/body[1]/section[1]/button[1]'
+  const movedPath = '/html[1]/body[1]/section[1]/button[2]'
+  const anchor = { tag: 'button', role: 'button', label: 'Save', heading: 'Billing', elementId: '', name: '', kind: 'button' }
+  const id = '11111111-1111-4111-8111-111111111111'
+  const secondId = '22222222-2222-4222-8222-222222222222'
+  const local = {}
+  const session = {}
+  const injected = []
+  const makeElement = (localName, text = '') => ({
+    nodeType: 1, localName, id: '', textContent: text, innerText: text,
+    type: localName === 'button' ? 'button' : undefined,
+    isConnected: true, namespaceURI: 'http://www.w3.org/1999/xhtml',
+    parentElement: null, previousElementSibling: null,
+    ownerDocument: document, getRootNode() { return document },
+    getAttribute() { return null },
+    checkVisibility() { return true },
+    getBoundingClientRect() { return { left: 20, top: 50, width: 40, height: 30 } },
+  })
+  const document = {
+    contentType: 'text/html',
+    getElementById() { return null },
+    evaluate(xpath) {
+      const routes = { [savedPath]: replacement, [movedPath]: moved, '/html/body/iframe': iframe }
+      return { singleNodeValue: routes[xpath] ?? null }
+    },
+    getElementsByTagName() { return candidates },
+  }
+  const html = makeElement('html')
+  const body = makeElement('body')
+  body.parentElement = html
+  document.body = body
+  const section = makeElement('section')
+  section.parentElement = body
+  section.closest = () => section
+  const heading = makeElement('h2', 'Billing')
+  heading.parentElement = section
+  heading.compareDocumentPosition = () => 4
+  section.querySelectorAll = () => [heading]
+  const replacement = makeElement('button', 'Delete')
+  replacement.parentElement = section
+  replacement.previousElementSibling = heading
+  const moved = makeElement('button', 'Save')
+  moved.parentElement = section
+  moved.previousElementSibling = replacement
+  const duplicate = makeElement('button', 'Save')
+  duplicate.parentElement = section
+  duplicate.previousElementSibling = moved
+  const iframe = { ...makeElement('iframe'), contentDocument: null, parentElement: body }
+  const candidates = [replacement, moved]
+
+  function fakeStorage(records) {
+    return {
+      async setAccessLevel() {},
+      async get(keys) {
+        if (keys === null) return structuredClone(records)
+        const output = Object.fromEntries((Array.isArray(keys) ? keys : [keys])
+          .filter(key => Object.hasOwn(records, key)).map(key => [key, records[key]]))
+        return structuredClone(output)
+      },
+      async set(values) { Object.assign(records, structuredClone(values)) },
+      async remove(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) delete records[key] },
+    }
+  }
+  const extensionOrigin = 'chrome-extension://fixture'
+  const window = {}
+  window.top = window
+  const context = createContext({
+    document, window, location: { href: url },
+    XPathResult: { FIRST_ORDERED_NODE_TYPE: 9 }, Node: { DOCUMENT_POSITION_FOLLOWING: 4 },
+    URL, TextEncoder, crypto, setTimeout, clearTimeout, performance, NOTE_CONTEXT_MATCHING_KEY,
+    chrome: {
+      runtime: { id: 'fixture', getURL: name => extensionOrigin + '/' + name },
+      windows: { async create() {} },
+      storage: { onChanged: { addListener() {} }, local: fakeStorage(local), session: fakeStorage(session) },
+      tabs: { async get() { return tab }, async query() { return [tab] }, async sendMessage() {} },
+      webNavigation: { async getFrame() { return { documentId: 'current-document', url } } },
+      scripting: {
+        async executeScript({ func, args }) {
+          const mode = args?.[0]?.mode
+          if (mode) injected.push(mode)
+          return [{ result: mode === 'resolve' ? func(...args) : true }]
+        },
+      },
+    },
+  })
+  const worker = await browserWorkerSource()
+  const [address, handle, read, update, view, noteAddress, rememberRedirect, clearRedirect] = runInContext(
+    worker + '\n;[elementNoteAddress, handleElementNoteMessage, readElementNotes, updateElementNote, startElementNoteView, pageNoteAddress, rememberNoteRedirect, clearNoteRedirectOnNavigation]', context)
+  const page = await address(url)
+  const storageKey = 'dshElementNotes'
+  const original = { id, xpath: savedPath, note: 'Check billing', anchor, x: 8, y: 12 }
+  local[storageKey] = { [page.pageKey]: { ...page, notes: [original] } }
+  return {
+    tab, page, id, secondId, anchor, savedPath, movedPath, original, local, session, injected, handle, update,
+    rawAddress: address, noteAddress,
+    redirect: (url, redirectUrl) => rememberRedirect({ tabId: tab.id, frameId: 0, requestId: 'test', url, redirectUrl }),
+    commitNavigation: url => clearRedirect(tab.id, url),
+    replacement, moved, duplicate, candidates,
+    manager: { id: 'fixture', url: extensionOrigin + '/popup.html?allNotes=1' },
+    popup: { id: 'fixture', url: extensionOrigin + '/popup.html' },
+    sender: { id: 'fixture', tab, frameId: 0, documentId: 'current-document' },
+    entries: () => local[storageKey][page.pageKey].notes,
+    enable: () => { local[NOTE_CONTEXT_MATCHING_KEY] = true },
+    async notes() {
+      return JSON.parse(JSON.stringify(await read({ tabId: tab.id, scope: 'page' }, { mode: 'off' })))
+    },
+    frameStatus() {
+      return view({ mode: 'resolve', notes: [{
+        xpath: '/html/body/iframe >> ' + savedPath, onCurrentPage: true, anchor,
+      }] })[0].status
+    },
+  }
+}
+
+it('uses the saved XPath by default and suggests a moved note target only after opt-in', async () => {
+  const fixture = await noteContextFixture()
+  const initial = await fixture.notes()
+  assert.equal(initial.notes[0].xpath, fixture.savedPath)
+  assert.equal(initial.notes[0].x, 8)
+  assert.equal(initial.notes[0].targetStatus, undefined)
+  assert.deepEqual(fixture.injected, [])
+  fixture.enable()
+  const moved = await fixture.notes()
+  assert.equal(moved.notes[0].targetStatus, 'suggested')
+  assert.equal(moved.notes[0].xpath, fixture.savedPath)
+  assert.equal(moved.notes[0].suggestedXPath, fixture.movedPath)
+  assert.equal(moved.notes[0].x, undefined)
+  assert.equal(moved.notes[0].anchor, undefined)
+  assert.match(moved.notesHtml, /Note target suggested/u)
+  assert.equal(fixture.entries()[0].xpath, fixture.savedPath)
+  assert.equal(fixture.frameStatus(), 'unavailable')
+})
+
+it('keeps legacy notes usable and saves no context when the toggle is off', async () => {
+  const fixture = await noteContextFixture()
+  const legacy = { xpath: fixture.savedPath, note: 'Legacy note', x: 8, y: 12 }
+  fixture.local.dshElementNotes[fixture.page.pageKey] = [legacy]
+  const initial = await fixture.notes()
+  assert.equal(initial.notes[0].note, legacy.note)
+  assert.equal(initial.notes[0].x, legacy.x)
+  assert.equal(initial.notes[0].targetStatus, undefined)
+  assert.deepEqual(fixture.injected, [])
+
+  await fixture.handle({ type: 'DSH_NOTE_MODE' }, fixture.popup)
+  const draftKey = 'dshElementNoteDraft:' + fixture.tab.id
+  await fixture.handle({
+    type: 'DSH_NOTE_SELECTED', token: fixture.session[draftKey].token,
+    xpath: fixture.movedPath, anchor: fixture.anchor, x: 40, y: 65,
+  }, fixture.sender)
+  const token = fixture.session[draftKey].token
+  await fixture.handle({
+    type: 'DSH_NOTE_EDITOR', action: 'save', tabId: fixture.tab.id, token, note: 'Path only',
+  }, { id: fixture.popup.id, url: fixture.popup.url + '?noteToken=' + token })
+  const stored = fixture.entries().find(entry => entry.note === 'Path only')
+  assert.equal(stored.anchor, undefined)
+  assert.equal(stored.xpath, fixture.movedPath)
+  assert.equal(stored.x, 40)
+  assert(fixture.entries().some(entry => entry.note === legacy.note))
+})
+
+it('rejects ambiguous note targets and a different control at the saved XPath', async () => {
+  const fixture = await noteContextFixture()
+  fixture.enable()
+  fixture.candidates.push(fixture.duplicate)
+  const duplicate = await fixture.notes()
+  assert.equal(duplicate.notes[0].targetStatus, 'ambiguous')
+  assert.equal(duplicate.notes[0].x, undefined)
+
+  fixture.candidates.splice(1)
+  fixture.replacement.textContent = fixture.replacement.innerText = 'Save'
+  fixture.replacement.type = 'submit'
+  const changed = await fixture.notes()
+  assert.equal(changed.notes[0].targetStatus, 'missing')
+  assert.equal(changed.notes[0].suggestedXPath, undefined)
+})
+
+it('reattaches a note through Page Notes and keeps its ID when text is edited', async () => {
+  const fixture = await noteContextFixture()
+  fixture.enable()
+  fixture.entries().push({ id: fixture.secondId, xpath: fixture.savedPath, note: 'Another note at the old path' })
+  await fixture.handle({ type: 'DSH_NOTE_LIST' }, fixture.popup)
+  const viewKey = 'dshElementNoteView:' + fixture.tab.id
+  const draftKey = 'dshElementNoteDraft:' + fixture.tab.id
+  const pageKey = fixture.page.pageKey
+  await fixture.handle({
+    type: 'DSH_NOTE_REATTACH', token: fixture.session[viewKey].token, pageKey,
+    xpath: fixture.savedPath, id: fixture.id,
+  }, fixture.sender)
+  assert.equal(fixture.session[draftKey].reattach.ref.id, fixture.id)
+  await fixture.handle({
+    type: 'DSH_NOTE_SELECTED', token: fixture.session[draftKey].token,
+    xpath: fixture.movedPath, anchor: fixture.anchor, x: 40, y: 65,
+  }, fixture.sender)
+  assert.equal(fixture.session[viewKey].mode, 'list')
+  assert.equal(fixture.entries().find(entry => entry.id === fixture.id).note, 'Check billing')
+  assert.equal(fixture.entries().find(entry => entry.id === fixture.id).xpath, fixture.movedPath)
+  assert.equal(fixture.entries().find(entry => entry.id === fixture.secondId).xpath, fixture.savedPath)
+  await fixture.handle({
+    type: 'DSH_NOTE_ALL', action: 'save', pageKey, id: fixture.id, xpath: fixture.movedPath, note: 'Updated billing note',
+  }, fixture.manager)
+  const verified = (await fixture.notes()).notes.find(entry => entry.id === fixture.id)
+  assert.equal(verified.targetStatus, 'matched')
+  assert.equal(verified.note, 'Updated billing note')
+  assert.equal(verified.x, 40)
+  assert.equal(verified.y, 65)
+
+  await assert.rejects(fixture.update({
+    pageKey, ref: { id: fixture.id, xpath: fixture.savedPath }, previousAnchor: fixture.anchor,
+    xpath: fixture.savedPath, picked: true,
+  }, 'reattach'), /note target changed/u)
+  assert.equal(fixture.entries().find(entry => entry.id === fixture.id).xpath, fixture.movedPath)
+})
+
+it('normalizes tracking on any note page and preserves meaningful URL variants', async () => {
+  const fixture = await noteContextFixture()
+  const canonical = await fixture.noteAddress('https://portal.example/reports')
+  assert.equal((await fixture.noteAddress('https://portal.example/reports?zx=123456789&_=456&utm_source=mail')).pageKey, canonical.pageKey)
+  assert.equal((await fixture.noteAddress('https://www.google.com/?zx=123')).originalUrl, 'https://www.google.com/')
+  assert.equal((await fixture.noteAddress('https://portal.example/reports?hl=fr&zx=123&x=a%20b#hello')).originalUrl,
+    'https://portal.example/reports?hl=fr&x=a%20b#hello')
+  for (const url of ['https://portal.example/reports?q=invoice', 'https://portal.example/reports?zx=custom',
+    'https://portal.example/reports?utm_filter=unpaid', 'https://portal.example/reports#paid',
+    'https://www.portal.example/reports', 'http://portal.example/reports', 'https://portal.example:8443/reports']) {
+    assert.notEqual((await fixture.noteAddress(url)).pageKey, canonical.pageKey)
+  }
+  assert.notEqual((await fixture.rawAddress('https://portal.example/reports?zx=123')).pageKey, canonical.pageKey)
+})
+
+it('recovers notes across verified redirect chains and retains each source URL', async () => {
+  const fixture = await noteContextFixture('https://www.accounts.example/reports?q=unpaid&zx=999')
+  const bare = await fixture.rawAddress('http://accounts.example/reports?q=unpaid')
+  const earlier = await fixture.rawAddress('https://accounts.example/reports?q=unpaid&utm_medium=email')
+  const different = await fixture.rawAddress('https://www.accounts.example/reports?q=paid&zx=111')
+  const canonical = await fixture.noteAddress(fixture.tab.url)
+  const store = fixture.local.dshElementNotes
+  store[bare.pageKey] = [{ xpath: fixture.savedPath, note: 'Legacy report', x: 15, y: 16 }]
+  store[earlier.pageKey] = { ...earlier, notes: [{ ...fixture.original, id: fixture.secondId, note: 'Earlier redirect' }] }
+  store[different.pageKey] = { ...different, notes: [{ xpath: fixture.savedPath, note: 'Paid only' }] }
+
+  await fixture.redirect(bare.originalUrl, 'https://accounts.example/reports?q=unpaid')
+  await fixture.redirect('https://accounts.example/reports?q=unpaid', fixture.tab.url)
+  await fixture.commitNavigation(fixture.tab.url)
+  await fixture.handle({ type: 'DSH_NOTE_LIST' }, fixture.popup)
+  const view = fixture.session['dshElementNoteView:' + fixture.tab.id]
+  assert.equal(view.address.pageKey, canonical.pageKey)
+  assert.equal(view.notes.filter(note => note.onCurrentPage).length, 3)
+  const current = await fixture.notes()
+  assert.equal(current.total, 3)
+  assert(current.notes.every(note => note.pageKey === canonical.pageKey && note.onCurrentPage && note.sourceUrl === undefined))
+  assert.equal(current.notes.find(note => note.note === 'Legacy report').x, 15)
+  assert.equal(current.notes.find(note => note.note === 'Earlier redirect').id, fixture.secondId)
+  assert.equal(fixture.local.dshElementNotes[bare.pageKey], undefined)
+  assert.equal(fixture.local.dshElementNotes[earlier.pageKey], undefined)
+  assert(fixture.local.dshElementNotes[different.pageKey])
+
+  const { notes } = await fixture.handle({ type: 'DSH_NOTE_ALL', action: 'list' }, fixture.manager)
+  assert.equal(notes.find(note => note.note === 'Legacy report').originalUrl, bare.originalUrl)
+  assert.equal(notes.find(note => note.note === 'Earlier redirect').originalUrl, earlier.originalUrl)
+  assert.equal((await fixture.notes()).total, 3)
+})
+
+it('keeps distinct origins and page variants separate without a matching redirect', async () => {
+  const fixture = await noteContextFixture('https://www.portal.example/reports?q=open')
+  const bare = await fixture.rawAddress('https://portal.example/reports?q=open')
+  const separate = await fixture.rawAddress('https://other.example/reports?q=open')
+  const differentQuery = await fixture.rawAddress('https://portal.example/reports?q=closed')
+  const store = fixture.local.dshElementNotes
+  for (const address of [bare, separate, differentQuery]) {
+    store[address.pageKey] = { ...address, notes: [{ xpath: fixture.savedPath, note: address.originalUrl }] }
+  }
+  await fixture.redirect(separate.originalUrl, fixture.tab.url)
+  await fixture.redirect(differentQuery.originalUrl, fixture.tab.url)
+  assert.equal((await fixture.notes()).total, 1)
+
+  await fixture.redirect(bare.originalUrl, fixture.tab.url)
+  await fixture.commitNavigation('https://www.portal.example/other')
+  assert.equal((await fixture.notes()).total, 1)
+  assert(fixture.local.dshElementNotes[bare.pageKey])
+  assert(fixture.local.dshElementNotes[separate.pageKey])
+  assert(fixture.local.dshElementNotes[differentQuery.pageKey])
+})
+
+it('saves new notes at the normalized URL and keeps the picked address as the source', async () => {
+  const fixture = await noteContextFixture('https://portal.example/reports?utm_source=mail&zx=123456789')
+  const canonical = await fixture.noteAddress('https://portal.example/reports')
+  const draftKey = 'dshElementNoteDraft:' + fixture.tab.id
+  await fixture.handle({ type: 'DSH_NOTE_MODE' }, fixture.popup)
+  await fixture.handle({
+    type: 'DSH_NOTE_SELECTED', token: fixture.session[draftKey].token,
+    xpath: fixture.movedPath, x: 40, y: 65,
+  }, fixture.sender)
+  const token = fixture.session[draftKey].token
+  await fixture.handle({
+    type: 'DSH_NOTE_EDITOR', action: 'save', tabId: fixture.tab.id, token, note: 'New report note',
+  }, { id: fixture.popup.id, url: fixture.popup.url + '?noteToken=' + token })
+
+  assert.equal((await fixture.notes()).notes.find(note => note.note === 'New report note').pageKey, canonical.pageKey)
+  const { notes } = await fixture.handle({ type: 'DSH_NOTE_ALL', action: 'list' }, fixture.manager)
+  assert.equal(notes.find(note => note.note === 'New report note').originalUrl, fixture.tab.url)
 })
 
 describe('BrowserExtensionBridge pairing failure limit', () => {

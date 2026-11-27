@@ -21,6 +21,7 @@
           <button id="tab-connection" type="button" role="tab" aria-selected="true" aria-controls="connection">Connection</button>
           <button id="tab-domain-filter" type="button" role="tab" aria-selected="false" aria-controls="domain-filter" tabindex="-1">Site access</button>
           <button id="tab-clipboard" type="button" role="tab" aria-selected="false" aria-controls="clipboard" tabindex="-1">Clipboard</button>
+          <button id="tab-notes" type="button" role="tab" aria-selected="false" aria-controls="notes" tabindex="-1">Note Mode</button>
           <button id="tab-interaction" type="button" role="tab" aria-selected="false" aria-controls="interaction" tabindex="-1">Interaction timing</button>
         </div>
 
@@ -90,6 +91,18 @@
               <div class="actions">
                 <button type="submit" class="primary">Save clipboard setting</button>
                 <p id="clipboard-status" class="status" role="status" aria-live="polite"></p>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel" id="notes" role="tabpanel" aria-labelledby="tab-notes" tabindex="0" hidden>
+            <h2>Note Mode</h2>
+            <p class="panel-intro" id="note-context-help">Save a short label, role, and nearby heading with new notes. Page Notes can suggest a matching control when its position changes. Use Reattach to confirm the new target. This setting is off by default.</p>
+            <form id="notes-form">
+              <label class="check"><input id="note-context-matching" type="checkbox" aria-describedby="note-context-help"> Match saved notes by page context</label>
+              <div class="actions">
+                <button type="submit" class="primary">Save note setting</button>
+                <p id="note-settings-status" class="status" role="status" aria-live="polite"></p>
               </div>
             </form>
           </section>

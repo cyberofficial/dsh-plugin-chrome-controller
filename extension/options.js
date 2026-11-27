@@ -1,4 +1,4 @@
-import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, normalizeDshOrigin, parseDomainFilterEntries } from './origin.js'
+import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, NOTE_CONTEXT_MATCHING_KEY, normalizeDshOrigin, parseDomainFilterEntries } from './origin.js'
 import './overlay.js'
 
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
@@ -178,6 +178,9 @@ const clipboardForm = document.querySelector('#clipboard-form')
 const clipboardAcknowledgeInput = document.querySelector('#clipboard-acknowledge')
 const clipboardEnabledInput = document.querySelector('#clipboard-enabled')
 const clipboardStatusNode = document.querySelector('#clipboard-status')
+const notesForm = document.querySelector('#notes-form')
+const noteContextMatching = document.querySelector('#note-context-matching')
+const noteSettingsStatus = document.querySelector('#note-settings-status')
 const groupsNode = document.querySelector('#settings-groups')
 const statusNode = document.querySelector('#status')
 const resetButton = document.querySelector('#reset')
@@ -767,6 +770,12 @@ async function initialize() {
     clipboardEnabledInput.checked = false
     updateClipboardGate()
   }
+  try {
+    const notes = await chrome.storage.local.get(NOTE_CONTEXT_MATCHING_KEY)
+    noteContextMatching.checked = notes[NOTE_CONTEXT_MATCHING_KEY] === true
+  } catch {
+    noteContextMatching.checked = false
+  }
   updatePairingPage()
 }
 
@@ -811,6 +820,19 @@ clipboardForm.addEventListener('submit', async event => {
   } catch (error) {
     clipboardStatusNode.textContent = error instanceof Error ? error.message : String(error)
     clipboardStatusNode.dataset.error = 'true'
+  }
+})
+
+notesForm.addEventListener('submit', async event => {
+  event.preventDefault()
+  const enabled = noteContextMatching.checked
+  try {
+    await chrome.storage.local.set({ [NOTE_CONTEXT_MATCHING_KEY]: enabled })
+    noteSettingsStatus.textContent = enabled ? 'Note context matching enabled.' : 'Note context matching disabled.'
+    noteSettingsStatus.dataset.error = 'false'
+  } catch (error) {
+    noteSettingsStatus.textContent = error instanceof Error ? error.message : String(error)
+    noteSettingsStatus.dataset.error = 'true'
   }
 })
 

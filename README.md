@@ -19,7 +19,7 @@ Put your DeepSeek Harness agent to work in the Chrome window you already use. Wa
 | **Paginated tables** | Follow a table's Next control and collect the rows as JSON or CSV. Choose the columns you need and check why the tool stopped. |
 | **Browser dialogs** | When a JavaScript confirmation or prompt interrupts a tab, review the dialog in DSH Web and choose how Chrome should respond. |
 | **Workbooks** | Check the active sheet and select cells or ranges in Excel Online and Google Sheets. In Excel Online, read ranges when the editor exposes a compatible API, or watch the formula bar with cell addresses. |
-| **Notes and click targets** | Attach instructions to an element with **Note Mode**, or mark a place for the agent to click with **Points of Interest**. Browse saved notes and points for the current site or across all sites. |
+| **Notes and click targets** | Attach instructions to an element with **Note Mode**, or mark a place for the agent to click with **Points of Interest**. Opt in to context matching to find possible note targets after layout changes. |
 | **Embedded apps and live updates** | Inspect and scroll inside accessible frames, including cross-origin frames. Watch several elements in one iframe, or arm a main-page wait before triggering a change. |
 | **Automation and debugging** | Run a sequence of clicks, typing, scrolling, and waits. Take screenshots, inspect page content, or capture console errors and network activity during a reproduction. |
 | **Signed-in downloads** | Save supported files of up to 10 MiB from a signed-in tab to your DSH session workspace. A credentialed cross-origin retry requires approval. Regular Chrome downloads go to the browser's computer. |
@@ -57,6 +57,7 @@ The included skill has examples for choosing the right tab and frame, watching c
 
 - In **Connection**, turn on **Connect automatically** to pair at Chrome startup or extension reload and retry after interruptions. To replace a pairing code, rotate it in DSH Web, then save the new one in the extension.
 - In **Site access**, set a **Whitelist** or **Blacklist** to control which domains DSH can open or operate on. The filter is off by default. It checks top-level tab addresses and tool-requested destinations. Entries include subdomains, and permitted pages can still use embedded frames.
+- In **Note Mode**, turn on **Match saved notes by page context** to suggest matches after a layout change. Use **Reattach** in Page Notes to confirm or replace a target. The setting is off by default.
 - System **Clipboard** access is off by default. Acknowledge and enable it to let DSH read or replace the clipboard and paste with Ctrl+V. The paste tool can fall back to fast typing when clipboard access is off or the paste fails.
 - In **Interaction timing**, adjust typing pauses, cursor movement, drag duration, and the spacing between sequence steps. Play previews to see how your settings feel before saving.
 

@@ -204,7 +204,7 @@ async function initializeAllNotes() {
 
   async function request(action, entry, note) {
     const result = await sendMessage({
-      type: 'DSH_NOTE_ALL', action, pageKey: entry?.pageKey, xpath: entry?.xpath, note,
+      type: 'DSH_NOTE_ALL', action, pageKey: entry?.pageKey, xpath: entry?.xpath, id: entry?.id, note,
     })
     if (result?.ok !== true) throw new Error(result?.error ?? 'Could not load notes')
     return result.notes
@@ -238,7 +238,7 @@ async function initializeAllNotes() {
   }
 
   function makeRow(entry) {
-    const draftKey = entry.pageKey + ':' + entry.xpath
+    const draftKey = entry.pageKey + ':' + (entry.id ?? entry.xpath)
     const row = document.createElement('article')
     const url = entry.originalUrl ?? entry.pageUrl
     const source = document.createElement('p')

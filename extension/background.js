@@ -1,4 +1,4 @@
-import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, domainFilterAllows, normalizeDshOrigin } from './origin.js'
+import { DEFAULT_DSH_ORIGIN, DOMAIN_FILTER_KEY, NOTE_CONTEXT_MATCHING_KEY, domainFilterAllows, normalizeDshOrigin } from './origin.js'
 import { clampPoiPoint, normalizePoiArea, normalizePoiText, selectPoiPoint } from './poi.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
@@ -212,7 +212,9 @@ function getBehaviorSettings() {
 }
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'local' || changes[BEHAVIOR_SETTINGS_KEY] === undefined) return
+  if (areaName !== 'local') return
+  if (changes[NOTE_CONTEXT_MATCHING_KEY] !== undefined) void refreshOpenNoteLists().catch(() => {})
+  if (changes[BEHAVIOR_SETTINGS_KEY] === undefined) return
   behaviorSettingsCache = normalizeBehaviorSettings(changes[BEHAVIOR_SETTINGS_KEY].newValue)
   behaviorSettingsLoaded = true
   behaviorSettingsLoadTask = undefined
@@ -4711,6 +4713,123 @@ async function elementNoteAddress(rawUrl) {
   }
 }
 
+const NOTE_TRACKING_PARAMS = new Set([
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_id', 'utm_term', 'utm_content',
+  'utm_source_platform', 'utm_creative_format', 'utm_marketing_tactic',
+  'gclid', 'dclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'ttclid',
+])
+let noteRedirectTail = Promise.resolve()
+
+/** Drop known tracking fields while keeping the page's path, route, and identifying query. */
+function normalizedNoteUrl(rawUrl) {
+  let url
+  try { url = new URL(rawUrl) } catch { return undefined }
+  if (!['http:', 'https:'].includes(url.protocol)) return undefined
+  url.username = ''
+  url.password = ''
+  const fields = url.search.slice(1).split('&')
+  const stable = fields.filter(field => !NOTE_TRACKING_PARAMS.has(field.split('=', 1)[0].toLowerCase())
+    && !/^(?:zx|_)=[0-9]+$/u.test(field))
+  if (stable.length !== fields.length) url.search = stable.join('&')
+  return url
+}
+
+function pageNoteAddress(rawUrl) {
+  return elementNoteAddress(normalizedNoteUrl(rawUrl)?.href)
+}
+
+function noteRedirectKey(tabId) {
+  return 'dshNoteRedirect:' + tabId
+}
+
+function rememberNoteRedirect({ tabId, frameId, requestId, url, redirectUrl }) {
+  if (!Number.isInteger(tabId) || tabId < 0 || frameId !== 0 || typeof requestId !== 'string') return
+  const source = normalizedNoteUrl(url)
+  const target = normalizedNoteUrl(redirectUrl)
+  if (!source || !target || source.origin === target.origin || source.port !== target.port
+    || source.hostname.replace(/^www\./u, '') !== target.hostname.replace(/^www\./u, '')
+    || source.pathname !== target.pathname || source.search !== target.search || source.hash !== target.hash
+    || (source.protocol !== target.protocol && !(source.protocol === 'http:' && target.protocol === 'https:'))) return
+
+  // Keep only the destination page hash and the verified source origins for this tab.
+  const key = noteRedirectKey(tabId)
+  const write = noteRedirectTail.then(async () => {
+    const [from, to, pending] = await Promise.all([
+      elementNoteAddress(source.href), elementNoteAddress(target.href), chrome.storage.session.get(key),
+    ])
+    const previous = pending[key]
+    const chain = previous?.requestId === requestId && previous.target === from.pageKey ? previous.origins : []
+    const origins = [...new Set([...chain, source.origin])].slice(-8)
+    await chrome.storage.session.set({ [key]: { requestId, target: to.pageKey, origins } })
+  })
+  noteRedirectTail = write.catch(() => {})
+  return write
+}
+
+function clearNoteRedirectOnNavigation(tabId, url) {
+  const key = noteRedirectKey(tabId)
+  const write = noteRedirectTail.then(async () => {
+    const redirect = (await chrome.storage.session.get(key))[key]
+    if (redirect && redirect.target !== (await pageNoteAddress(url))?.pageKey) {
+      await chrome.storage.session.remove(key)
+    }
+  })
+  noteRedirectTail = write.catch(() => {})
+  return write
+}
+
+async function noteLocationUrls(address, tabId) {
+  const urls = new Set([address.originalUrl])
+  await noteRedirectTail
+  const key = noteRedirectKey(tabId)
+  const redirect = (await chrome.storage.session.get(key))[key]
+  if (redirect?.target === address.pageKey) {
+    const url = new URL(address.originalUrl)
+    for (const origin of redirect.origins) urls.add(origin + url.pathname + url.search + url.hash)
+  }
+  return urls
+}
+
+async function noteContextMatchingEnabled() {
+  await ensureTrustedLocalStorage()
+  const stored = await chrome.storage.local.get(NOTE_CONTEXT_MATCHING_KEY)
+  return stored[NOTE_CONTEXT_MATCHING_KEY] === true
+}
+
+function noteReference(entry) {
+  return { id: entry.id, xpath: entry.xpath }
+}
+
+function requireNoteReference(message) {
+  const xpath = requireNoteXPath(message.xpath)
+  const id = message.id
+  if (id !== undefined && (typeof id !== 'string' || !/^[a-f0-9-]{36}$/u.test(id))) throw new Error('Invalid note ID')
+  return { id, xpath }
+}
+
+function findNoteEntry(entries, { id, xpath }) {
+  return id === undefined ? entries.find(entry => entry.id === undefined && entry.xpath === xpath)
+    : entries.find(entry => entry.id === id)
+}
+
+function sameNoteAnchor(a, b) {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
+}
+
+async function readSelectedNoteAnchor(value, sender) {
+  if (!isRecord(value) || typeof value.tag !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/iu.test(value.tag)) return undefined
+  const fields = [['role', 64], ['label', 120], ['heading', 120], ['elementId', 120], ['name', 120], ['kind', 300]]
+  const anchor = { tag: value.tag }
+  for (const [key, max] of fields) {
+    const text = value[key]
+    if (typeof text !== 'string' || text.length > max) return undefined
+    anchor[key] = text
+  }
+  if (!anchor.label && !anchor.elementId && !anchor.name) return undefined
+  if (sender.frameId !== 0) anchor.frame = (await elementNoteAddress(sender.url))?.pageUrl ?? null
+  return anchor
+}
+
 function noteEntries(page) {
   return Array.isArray(page) ? page : page?.notes ?? []
 }
@@ -4729,16 +4848,19 @@ function collectElementNotes(stored, address, scope = 'domain') {
   return pages.flatMap(([pageKey, page]) => {
     const onCurrentPage = pageKey === address?.pageKey
     const meta = onCurrentPage ? address : page
-    return noteEntries(page).map(({ xpath, note, x, y }) => ({
-      pageKey, xpath, note, x, y, pageUrl: meta.pageUrl ?? null, canOpen: meta.canOpen === true, onCurrentPage,
+    return noteEntries(page).map(({ id, xpath, note, x, y, anchor }) => ({
+      pageKey, ...(id === undefined ? {} : { id }), xpath, note, x, y,
+      ...(anchor === undefined ? {} : { anchor }),
+      pageUrl: meta.pageUrl ?? null, canOpen: meta.canOpen === true, onCurrentPage,
     }))
   })
 }
 
 function collectMasterElementNotes(stored) {
-  return collectElementNotes(stored).map(entry => {
+  return collectElementNotes(stored).map(({ anchor, ...entry }) => {
     const page = stored[entry.pageKey]
-    return { ...entry, site: page.site ?? null, originalUrl: page.originalUrl ?? null }
+    const saved = findNoteEntry(noteEntries(page), entry)
+    return { ...entry, site: page.site ?? null, originalUrl: saved?.sourceUrl ?? page.originalUrl ?? null }
   })
 }
 
@@ -4756,17 +4878,35 @@ async function readElementNotes(params, policy) {
   const scope = params.scope === undefined ? 'domain' : params.scope
   if (!['domain', 'page', 'all'].includes(scope)) throw new Error('scope must be domain, page, or all')
   let tabId
+  let tabUrl
   let all
   if (scope === 'all') {
     all = collectElementNotes(await readNoteStore()).filter(note => domainFilterAllows(policy, note.pageUrl))
   } else {
     tabId = requireTabId(params.tabId)
     const tab = await chrome.tabs.get(tabId)
-    const address = await elementNoteAddress(tab.url)
+    tabUrl = tab.url
+    const address = await pageNoteAddress(tabUrl)
     if (address === undefined) throw new Error('Element notes are available on HTTP and HTTPS pages')
-    all = collectElementNotes(await readNoteStoreForAddress(address), address, scope)
+    all = collectElementNotes(await readNoteStoreForAddress(address, tab), address, scope)
   }
-  const notes = all.slice(offset, offset + limit)
+  const batch = all.slice(offset, offset + limit)
+  const checkContext = tabId !== undefined && batch.some(entry => entry.onCurrentPage && entry.anchor)
+    && await noteContextMatchingEnabled()
+  // Resolve only notes in this result that belong to the exact current page.
+  const targets = checkContext ? await runInFrame(tabId, 0, startElementNoteView, [{
+    mode: 'resolve', expectedUrl: tabUrl,
+    notes: batch.map(({ xpath, onCurrentPage, anchor }) => ({ xpath, onCurrentPage, anchor })),
+  }]).catch(() => null) : null
+  const notes = batch.map(({ anchor, ...entry }, index) => {
+    if (!checkContext || !entry.onCurrentPage || !anchor) return entry
+    const { x, y, ...note } = entry
+    const target = targets?.[index]
+    const targetStatus = target?.status ?? 'unavailable'
+    if (targetStatus === 'matched') return { ...note, targetStatus, x: target.x, y: target.y }
+    if (targetStatus === 'suggested') return { ...note, targetStatus, suggestedXPath: target.xpath }
+    return { ...note, targetStatus }
+  })
   const result = { scope, total: all.length, notes, notesHtml: formatElementNotes(notes) }
   if (tabId !== undefined) result.tabId = tabId
   if (offset + notes.length < all.length) result.nextOffset = offset + notes.length
@@ -4778,7 +4918,10 @@ function formatElementNotes(notes) {
     .replaceAll('>', '&gt;').replace(/-{2,}/g, hyphens => '&#45;'.repeat(hyphens.length))
   return [
     '<!--- #-DSH-Chrome-Controller-Notes-# --->',
-    ...notes.map(({ xpath, note }) => '<!--- ' + escapeComment(xpath) + ' = ' + escapeComment(note) + ' --->'),
+    ...notes.map(({ xpath, note, targetStatus }) => {
+      const locator = targetStatus === undefined || targetStatus === 'matched' ? xpath : '[Note target ' + targetStatus + '. Check Page Notes.]'
+      return '<!--- ' + escapeComment(locator) + ' = ' + escapeComment(note) + ' --->'
+    }),
     '<!--- ##-DSH-Chrome-Controller-Notes-## --->',
   ].join('\n')
 }
@@ -4795,14 +4938,36 @@ function writeNoteStore(mutate) {
   return write
 }
 
-async function readNoteStoreForAddress(address) {
+async function readNoteStoreForAddress(address, tab) {
   const stored = await readNoteStore()
-  const page = stored[address.pageKey]
-  if (page === undefined || page.originalUrl !== undefined) return stored
+  if (Object.keys(stored).length === 0) return stored
+  const urls = await noteLocationUrls(address, tab.id)
+  const legacyKeys = new Map()
+  if (Object.values(stored).some(page => typeof page?.originalUrl !== 'string')) {
+    for (const legacy of await Promise.all([tab.url, ...urls].map(elementNoteAddress))) {
+      if (legacy !== undefined) legacyKeys.set(legacy.pageKey, legacy.originalUrl)
+    }
+  }
+
+  const aliases = current => Object.entries(current).flatMap(([key, page]) => {
+    if (key === address.pageKey) return []
+    const sourceUrl = page?.originalUrl ?? legacyKeys.get(key)
+    return urls.has(normalizedNoteUrl(sourceUrl)?.href) ? [{ key, page, sourceUrl }] : []
+  })
+  const needsAddress = current => current[address.pageKey] !== undefined && current[address.pageKey].originalUrl === undefined
+  if (aliases(stored).length === 0 && !needsAddress(stored)) return stored
+
   return writeNoteStore(current => {
-    const existing = current[address.pageKey]
-    if (existing === undefined || existing.originalUrl !== undefined) return false
-    current[address.pageKey] = { ...address, notes: noteEntries(existing) }
+    const moved = aliases(current)
+    if (moved.length === 0 && !needsAddress(current)) return false
+    const notes = [...noteEntries(current[address.pageKey])]
+    for (const { key, page, sourceUrl } of moved) {
+      for (const note of noteEntries(page)) {
+        notes.push({ ...note, id: note.id ?? crypto.randomUUID(), sourceUrl: note.sourceUrl ?? sourceUrl })
+      }
+      delete current[key]
+    }
+    current[address.pageKey] = { ...address, notes }
     return true
   })
 }
@@ -4831,22 +4996,42 @@ function updateElementNote(draft, action, note) {
   return writeNoteStore(stored => {
     const page = stored[draft.pageKey]
     const current = noteEntries(page)
-    const remaining = current.filter(entry => entry.xpath !== draft.xpath)
-    if (action === 'save') {
-      if (draft.savedOnly && remaining.length === current.length) throw new Error('This note has already been removed')
-      if (remaining.length >= 30) throw new Error('This page has 30 notes. Remove an existing note before adding another.')
+    const existing = draft.ref === undefined ? undefined : findNoteEntry(current, draft.ref)
+    const remaining = current.filter(entry => entry !== existing)
+    if (action === 'save' || action === 'reattach') {
+      if (!existing && (draft.savedOnly || action === 'reattach')) throw new Error('This note has already been removed')
+      if (!existing && draft.picked && current.some(entry => entry.xpath === draft.xpath
+        && (!draft.contextMatching || entry.anchor === undefined || sameNoteAnchor(entry.anchor, draft.anchor)))) {
+        throw new Error('A note was saved for this element. Open Page Notes to edit it.')
+      }
+      if (existing && draft.picked && (existing.xpath !== draft.ref.xpath || !sameNoteAnchor(existing.anchor, draft.previousAnchor))) {
+        throw new Error('This note target changed. Reopen Page Notes and try again.')
+      }
+      if (!existing && remaining.length >= 30) throw new Error('This page already has at least 30 notes. Remove one before adding another.')
       const total = Object.values(stored).reduce((sum, page) => sum + noteEntries(page).length, 0)
-      if (total >= 300 && remaining.length === current.length) {
+      if (total >= 300 && !existing) {
         throw new Error('The extension has 300 saved notes. Remove an existing note before adding another.')
       }
-      const entry = { xpath: draft.xpath, note }
-      if (typeof draft.x === 'number' && typeof draft.y === 'number') {
-        entry.x = draft.x
-        entry.y = draft.y
+      const entry = {
+        ...existing, id: existing?.id ?? crypto.randomUUID(),
+        xpath: draft.picked ? draft.xpath : existing?.xpath ?? draft.xpath,
+        note: action === 'reattach' ? existing.note : note,
+        ...(!existing && draft.sourceUrl ? { sourceUrl: draft.sourceUrl } : {}),
+      }
+      if (draft.picked) {
+        if (draft.anchor) entry.anchor = draft.anchor
+        else if (action === 'reattach') delete entry.anchor
+        if (Number.isFinite(draft.x) && Number.isFinite(draft.y)) {
+          entry.x = draft.x
+          entry.y = draft.y
+        } else {
+          delete entry.x
+          delete entry.y
+        }
       }
       remaining.unshift(entry)
     }
-    if (action === 'remove' && remaining.length === current.length) return false
+    if (action === 'remove' && !existing) return false
     if (remaining.length === 0) delete stored[draft.pageKey]
     else if (draft.address !== undefined) stored[draft.pageKey] = { ...draft.address, notes: remaining }
     else if (Array.isArray(page)) stored[draft.pageKey] = remaining
@@ -4859,12 +5044,16 @@ async function resumeElementNotePicker(tabId, draft) {
   const key = noteDraftKey(tabId)
   try {
     const tab = await chrome.tabs.get(tabId)
-    const address = await elementNoteAddress(tab.url)
+    const address = await pageNoteAddress(tab.url)
     if (address?.pageKey !== draft.pageKey) return false
     const viewKey = noteViewKey(tabId)
     const pending = await chrome.storage.session.get([key, viewKey])
     if (pending[key]?.token !== draft.token || pending[viewKey]?.token !== draft.pickerToken) return false
-    const picker = { mode: 'pick', token: draft.pickerToken, address, frameId: draft.frameId ?? 0, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
+    const picker = {
+      mode: 'pick', token: draft.pickerToken, address, frameId: draft.frameId ?? 0,
+      frameStack: draft.frameStack ?? [], parentFrameId: draft.parentFrameId ?? null,
+      expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+    }
     await chrome.storage.session.set({ [key]: picker, [viewKey]: picker })
     const frameId = typeof draft.frameId === 'number' ? draft.frameId : 0
     let frameUrl = tab.url
@@ -4879,7 +5068,8 @@ async function resumeElementNotePicker(tabId, draft) {
       target,
       func: startElementNoteView,
       args: [{ mode: 'pick', token: picker.token, notes: [], lifetimeMs: ELEMENT_NOTE_DRAFT_MS,
-        corner: draft.corner, expectedUrl: frameUrl }],
+        corner: draft.corner, expectedUrl: frameUrl, frameStack: picker.frameStack, parentFrameId: picker.parentFrameId,
+        contextMatching: await noteContextMatchingEnabled() }],
     })
     return result?.result === true
   } catch {
@@ -4891,13 +5081,14 @@ async function resumeElementNotePicker(tabId, draft) {
 async function refreshOpenNoteLists(pageKey) {
   const state = await chrome.storage.session.get(null)
   const stored = await readNoteStore()
+  const contextMatching = await noteContextMatchingEnabled()
   const site = stored[pageKey]?.site
   await Promise.allSettled(Object.entries(state).map(async ([key, view]) => {
     if (!key.startsWith(noteViewKey('')) || view?.mode !== 'list' || view.expiresAt <= Date.now()) return
     if (site !== undefined && view.address.site !== site) return
     const tabId = Number(key.slice(noteViewKey('').length))
     await chrome.tabs.sendMessage(tabId, {
-      type: 'DSH_NOTE_LIST_UPDATED', token: view.token,
+      type: 'DSH_NOTE_LIST_UPDATED', token: view.token, contextMatching,
       notes: collectElementNotes(stored, view.address),
     }, { frameId: 0 })
   }))
@@ -4948,6 +5139,8 @@ async function startPickerInFrame(tabId, view) {
     useContextTarget: view.useContextTarget ?? false,
     frameStack: view.frameStack ?? [],
     parentFrameId: view.parentFrameId ?? null,
+    contextMatching: await noteContextMatchingEnabled(),
+    reattaching: view.reattach !== undefined,
   }])
   if (started !== true) throw new Error('Could not open element notes on this frame')
 }
@@ -4959,16 +5152,17 @@ async function startPickerInFrame(tabId, view) {
  * right-click on a specific frame starts the picker in that frame with the
  * stack precomputed.
  */
-async function openElementNoteView(tab, mode, useContextTarget = false, frameId = 0, frameStack = [], parentFrameId = null) {
+async function openElementNoteView(tab, mode, useContextTarget = false, frameId = 0, frameStack = [], parentFrameId = null, reattach) {
   const tabId = requireTabId(tab?.id)
-  const address = await elementNoteAddress(tab.url)
+  const address = await pageNoteAddress(tab.url)
   if (address === undefined) throw new Error('Open an HTTP or HTTPS page to use element notes')
+  if (reattach !== undefined && address.pageKey !== reattach.pageKey) throw new Error('Open the original page to reattach this note')
   const token = crypto.randomUUID()
-  const stored = await readNoteStoreForAddress(address)
+  const stored = await readNoteStoreForAddress(address, tab)
   const notes = mode === 'list' ? collectElementNotes(stored, address) : []
   const view = {
     mode, token, address, notes, useContextTarget,
-    frameId, frameStack, parentFrameId,
+    frameId, frameStack, parentFrameId, ...(reattach === undefined ? {} : { reattach }),
     expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
   }
   const state = { [noteViewKey(tabId)]: view }
@@ -5308,9 +5502,9 @@ async function handleElementNoteMessage(message, sender) {
     if (message.action === 'list') return { ok: true, notes: collectMasterElementNotes(await readNoteStore()) }
     if (message.action !== 'save' && message.action !== 'remove') throw new Error('Unknown note action')
     if (typeof message.pageKey !== 'string' || !/^[a-f0-9]{64}$/u.test(message.pageKey)) throw new Error('Invalid note page')
-    const xpath = requireNoteXPath(message.xpath)
+    const ref = requireNoteReference(message)
     const note = message.action === 'save' ? requireNoteText(message.note) : undefined
-    const stored = await updateElementNote({ pageKey: message.pageKey, xpath, savedOnly: true }, message.action, note)
+    const stored = await updateElementNote({ pageKey: message.pageKey, ref, savedOnly: true }, message.action, note)
     void refreshOpenNoteLists(message.pageKey).catch(() => {})
     return { ok: true, notes: collectMasterElementNotes(stored) }
   }
@@ -5323,7 +5517,8 @@ async function handleElementNoteMessage(message, sender) {
 
   const editingSaved = message.type === 'DSH_NOTE_OPEN_SAVED'
   const deletingSaved = message.type === 'DSH_NOTE_DELETE_SAVED'
-  const fromList = editingSaved || deletingSaved
+  const reattachingSaved = message.type === 'DSH_NOTE_REATTACH'
+  const fromList = editingSaved || deletingSaved || reattachingSaved
   const fromPage = fromList || message.type === 'DSH_NOTE_SELECTED'
     || message.type === 'DSH_NOTE_ENTER_FRAME' || message.type === 'DSH_NOTE_LEAVE_FRAME'
   if (fromPage ? sender.tab === undefined : !fromEditor) {
@@ -5347,37 +5542,82 @@ async function handleElementNoteMessage(message, sender) {
     if (message.type === 'DSH_NOTE_ENTER_FRAME' || message.type === 'DSH_NOTE_LEAVE_FRAME') {
       return handleFrameDrill(tabId, key, draft, sender, message)
     }
-    const leafXPath = requireNoteXPath(message.xpath)
-    const xpath = [...(draft.frameStack ?? []), leafXPath].join(' >> ')
-    if (draft.xpath !== undefined) throw new Error('An editor is already open for this selection')
-    const address = await elementNoteAddress(sender.tab.url)
+    if (!fromList && draft.mode !== 'pick') throw new Error('Open Note Mode from the extension popup')
+    const address = await pageNoteAddress(sender.tab.url)
     if (address?.pageKey !== draft.address.pageKey) {
       throw new Error('The page changed. Open the notes again from the extension popup.')
     }
     const pageKey = fromList ? message.pageKey : address.pageKey
+    if (typeof pageKey !== 'string' || !/^[a-f0-9]{64}$/u.test(pageKey)) throw new Error('Invalid note page')
+    const page = (await readNoteStore())[pageKey]
+    const entries = noteEntries(page)
+    const xpath = fromList ? requireNoteXPath(message.xpath)
+      : requireNoteXPath([...(draft.frameStack ?? []), requireNoteXPath(message.xpath)].join(' >> '))
+    const contextMatching = !fromList && await noteContextMatchingEnabled()
+    const anchor = contextMatching ? await readSelectedNoteAnchor(message.anchor, sender) : undefined
+    let entry
     if (fromList) {
-      if (typeof pageKey !== 'string' || !/^[a-f0-9]{64}$/u.test(pageKey)) throw new Error('Invalid note page')
-      const page = (await readNoteStore())[pageKey]
-      if ((pageKey !== address.pageKey && page?.site !== address.site)
-        || !noteEntries(page).some(entry => entry.xpath === xpath)) {
+      entry = findNoteEntry(entries, requireNoteReference(message))
+      if (!entry || (pageKey !== address.pageKey && page?.site !== address.site)) {
         throw new Error('This note is no longer on the list. Reopen Page Notes.')
       }
       if (deletingSaved) {
-        const stored = await updateElementNote({ pageKey, xpath }, 'remove')
+        const stored = await updateElementNote({ pageKey, ref: noteReference(entry) }, 'remove')
         return { ok: true, notes: collectElementNotes(stored, address) }
       }
-    }
-    const editorToken = crypto.randomUUID()
-    const editorDraft = { token: editorToken, pageKey, xpath, x: message.x, y: message.y, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS }
-    if (editingSaved) {
-      editorDraft.viewToken = draft.token
-      editorDraft.viewAddress = address
-      editorDraft.savedOnly = true
+      if (reattachingSaved) {
+        if (pageKey !== address.pageKey) throw new Error('Open the original page to reattach this note')
+        return openElementNoteView(await chrome.tabs.get(tabId), 'pick', false, 0, [], null, {
+          pageKey, ref: noteReference(entry), previousAnchor: entry.anchor,
+        })
+      }
+    } else if (draft.reattach !== undefined) {
+      const latest = (await chrome.storage.session.get(key))[key]
+      const tab = await chrome.tabs.get(tabId)
+      const frame = typeof sender.documentId === 'string'
+        ? await chrome.webNavigation.getFrame({ tabId, frameId: sender.frameId }).catch(() => undefined) : undefined
+      if (latest?.token !== draft.token || tab.url !== sender.tab.url
+        || (typeof sender.documentId === 'string' && frame?.documentId !== sender.documentId)) {
+        throw new Error('The page or note picker changed. Reopen Page Notes.')
+      }
+      await updateElementNote({
+        ...draft.reattach, address, xpath, anchor, picked: true, x: message.x, y: message.y,
+      }, 'reattach')
+      const current = await chrome.storage.session.get([key, noteViewKey(tabId)])
+      if (current[key]?.token === draft.token && current[noteViewKey(tabId)]?.token === draft.token) {
+        await chrome.storage.session.remove(key)
+        const active = await chrome.tabs.get(tabId).catch(() => undefined)
+        if (active?.url === tab.url) await openElementNoteView(active, 'list').catch(() => {})
+      }
+      void refreshOpenNoteLists(pageKey).catch(() => {})
+      return { ok: true }
     } else {
+      const matches = entries.filter(saved => saved.xpath === xpath
+        && (!contextMatching || saved.anchor === undefined || sameNoteAnchor(saved.anchor, anchor)))
+      if (matches.length > 1) throw new Error('Multiple notes use this path. Edit the intended note in Page Notes.')
+      entry = matches[0]
+    }
+
+    const editorToken = crypto.randomUUID()
+    const editorDraft = {
+      token: editorToken, pageKey, xpath, x: message.x, y: message.y, expiresAt: Date.now() + ELEMENT_NOTE_DRAFT_MS,
+      ...(entry ? { ref: noteReference(entry), savedOnly: true } : {}),
+    }
+    if (!editingSaved) {
       editorDraft.address = address
+      if (!entry) {
+        const pickedAddress = await elementNoteAddress(sender.tab.url)
+        if (pickedAddress.originalUrl !== address.originalUrl) editorDraft.sourceUrl = pickedAddress.originalUrl
+      }
+      editorDraft.picked = true
+      editorDraft.anchor = anchor
+      editorDraft.previousAnchor = entry?.anchor
+      editorDraft.contextMatching = contextMatching
       editorDraft.pickerToken = draft.token
       editorDraft.documentId = sender.documentId
       editorDraft.frameId = sender.frameId
+      editorDraft.frameStack = draft.frameStack ?? []
+      editorDraft.parentFrameId = draft.parentFrameId ?? null
       editorDraft.corner = typeof message.corner === 'string' && /^(top|bottom)-(left|right)$/u.test(message.corner)
         ? message.corner : 'top-right'
     }
@@ -5401,7 +5641,7 @@ async function handleElementNoteMessage(message, sender) {
   if (draft.xpath === undefined) throw new Error('No element has been selected')
   if (message.action === 'read') {
     const stored = await readNoteStore()
-    const entry = noteEntries(stored[draft.pageKey]).find(entry => entry.xpath === draft.xpath)
+    const entry = draft.ref === undefined ? undefined : findNoteEntry(noteEntries(stored[draft.pageKey]), draft.ref)
     const x = typeof entry?.x === 'number' ? entry.x : typeof draft.x === 'number' ? draft.x : undefined
     const y = typeof entry?.y === 'number' ? entry.y : typeof draft.y === 'number' ? draft.y : undefined
     return {
@@ -5414,13 +5654,9 @@ async function handleElementNoteMessage(message, sender) {
   if (!['save', 'remove', 'cancel'].includes(message.action)) throw new Error('Unknown note action')
   const note = message.action === 'save' ? requireNoteText(message.note) : undefined
   if (message.action !== 'cancel') {
-    const stored = await updateElementNote(draft, message.action, note)
-    if (draft.viewToken !== undefined) {
-      await chrome.tabs.sendMessage(tabId, {
-        type: 'DSH_NOTE_LIST_UPDATED', token: draft.viewToken,
-        notes: collectElementNotes(stored, draft.viewAddress),
-      }, { frameId: 0 }).catch(() => {})
-    }
+    if (draft.anchor && !await noteContextMatchingEnabled()) delete draft.anchor
+    await updateElementNote(draft, message.action, note)
+    void refreshOpenNoteLists(draft.pageKey).catch(() => {})
   }
 
   const canResume = draft.pickerToken !== undefined && typeof draft.documentId === 'string'
@@ -5433,10 +5669,149 @@ async function handleElementNoteMessage(message, sender) {
 }
 
 /** Runs in Chrome's isolated world. Notes are edited in the extension window. */
-function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl, useContextTarget = false, frameStack = [], parentFrameId = null }) {
+function startElementNoteView({
+  mode, token, notes, lifetimeMs, corner = 'top-right', expectedUrl, useContextTarget = false,
+  frameStack = [], parentFrameId = null, contextMatching = false, reattaching = false,
+}) {
   if (document.contentType !== 'text/html') throw new Error('Element notes require an HTML document')
-  // Subframe pickers must not bail on the tab URL; only the top frame matches it.
   if (expectedUrl !== undefined && window === window.top && location.href !== expectedUrl) return false
+
+  const anchorFields = ['tag', 'role', 'label', 'heading', 'elementId', 'name', 'kind']
+
+  function shortText(value, max = 120) {
+    const text = String(value ?? '').replace(/\s+/gu, ' ').trim()
+    return text.length <= max ? text : ''
+  }
+
+  function ariaLabel(element) {
+    if (!element) return ''
+    const root = element.getRootNode()
+    const ids = element.getAttribute('aria-labelledby')?.trim().split(/\s+/u) ?? []
+    const label = ids.map(id => root.getElementById?.(id)?.textContent ?? '').join(' ')
+    return shortText(label) || shortText(element.getAttribute('aria-label'))
+  }
+
+  function nearbyHeading(element, cache) {
+    const selector = 'fieldset, section, article, form, main, [role="region"], [role="group"]'
+    const body = element.ownerDocument.body
+    let scope = element.parentElement?.closest(selector) ?? body
+    while (scope) {
+      if (!cache.has(scope)) {
+        cache.set(scope, { label: ariaLabel(scope), headings: [...scope.querySelectorAll('legend, h1, h2, h3, h4, h5, h6, [role="heading"]')] })
+      }
+      const { label, headings } = cache.get(scope)
+      if (label) return label
+      let preceding
+      for (const heading of headings) {
+        if (heading === element || (heading.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)) preceding = heading
+        else break
+      }
+      const text = shortText((preceding ?? (headings.length === 1 ? headings[0] : undefined))?.textContent)
+      if (text) return text
+      scope = scope === body ? null : scope.parentElement?.closest(selector) ?? body
+    }
+    return ''
+  }
+
+  function describeNoteTarget(element, headings = new Map()) {
+    const tag = element.localName
+    let kind = tag === 'input' || tag === 'button' ? shortText(element.type, 64) : ''
+    if (tag === 'a' && element.hasAttribute('href')) {
+      try {
+        const url = new URL(element.getAttribute('href'), element.ownerDocument.baseURI)
+        kind = ['http:', 'https:'].includes(url.protocol) ? shortText(url.origin + url.pathname, 300) : url.protocol
+      } catch {}
+    }
+    const role = shortText(element.getAttribute('role')?.trim().split(/\s+/u)[0], 64)
+      || (tag === 'a' && kind ? 'link' : tag === 'textarea' ? 'textbox' : tag === 'select' ? 'combobox' : tag)
+    const formText = ['input', 'textarea', 'select'].includes(tag) || element.isContentEditable
+    const buttonText = tag === 'input' && ['button', 'submit', 'reset'].includes(kind)
+      ? element.getAttribute('value') : ''
+    const label = ariaLabel(element)
+      || shortText(Array.from(element.labels ?? [], label => label.textContent).join(' '))
+      || shortText(element.getAttribute('alt'))
+      || shortText(formText ? buttonText : element.innerText ?? element.textContent)
+      || shortText(element.getAttribute('title')) || shortText(element.getAttribute('placeholder'))
+    return {
+      tag, role, label, heading: nearbyHeading(element, headings), elementId: shortText(element.getAttribute('id')),
+      name: shortText(element.getAttribute('name')), kind,
+    }
+  }
+
+  function elementAtXPath(doc, xpath) {
+    const result = doc.evaluate(xpath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+    return result?.nodeType === 1 && result.id !== 'dsh-note-picker-host' ? result : null
+  }
+
+  function notePath(xpath) {
+    const segments = xpath.split(' >> ')
+    const leaf = segments.pop()
+    let doc = document
+    try {
+      for (const segment of segments) {
+        const frame = elementAtXPath(doc, segment)
+        // Resolve within the original frame path. An inaccessible frame cannot
+        // supply a target, even if the same leaf XPath exists in the top page.
+        if (!frame || !['iframe', 'frame'].includes(frame.localName) || !frame.contentDocument) return null
+        doc = frame.contentDocument
+      }
+      return { doc, frames: segments, saved: elementAtXPath(doc, leaf) }
+    } catch {
+      return null
+    }
+  }
+
+  function noteTarget(entry, cache, enabled = contextMatching) {
+    const path = notePath(entry.xpath)
+    if (!path) return { status: 'unavailable', element: null }
+    const { doc, frames, saved } = path
+    const anchor = entry.anchor
+    if (!enabled || !anchor) return { status: 'saved_path', element: saved, doc }
+    try {
+      if (frames.length > 0 && (!anchor.frame || anchor.frame !== doc.location.origin + doc.location.pathname)) {
+        return { status: 'unavailable', element: null, doc }
+      }
+      // A bounded search needs to see every candidate before claiming a match.
+      const candidates = anchor.elementId
+        ? doc.querySelectorAll('#' + CSS.escape(anchor.elementId)) : doc.getElementsByTagName(anchor.tag)
+      if (candidates.length > 5_000) return { status: 'unavailable', element: null, doc }
+      let match
+      for (const candidate of candidates) {
+        if (candidate.localName !== anchor.tag || candidate.id === 'dsh-note-picker-host') continue
+        let description = cache.elements.get(candidate)
+        if (!description) {
+          description = describeNoteTarget(candidate, cache.headings)
+          cache.elements.set(candidate, description)
+        }
+        if (anchorFields.some(key => description[key] !== anchor[key])) continue
+        if (!candidate.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue
+        if (match) return { status: 'ambiguous', element: null, doc }
+        match = candidate
+      }
+      if (!match) return { status: 'missing', element: null, doc }
+      if (match === saved) return { status: 'matched', element: match, doc }
+      return { status: 'suggested', element: match, doc, xpath: [...frames, absoluteXPath(match)].join(' >> ') }
+    } catch {
+      return { status: 'unavailable', element: null, doc }
+    }
+  }
+
+  function noteTargetCache() {
+    return { elements: new Map(), headings: new Map() }
+  }
+
+  if (mode === 'resolve') {
+    const cache = noteTargetCache()
+    return notes.map(note => {
+      if (!note.onCurrentPage || !note.anchor) return null
+      const target = noteTarget(note, cache, true)
+      if (target.status === 'suggested') return { status: 'suggested', xpath: target.xpath }
+      if (target.status !== 'matched') return { status: target.status }
+      const rect = target.element.getBoundingClientRect()
+      return { status: 'matched', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+    })
+  }
+
   globalThis.__dshStopNotePicker?.()
   const controller = new AbortController()
   const listen = { signal: controller.signal }
@@ -5503,7 +5878,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     placeToolbar(position.value)
     position.blur()
   }, listen)
-  const close = makeButton(mode === 'pick' ? 'Done' : 'Close')
+  const close = makeButton(reattaching ? 'Cancel' : mode === 'pick' ? 'Done' : 'Close')
   header.append(status, position, close)
   toolbar.append(header)
 
@@ -5532,9 +5907,28 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     return outline
   }
 
+  function noteViewportRect(element) {
+    if (!element?.isConnected) return null
+    let { top, left, width, height } = element.getBoundingClientRect()
+    let doc = element.ownerDocument
+    while (doc !== document) {
+      const frame = doc.defaultView?.frameElement
+      if (!frame || !frame.isConnected) return null
+      const outer = frame.getBoundingClientRect()
+      const scaleX = frame.offsetWidth > 0 ? outer.width / frame.offsetWidth : 1
+      const scaleY = frame.offsetHeight > 0 ? outer.height / frame.offsetHeight : 1
+      left = outer.left + (frame.clientLeft + left) * scaleX
+      top = outer.top + (frame.clientTop + top) * scaleY
+      width *= scaleX
+      height *= scaleY
+      doc = frame.ownerDocument
+    }
+    return { top, left, width, height }
+  }
+
   function drawOutline(outline, element, active = false) {
-    const rect = element?.getBoundingClientRect()
-    const visible = rect !== undefined && rect.width > 0 && rect.height > 0
+    const rect = noteViewportRect(element)
+    const visible = rect !== null && rect.width > 0 && rect.height > 0
     outline.style.display = visible ? 'block' : 'none'
     if (visible) {
       Object.assign(outline.style, {
@@ -5545,8 +5939,8 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     return visible
   }
 
-  async function openEditor(type, xpath, pageKey, x, y) {
-    const result = await chrome.runtime.sendMessage({ type, token, xpath, corner, pageKey, x, y })
+  async function openEditor(type, details) {
+    const result = await chrome.runtime.sendMessage({ type, token, corner, ...details })
     if (result?.ok !== true) throw new Error(result?.error ?? 'Could not open the note editor')
   }
 
@@ -5564,7 +5958,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     let contextSelection = selected !== null
     const previousChildren = []
     let opening = false
-    const useSelection = selected === null ? null : makeButton('Add note')
+    const useSelection = selected === null ? null : makeButton(reattaching ? 'Reattach here' : 'Add note')
     if (useSelection !== null) {
       header.insertBefore(useSelection, close)
       useSelection.addEventListener('click', event => {
@@ -5611,7 +6005,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       if (back !== null) hint = 'Use "Back" (or Left) to go up a frame. ' + hint
       status.textContent = chainNote + (contextSelection && selected !== null
         ? 'Selected ' + target + '. ' + hint
-        : 'Click to select ' + target + '. ' + hint)
+        : (reattaching ? 'Click to reattach to ' : 'Click to select ') + target + '. ' + hint)
       if (useSelection !== null) useSelection.disabled = selected === null || opening
       enterFrame.disabled = selected === null || !isFrame || opening
     }
@@ -5639,7 +6033,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
       if (opening || selected === null || !selected.isConnected) return
       opening = true
       if (useSelection !== null) useSelection.disabled = true
-      status.textContent = 'Opening note editor...'
+      status.textContent = reattaching ? 'Reattaching note...' : 'Opening note editor...'
       try {
         // Capture the viewport point at which the user is placing the note, so
         // DSH can point the LLM at where to click (e.g. inside iframes such as
@@ -5647,7 +6041,8 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         const rect = selected.getBoundingClientRect()
         const x = rect.left + rect.width / 2
         const y = rect.top + rect.height / 2
-        await openEditor('DSH_NOTE_SELECTED', absoluteXPath(selected), undefined, x, y)
+        const anchor = contextMatching ? describeNoteTarget(selected) : undefined
+        await openEditor('DSH_NOTE_SELECTED', { xpath: absoluteXPath(selected), x, y, anchor })
         stop()
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error)
@@ -5774,31 +6169,20 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     toolbar.append(list)
     shadow.append(outlines, toolbar)
     let rows = []
-    let activeXPath
+    let activeNote
     let animationFrame
+    let lookupTimer
     let needsLookup = false
     let opening = false
 
-    function lookup(xpath) {
-      try {
-        // Chained frame paths (`/frame >> /element`) resolve segment by segment,
-        // descending into same-origin iframe documents; cross-origin frames are
-        // not reachable from page JS and report as not found here.
-        const segments = xpath.split(' >> ')
-        let doc = document
-        let element = null
-        for (const segment of segments) {
-          const result = doc.evaluate(segment, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
-          element = result.singleNodeValue
-          if (!(element instanceof Element) || element === host) return null
-          const frameDoc = element instanceof HTMLIFrameElement || element instanceof HTMLFrameElement
-            ? element.contentDocument
-            : null
-          doc = frameDoc ?? document
-        }
-        return element
-      } catch {
-        return null
+    function scheduleLookup() {
+      if (!contextMatching) {
+        scheduleDraw(true)
+      } else if (lookupTimer === undefined) {
+        lookupTimer = setTimeout(() => {
+          lookupTimer = undefined
+          scheduleDraw(true)
+        }, 120)
       }
     }
 
@@ -5808,13 +6192,30 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         stop()
         return
       }
+      const cache = resolve ? noteTargetCache() : undefined
+      const documents = resolve ? new Set([document]) : undefined
       for (const row of rows) {
         if (!row.onCurrentPage) continue
-        if (resolve) row.element = lookup(row.xpath)
-        const visible = drawOutline(row.outline, row.element, row.xpath === activeXPath)
+        if (resolve) {
+          const target = noteTarget(row, cache)
+          row.element = target.element
+          row.targetStatus = target.status
+          if (target.doc) documents.add(target.doc)
+        }
+        const visible = drawOutline(row.outline, row.element, row.key === activeNote || row.targetStatus === 'suggested')
         row.locate.disabled = !visible
-        row.unavailable.hidden = visible
-        row.unavailable.textContent = row.element === null ? 'Element not found' : 'Element is hidden'
+        const message = row.targetStatus === 'ambiguous' ? 'Multiple matches. Reattach this note.'
+          : row.targetStatus === 'missing' ? 'Context changed. Reattach this note.'
+          : row.targetStatus === 'unavailable' ? 'Target unavailable. Reattach this note.'
+          : row.targetStatus === 'suggested' ? 'Suggested match. Reattach to confirm.'
+          : !visible ? (row.element === null ? 'Element not found' : 'Element is hidden')
+          : contextMatching && row.targetStatus === 'saved_path' ? 'Saved XPath. Reattach to capture context.' : ''
+        row.unavailable.textContent = message
+        row.unavailable.hidden = message === ''
+      }
+      if (documents) {
+        observer.disconnect()
+        for (const doc of documents) observer.observe(doc, observeOptions)
       }
     }
 
@@ -5830,7 +6231,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
 
     function render(entries) {
       status.textContent = entries.length === 0 ? 'No notes for this site.' : 'Notes on this site'
-      rows = entries.map(({ xpath, note, pageKey, pageUrl, canOpen, onCurrentPage }, index) => {
+      rows = entries.map(({ id, xpath, note, pageKey, pageUrl, canOpen, onCurrentPage, anchor }, index) => {
         const number = String(index + 1)
         const row = document.createElement('div')
         Object.assign(row.style, { borderTop: '1px solid #53627a', padding: '8px 0' })
@@ -5856,6 +6257,8 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         Object.assign(actions.style, { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px' })
         const locate = makeButton('Locate')
         locate.setAttribute('aria-label', 'Locate note ' + number)
+        const reattach = makeButton('Reattach')
+        reattach.setAttribute('aria-label', 'Reattach note ' + number)
         const edit = makeButton('Edit')
         edit.setAttribute('aria-label', 'Edit note ' + number)
         const remove = makeButton('Delete')
@@ -5864,7 +6267,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
         const unavailable = document.createElement('span')
         unavailable.hidden = true
         locate.disabled = true
-        if (onCurrentPage) actions.append(locate)
+        if (onCurrentPage) actions.append(locate, reattach)
         actions.append(edit, remove, unavailable)
         row.append(source, description, actions)
 
@@ -5876,20 +6279,33 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
           padding: '1px 5px', borderRadius: '0 0 4px 0', font: '600 12px/1.5 system-ui, sans-serif',
         })
         outline.append(badge)
-        const view = { xpath, onCurrentPage, row, outline, locate, unavailable, element: null }
+        const view = { key: id ?? xpath, xpath, anchor, onCurrentPage, row, outline, locate, unavailable, element: null }
         locate.addEventListener('click', event => {
           if (!event.isTrusted) return
-          view.element = lookup(xpath)
-          view.element?.scrollIntoView({ block: 'center', inline: 'nearest' })
-          activeXPath = xpath
+          const target = noteTarget(view, noteTargetCache())
+          target.element?.scrollIntoView({ block: 'center', inline: 'nearest' })
+          activeNote = view.key
           scheduleDraw(true)
         })
+        reattach.addEventListener('click', async event => {
+          if (!event.isTrusted || opening) return
+          opening = true
+          reattach.disabled = true
+          try {
+            await openEditor('DSH_NOTE_REATTACH', { xpath, pageKey, id })
+          } catch (error) {
+            status.textContent = error instanceof Error ? error.message : String(error)
+          } finally {
+            opening = false
+            reattach.disabled = false
+          }
+        }, listen)
         edit.addEventListener('click', async event => {
           if (!event.isTrusted || opening) return
           opening = true
           edit.disabled = true
           try {
-            await openEditor('DSH_NOTE_OPEN_SAVED', xpath, pageKey)
+            await openEditor('DSH_NOTE_OPEN_SAVED', { xpath, pageKey, id })
           } catch (error) {
             status.textContent = error instanceof Error ? error.message : String(error)
           } finally {
@@ -5909,7 +6325,7 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
           opening = true
           remove.disabled = true
           try {
-            const result = await chrome.runtime.sendMessage({ type: 'DSH_NOTE_DELETE_SAVED', token, xpath, pageKey })
+            const result = await chrome.runtime.sendMessage({ type: 'DSH_NOTE_DELETE_SAVED', token, xpath, pageKey, id })
             if (result?.ok !== true) throw new Error(result?.error ?? 'Could not delete the note')
             if (!controller.signal.aborted) render(result.notes)
           } catch (error) {
@@ -5927,15 +6343,22 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
     }
 
     function onNotesUpdated(message, sender) {
-      if (sender.id === chrome.runtime.id && message?.type === 'DSH_NOTE_LIST_UPDATED'
-        && message.token === token && Array.isArray(message.notes)) render(message.notes)
+      if (sender.id !== chrome.runtime.id || message?.type !== 'DSH_NOTE_LIST_UPDATED'
+        || message.token !== token || !Array.isArray(message.notes)) return
+      contextMatching = message.contextMatching === true
+      render(message.notes)
     }
-    const observer = new MutationObserver(() => scheduleDraw(true))
-    observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true })
+    const observeOptions = { childList: true, subtree: true, attributes: true, characterData: true }
+    const observer = new MutationObserver(scheduleLookup)
+    observer.observe(document, observeOptions)
     chrome.runtime.onMessage.addListener(onNotesUpdated)
     window.addEventListener('scroll', () => scheduleDraw(), { ...listen, capture: true })
     window.addEventListener('resize', () => scheduleDraw(), listen)
+    window.addEventListener('load', event => {
+      if (['iframe', 'frame'].includes(event.target?.localName)) scheduleLookup()
+    }, { ...listen, capture: true })
     cleanup = () => {
+      clearTimeout(lookupTimer)
       observer.disconnect()
       chrome.runtime.onMessage.removeListener(onNotesUpdated)
       if (animationFrame !== undefined) cancelAnimationFrame(animationFrame)
@@ -8022,7 +8445,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true
   }
   if (['DSH_NOTE_MODE', 'DSH_NOTE_LIST', 'DSH_NOTE_ALL', 'DSH_NOTE_SELECTED',
-    'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_EDITOR',
+    'DSH_NOTE_OPEN_SAVED', 'DSH_NOTE_DELETE_SAVED', 'DSH_NOTE_REATTACH', 'DSH_NOTE_EDITOR',
     'DSH_NOTE_ENTER_FRAME', 'DSH_NOTE_LEAVE_FRAME'].includes(message?.type)) {
     void handleElementNoteMessage(message, sender).then(sendResponse, error => sendResponse({
       ok: false,
@@ -8077,8 +8500,13 @@ chrome.runtime.onMessage.addListener(message => {
   return false
 })
 
+chrome.webRequest.onBeforeRedirect.addListener(details => {
+  void rememberNoteRedirect(details)?.catch(() => {})
+}, { urls: ['http://*/*', 'https://*/*'], types: ['main_frame'] })
+
 chrome.tabs.onRemoved.addListener(tabId => {
   void chrome.storage.session.remove([noteDraftKey(tabId), noteViewKey(tabId)]).catch(() => {})
+  void clearNoteRedirectOnNavigation(tabId).catch(() => {})
   overlayTabs.delete(tabId)
   activeDebuggerTargets.delete(tabId)
   browserDialogs.delete(tabId)
@@ -8090,8 +8518,10 @@ chrome.debugger.onDetach.addListener(source => {
     browserDialogs.delete(source.tabId)
   }
 })
-chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, documentLifecycle }) => {
-  if (frameId === 0 && (!documentLifecycle || documentLifecycle === 'active')) browserDialogs.delete(tabId)
+chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, documentLifecycle, url }) => {
+  if (frameId !== 0 || (documentLifecycle && documentLifecycle !== 'active')) return
+  browserDialogs.delete(tabId)
+  void clearNoteRedirectOnNavigation(tabId, url).catch(() => {})
 })
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading' || changeInfo.url !== undefined) overlayTabs.delete(tabId)
