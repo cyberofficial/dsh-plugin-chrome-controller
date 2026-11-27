@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, it, mock } from 'node:test'
+import { createContext, runInContext } from 'node:vm'
+import { DOMAIN_FILTER_KEY, domainFilterAllows } from '../extension/origin.js'
 import { BrowserExtensionBridge } from '../lib/bridge.js'
 import { apply } from '../lib/index.js'
 
@@ -243,6 +246,157 @@ it('lets a change wait reach its extension deadline and honors harness cancellat
   await assert.rejects(pending, { message: 'Harness deadline reached' })
   const cancelled = await call(context, 'poll', { body: { sessionToken } })
   assert.deepEqual(cancelled.json.cancelled, [shortWait.id])
+})
+
+async function mountDialogTools(t, ask) {
+  const context = fakeContext()
+  const tools = new Map()
+  context.tools = { register(tool) { tools.set(tool.name, tool) } }
+  context.systemPrompt = { section() {}, getSectionOrder: () => 0 }
+  context.skills = { register() {} }
+  context.get = key => key === 'userQuestions' ? { ask } : undefined
+  context.effect = factory => t.after(factory())
+  await apply(context)
+  const sessionToken = await connect(context)
+  const controller = new AbortController()
+  t.after(() => controller.abort())
+  return {
+    run(name, args) { return tools.get('dsh_browser_' + name).execute(args, { agent: {}, signal: controller.signal }) },
+    async receive(method) {
+      const response = await call(context, 'poll', { body: { sessionToken } })
+      const [command] = response.json.commands
+      assert.equal(command.method, method)
+      return command
+    },
+    async respond(command, result) {
+      await call(context, 'respond', { body: { sessionToken, id: command.id, ok: true, result } })
+    },
+  }
+}
+
+it('asks the user when a click opens a dialog and responds while the tab queue is held', { timeout: 2_000 }, async t => {
+  const asked = Promise.withResolvers()
+  const answered = Promise.withResolvers()
+  const plugin = await mountDialogTools(t, request => {
+    asked.resolve(request.questions[0])
+    return answered.promise
+  })
+  const result = plugin.run('click', { tabId: 42, selector: '#save' })
+  const click = await plugin.receive('page.click')
+  await plugin.respond(click, { blockedByDialog: 'dialog-1' })
+
+  const inspect = await plugin.receive('page.dialogInspect')
+  assert.deepEqual(inspect.params, { tabId: 42, dialogId: 'dialog-1' })
+  await plugin.respond(inspect, {
+    status: 'open',
+    dialog: { id: 'dialog-1', type: 'confirm', origin: 'https://example.com', message: 'Save [draft](https://example.com)?' },
+  })
+  const question = await asked.promise
+  assert.equal(question.id, 'dialog-1')
+  assert.deepEqual(question.options.map(option => option.label), ['Cancel', 'Confirm'])
+  assert.ok(question.detail.includes('\\[draft\\]'))
+  answered.resolve({ answers: [{ id: question.id, selected: ['Confirm'] }] })
+
+  const reply = await plugin.receive('page.dialogRespond')
+  assert.deepEqual(reply.params, { tabId: 42, dialogId: 'dialog-1', accept: true })
+  await plugin.respond(reply, { status: 'accepted' })
+  assert.deepEqual(await result, {
+    tabId: 42, status: 'dialog_handled', resolution: 'accepted', dialogType: 'confirm', origin: 'https://example.com', interrupted: true,
+  })
+})
+
+it('takes explicit prompt text from the user and leaves ambiguous answers open', { timeout: 2_000 }, async t => {
+  let answer
+  const plugin = await mountDialogTools(t, async () => ({ answers: [answer] }))
+  for (const type of ['confirm', 'prompt']) {
+    const dialog = { id: 'dialog-' + type, type, origin: 'https://example.com', message: 'Enter or confirm the name' }
+    answer = { id: dialog.id, selected: [], custom: 'Draft A' }
+
+    const result = plugin.run('handle_dialog', { tabId: 42 })
+    const inspect = await plugin.receive('page.dialogInspect')
+    await plugin.respond(inspect, { status: 'open', dialog })
+    if (type === 'confirm') {
+      assert.equal((await result).status, 'dialog_pending')
+      continue
+    }
+
+    const reply = await plugin.receive('page.dialogRespond')
+    assert.deepEqual(reply.params, { tabId: 42, dialogId: dialog.id, accept: true, promptText: 'Draft A' })
+    await plugin.respond(reply, { status: 'closed' })
+    assert.equal((await result).status, 'dialog_closed')
+  }
+})
+
+it('unblocks a suspended Chrome command without running the rest of its sequence', { timeout: 2_000 }, async () => {
+  const source = await readFile(new URL('../extension/background.js', import.meta.url), 'utf8')
+  const worker = source.slice(0, source.indexOf('chrome.runtime.onInstalled.addListener'))
+    .replace(/^import .*\r?$/gmu, '')
+  const calls = []
+  const suspended = Promise.withResolvers()
+  let pendingHandler
+  let domainPolicy
+  const url = 'https://example.com/form?private=1'
+  const context = createContext({
+    AbortController, AbortSignal, URL, crypto, performance, setTimeout, clearTimeout,
+    DOMAIN_FILTER_KEY, domainFilterAllows,
+    chrome: {
+      storage: {
+        onChanged: { addListener() {} },
+        local: { async setAccessLevel() {}, async get() { return { [DOMAIN_FILTER_KEY]: domainPolicy } } },
+      },
+      tabs: { async get() { return { url } } },
+      debugger: {
+        async attach() {},
+        async sendCommand(target, method, params) {
+          calls.push({ method, params })
+          if (method === 'Page.enable') return {}
+          if (method === 'Page.handleJavaScriptDialog') {
+            pendingHandler = undefined
+            browserEvent(target, 'Page.javascriptDialogClosed', { userInput: 'ignored' })
+            suspended.resolve({ result: { value: params.accept } })
+            return {}
+          }
+          if (params.expression === 'confirm("Save?")') {
+            pendingHandler = target
+            browserEvent(target, 'Page.javascriptDialogOpening', { type: 'confirm', url, message: 'Save?' })
+            return suspended.promise
+          }
+          return { result: { value: { width: 800, height: 600 } } }
+        },
+      },
+    },
+  })
+  const [run, browserEvent] = runInContext(worker + '\nactiveSession = { origin: "https://dsh.example", sessionToken: "test" }\n'
+    + ';[executeBrowserOperation, onBrowserDialogEvent]', context)
+  const attempt = await run('page.sequence', {
+    tabId: 42,
+    steps: [
+      { action: 'evaluate', method: 'page.evaluate', params: { tabId: 42, expression: 'confirm("Save?")' } },
+      { action: 'evaluate', method: 'page.evaluate', params: { tabId: 42, expression: 'nextStep()' } },
+    ],
+  })
+  const first = await run('page.dialogInspect', { tabId: 42, dialogId: attempt.blockedByDialog })
+  assert.equal(first.dialog.origin, 'https://example.com')
+  assert.equal(first.dialog.message, 'Save?')
+  assert.equal(calls[0].method, 'Page.enable')
+  assert.equal((await run('page.wait', { tabId: 43, durationMs: 0 })).waitedMs, 0)
+
+  const target = pendingHandler
+  browserEvent(target, 'Page.javascriptDialogClosed', {})
+  browserEvent(target, 'Page.javascriptDialogOpening', { type: 'beforeunload', url, message: '' })
+  const newer = await run('page.dialogInspect', { tabId: 42 })
+  assert.notEqual(newer.dialog.id, first.dialog.id)
+  assert.equal((await run('page.dialogRespond', { tabId: 42, dialogId: first.dialog.id, accept: true })).status, 'closed')
+
+  domainPolicy = { mode: 'whitelist', domains: ['other.example'] }
+  await assert.rejects(run('page.dialogRespond', { tabId: 42, dialogId: newer.dialog.id, accept: true }), /domain filter/u)
+  domainPolicy = undefined
+  assert.equal((await run('page.dialogRespond', { tabId: 42, dialogId: newer.dialog.id, accept: false })).status, 'dismissed')
+
+  assert.equal((await run('page.wait', { tabId: 42, durationMs: 0 })).waitedMs, 0)
+  assert.equal(calls.filter(call => call.method === 'Page.handleJavaScriptDialog').length, 1)
+  assert.equal(calls.filter(call => call.params?.expression === 'confirm("Save?")').length, 1)
+  assert.equal(calls.some(call => call.params?.expression === 'nextStep()'), false)
 })
 
 describe('BrowserExtensionBridge pairing failure limit', () => {

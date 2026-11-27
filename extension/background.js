@@ -151,6 +151,11 @@ const cancelledCommandIds = new Set()
 const completedCommandIds = new Set()
 const tabOperationTails = new Map()
 const activeDebuggerTargets = new Map()
+const browserDialogs = new Map()
+const activeTabOperations = new Map()
+const JAVASCRIPT_DIALOG_TYPES = new Set(['alert', 'confirm', 'prompt', 'beforeunload'])
+const MAX_DIALOG_MESSAGE_CHARS = 1_000
+const MAX_DIALOG_PROMPT_CHARS = 1_000
 const debuggerTargetsNeedingFreshCoordinates = new WeakSet()
 const dragTraceByTab = new Map()
 
@@ -1055,9 +1060,11 @@ async function pollWorker(session, signal) {
         // Dispatch without blocking this worker: take an execution slot, run the
         // command, then release the slot. The worker polls again immediately.
         void (async () => {
-          await acquireCommandSlot()
-          if (cancelledCommandIds.delete(command.id)) {
-            releaseCommandSlot()
+          // Dialog control must reach Chrome even when every normal slot is occupied.
+          const usesSlot = !isBrowserDialogCommand(command?.method)
+          if (usesSlot) await acquireCommandSlot()
+          if (cancelledCommandIds.delete(command.id) || signal.aborted) {
+            if (usesSlot) releaseCommandSlot()
             return
           }
           const commandController = new AbortController()
@@ -1074,7 +1081,7 @@ async function pollWorker(session, signal) {
             cancelledCommandIds.delete(command.id)
             completedCommandIds.add(command.id)
             if (completedCommandIds.size > 512) completedCommandIds.delete(completedCommandIds.values().next().value)
-            releaseCommandSlot()
+            if (usesSlot) releaseCommandSlot()
           }
         })()
       }
@@ -1561,10 +1568,14 @@ function requireClipboardText(value) {
 
 /** Shared real-pointer click dispatch used by ordinary and saved-point clicks. */
 async function dispatchClickAt(target, tabId, x, y) {
+  const signal = activeTabOperations.get(tabId)?.signal
+  signal?.throwIfAborted()
   await visualCursorMove(tabId, x, y, true)
+  signal?.throwIfAborted()
   await debuggerCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
   })
+  signal?.throwIfAborted()
   await debuggerCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mousePressed', x, y, button: 'left', clickCount: 1,
   })
@@ -1577,7 +1588,7 @@ const FORM_REVIEW_TTL_MS = 120_000
 const formReviews = new Map()
 
 // Restoring a pairing from Chrome storage creates a new object for the same session.
-function sameFormReviewPairing(left, right) {
+function sameBrowserPairing(left, right) {
   return Boolean(left && right && left.origin === right.origin && left.sessionToken === right.sessionToken)
 }
 
@@ -1588,7 +1599,7 @@ async function runFormReview(method, params, signal, policy) {
   const now = Date.now()
   const stale = reason => ({ status: 'stale', reason: reason + ' Request a fresh review.' })
   for (const [id, review] of formReviews) {
-    if (id !== params.reviewId && (review.expires <= now || !sameFormReviewPairing(review.session, session))) formReviews.delete(id)
+    if (id !== params.reviewId && (review.expires <= now || !sameBrowserPairing(review.session, session))) formReviews.delete(id)
   }
   if (!session) return stale('The browser pairing is no longer active.')
   if (prepare && formReviews.size >= 32) throw new Error('Too many pending form reviews')
@@ -1597,7 +1608,7 @@ async function runFormReview(method, params, signal, policy) {
   if (!prepare) {
     if (!review || review.tabId !== tabId) return stale('The extension no longer holds this pending review.')
     formReviews.delete(reviewId)
-    if (!sameFormReviewPairing(review.session, session)) return stale('The browser pairing changed.')
+    if (!sameBrowserPairing(review.session, session)) return stale('The browser pairing changed.')
     if (review.expires <= now) return stale('The review expired before the click.')
   }
 
@@ -1614,9 +1625,10 @@ async function runFormReview(method, params, signal, policy) {
     if (tab.url !== review.url) return stale('The tab URL changed.')
     if (!frame?.documentId) return stale('Chrome could no longer identify the reviewed document.')
     if (frame.documentId !== review.documentId) return stale('The reviewed document was replaced.')
+    await enableTabDialogEvents(tabId, signal)
   }
   signal?.throwIfAborted()
-  if (!sameFormReviewPairing(activeSession, session)) return stale('The browser pairing changed.')
+  if (!sameBrowserPairing(activeSession, session)) return stale('The browser pairing changed.')
   const expires = prepare ? now + FORM_REVIEW_TTL_MS : review.expires
   const [injection] = await chrome.scripting.executeScript({
     target: prepare ? { tabId, frameIds: [0] } : { tabId, documentIds: [review.documentId] },
@@ -1629,7 +1641,7 @@ async function runFormReview(method, params, signal, policy) {
     if (injection.result?.status === 'dispatched') return injection.result
     return stale(injection.result?.reason ?? 'The reviewed document could no longer be checked.')
   }
-  if (!sameFormReviewPairing(activeSession, session) || !injection?.documentId || !injection.result?.fields) {
+  if (!sameBrowserPairing(activeSession, session) || !injection?.documentId || !injection.result?.fields) {
     throw new Error('Could not stage the top-level form')
   }
   formReviews.set(reviewId, { tabId, documentId: injection.documentId, url: tab.url, session, expires })
@@ -1725,24 +1737,114 @@ function formReviewPayload(prepare, id, expires, expectedUrl, buttonSelector, se
   }
 }
 
+function isBrowserDialogCommand(method) {
+  return method === 'page.dialogInspect' || method === 'page.dialogRespond'
+}
+
+function onBrowserDialogEvent(source, method, params) {
+  const tabId = source.tabId
+  const target = activeDebuggerTargets.get(tabId)
+  if (target === undefined || source.sessionId !== undefined) return
+  if (method === 'Page.javascriptDialogClosed') {
+    browserDialogs.delete(tabId)
+    return
+  }
+  if (method !== 'Page.javascriptDialogOpening' || activeSession === undefined
+    || !JAVASCRIPT_DIALOG_TYPES.has(params?.type)) return
+
+  let origin = ''
+  try {
+    const url = new URL(params.url)
+    if (url.origin !== 'null') origin = url.origin
+  } catch {}
+  const message = typeof params.message === 'string' ? params.message : ''
+  const info = {
+    id: crypto.randomUUID(),
+    type: params.type,
+    origin,
+    message: message.slice(0, MAX_DIALOG_MESSAGE_CHARS),
+    ...(message.length > MAX_DIALOG_MESSAGE_CHARS ? { messageTruncated: true } : {}),
+  }
+  browserDialogs.set(tabId, { info, target, session: activeSession, responding: false })
+  activeTabOperations.get(tabId)?.onDialog(info.id)
+}
+
+async function runBrowserDialogCommand(method, params, signal) {
+  const tabId = requireTabId(params.tabId)
+  const dialog = browserDialogs.get(tabId)
+  const respond = method === 'page.dialogRespond'
+  const closed = { tabId, status: 'closed' }
+  const isCurrent = () => dialog !== undefined && browserDialogs.get(tabId) === dialog
+    && activeDebuggerTargets.get(tabId) === dialog.target && sameBrowserPairing(dialog.session, activeSession)
+
+  if (!isCurrent() || ((respond || params.dialogId !== undefined) && dialog.info.id !== params.dialogId)) return closed
+  const tab = await chrome.tabs.get(tabId).catch(() => undefined)
+  const policy = await getDomainFilter()
+  signal?.throwIfAborted()
+  if (!tab || !isCurrent()) return closed
+  requireTabDomainAccess(policy, tab)
+
+  if (dialog.responding) return { tabId, status: 'response_started' }
+  if (!respond) return { tabId, status: 'open', dialog: dialog.info }
+
+  const { accept, promptText } = params
+  if (typeof accept !== 'boolean' || (dialog.info.type === 'alert' && !accept)) {
+    throw new Error('Invalid action for this browser dialog')
+  }
+  const needsText = dialog.info.type === 'prompt' && accept
+  if (needsText ? typeof promptText !== 'string' || promptText.length > MAX_DIALOG_PROMPT_CHARS : promptText !== undefined) {
+    throw new Error('Invalid text for this browser dialog')
+  }
+  dialog.responding = true
+  await debuggerCommand(dialog.target, 'Page.handleJavaScriptDialog', { accept, ...(needsText ? { promptText } : {}) })
+  if (browserDialogs.get(tabId) === dialog) browserDialogs.delete(tabId)
+  return { tabId, status: accept ? 'accepted' : 'dismissed' }
+}
+
 function executeBrowserOperation(method, params, signal) {
+  if (isBrowserDialogCommand(method)) return runBrowserDialogCommand(method, params, signal)
   const tabId = Number.isSafeInteger(params?.tabId) ? params.tabId : undefined
   if (tabId === undefined) return executeBrowserOperationNow(method, params, signal)
+
+  const pending = browserDialogs.get(tabId)
+  if (pending) return Promise.resolve({ blockedByDialog: pending.info.id })
+
+  let reportDialog
+  const interrupted = new Promise(resolve => { reportDialog = resolve })
   const previous = tabOperationTails.get(tabId) ?? Promise.resolve()
-  const current = previous.then(() => {
+  const current = previous.then(async () => {
     signal?.throwIfAborted()
-    return executeBrowserOperationNow(method, params, signal)
+    const pending = browserDialogs.get(tabId)
+    if (pending) return { blockedByDialog: pending.info.id }
+
+    const controller = new AbortController()
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+    activeTabOperations.set(tabId, {
+      signal: operationSignal,
+      onDialog(id) {
+        reportDialog({ blockedByDialog: id })
+        controller.abort(new Error('A browser dialog interrupted this action'))
+      },
+    })
+    try {
+      return await executeBrowserOperationNow(method, params, operationSignal)
+    } finally {
+      activeTabOperations.delete(tabId)
+    }
   })
+  // Let DSH ask the user while Chrome finishes the call that opened the dialog.
+  // Keep ordinary same-tab operations serialized until that call settles.
   const tail = current.then(() => {}, () => {})
   tabOperationTails.set(tabId, tail)
   void tail.then(() => {
     if (tabOperationTails.get(tabId) === tail) tabOperationTails.delete(tabId)
   })
-  return current
+  return Promise.race([current, interrupted])
 }
 
 async function executeBrowserOperationNow(method, params, signal) {
   const policy = await getDomainFilter()
+  signal?.throwIfAborted()
   if (policy.mode === 'off' || !Number.isSafeInteger(params.tabId)) {
     return dispatchBrowserOperation(method, params, signal, policy)
   }
@@ -1892,6 +1994,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
     }
     case 'tabs.close': {
       const tabId = requireTabId(params.tabId)
+      await enableTabDialogEvents(tabId, signal)
       await chrome.tabs.remove(tabId)
       return { tabId, closed: true }
     }
@@ -2144,6 +2247,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       const tabId = requireTabId(params.tabId)
       const url = httpUrl(params.url)
       requireDomainAccess(policy, url)
+      await enableTabDialogEvents(tabId, signal)
       const tab = await navigateTabAndWait(tabId, url, signal)
       requireTabDomainAccess(policy, tab)
       return { tabId, url: tab.url ?? url, title: tab.title ?? '', loaded: true }
@@ -2153,6 +2257,7 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
     case 'page.reload': {
       const tabId = requireTabId(params.tabId)
       const action = method === 'page.back' ? 'back' : method === 'page.forward' ? 'forward' : 'reload'
+      await enableTabDialogEvents(tabId, signal)
       const { tab, navigationObserved, navigationMethod } = await historyTabAndWait(tabId, action, signal, policy)
       requireTabDomainAccess(policy, tab)
       return {
@@ -3161,9 +3266,10 @@ function historyTabAndWait(tabId, action, signal, policy) {
       return
     }
     Promise.resolve(operation).catch(async error => {
+      signal?.throwIfAborted()
       if (action === 'reload' || guardedHistory) throw error
       try {
-        const historyResult = await navigateHistoryViaDebugger(tabId, action)
+        const historyResult = await navigateHistoryViaDebugger(tabId, action, policy, signal)
         navigationObserved = true
         navigationMethod = 'cdp-history'
         return historyResult
@@ -3208,8 +3314,21 @@ async function navigateHistoryViaDebugger(tabId, action, policy = { mode: 'off' 
   })
 }
 
+async function enableTabDialogEvents(tabId, signal) {
+  if (!activeDebuggerTargets.has(tabId)) {
+    const tab = await chrome.tabs.get(tabId)
+    signal?.throwIfAborted()
+    // Keep Chrome's ordinary navigation and form behavior available on tabs
+    // where Chrome refuses a debugger attachment.
+    if (/^https?:\/\//u.test(tab.url ?? '')) await withDebugger(tabId, () => {}).catch(() => {})
+  }
+  signal?.throwIfAborted()
+}
+
 async function withDebugger(tabIdValue, operation) {
   const tabId = requireTabId(tabIdValue)
+  const signal = activeTabOperations.get(tabId)?.signal
+  signal?.throwIfAborted()
   const traceId = dragTraceByTab.get(tabId)
   const existing = activeDebuggerTargets.get(tabId)
   if (existing !== undefined) {
@@ -3224,18 +3343,24 @@ async function withDebugger(tabIdValue, operation) {
   if (traceId !== undefined) logDragTrace(traceId, 'debugger-attach-finished', { elapsedMs: Math.round(performance.now() - attachStartedAt) })
   activeDebuggerTargets.set(tabId, target)
   try {
+    await debuggerCommand(target, 'Page.enable')
     await waitForStableViewport(target)
   } catch (error) {
-    if (activeDebuggerTargets.get(tabId) === target) activeDebuggerTargets.delete(tabId)
+    if (activeDebuggerTargets.get(tabId) === target) {
+      activeDebuggerTargets.delete(tabId)
+      browserDialogs.delete(tabId)
+    }
     await chrome.debugger.detach(target).catch(() => {})
     throw error
   }
+  signal?.throwIfAborted()
   return operation(target)
 }
 
 async function detachAllDebuggerTargets() {
   const targets = [...activeDebuggerTargets.values()]
   activeDebuggerTargets.clear()
+  browserDialogs.clear()
   await Promise.all(targets.map(target => chrome.debugger.detach(target).catch(() => {})))
 }
 
@@ -7515,9 +7640,17 @@ chrome.tabs.onRemoved.addListener(tabId => {
   void chrome.storage.session.remove([noteDraftKey(tabId), noteViewKey(tabId)]).catch(() => {})
   overlayTabs.delete(tabId)
   activeDebuggerTargets.delete(tabId)
+  browserDialogs.delete(tabId)
 })
+chrome.debugger.onEvent.addListener(onBrowserDialogEvent)
 chrome.debugger.onDetach.addListener(source => {
-  if (Number.isInteger(source.tabId)) activeDebuggerTargets.delete(source.tabId)
+  if (Number.isInteger(source.tabId)) {
+    activeDebuggerTargets.delete(source.tabId)
+    browserDialogs.delete(source.tabId)
+  }
+})
+chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, documentLifecycle }) => {
+  if (frameId === 0 && (!documentLifecycle || documentLifecycle === 'active')) browserDialogs.delete(tabId)
 })
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading' || changeInfo.url !== undefined) overlayTabs.delete(tabId)
