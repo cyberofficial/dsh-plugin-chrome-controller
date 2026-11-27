@@ -128,6 +128,8 @@ const MAX_NETWORK_COOKIES = 500
 const MAX_CONSOLE_ENTRIES = 200
 const MAX_EXTRACT_ITEMS = 100
 const MAX_EXTRACT_CHARS = 50_000
+const PAGINATION_PAGE_WAIT_MS = 5_000
+const PAGINATION_LIMITS = Object.freeze({ maxRows: 1_000, maxColumns: 30, maxPageChars: 100_000, maxResultChars: 50_000 })
 // Base64 inflates by 4/3, so 10 MB stays below the DSH bridge's 20 MB body limit.
 const MAX_FETCH_FILE_BYTES = 10 * 1024 * 1024
 // A credentialed service-worker retry must be approved by the user in DSH
@@ -2097,6 +2099,8 @@ async function dispatchBrowserOperation(method, params, signal, policy) {
       return captureConsole(params, signal)
     case 'page.extract':
       return extractPage(params)
+    case 'page.extractPaginatedTable':
+      return extractPaginatedTable(params, signal, policy)
     case 'page.focus':
     case 'page.blur': {
       const tabId = requireTabId(params.tabId)
@@ -7421,6 +7425,251 @@ function formatConsoleArgument(argument) {
   if (value === null || ['number', 'boolean'].includes(typeof value)) return value
   if (typeof argument?.unserializableValue === 'string') return argument.unserializableValue.slice(0, 1_000)
   return String(argument?.description ?? argument?.type ?? 'unknown').slice(0, 1_000)
+}
+
+/** Reads one bounded, rectangular table and its explicitly selected pagination control. */
+function readPaginationPage(tableSelector, nextSelector, origin, limits, activation) {
+  if (location.origin !== origin) return { state: 'origin_changed' }
+  if (document.readyState === 'loading') return { state: 'table_loading' }
+  let tables
+  let controls
+  try {
+    tables = document.querySelectorAll(tableSelector)
+    controls = document.querySelectorAll(nextSelector)
+  } catch {
+    return { state: 'invalid_selector' }
+  }
+  if (tables.length === 0) return { state: 'table_missing' }
+  if (tables.length > 1) return { state: 'table_ambiguous' }
+  const table = tables[0]
+  if (!(table instanceof HTMLTableElement)) return { state: 'unsupported_table' }
+  const visible = element => element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+  if (!visible(table) || table.closest('[aria-busy="true"]')) return { state: 'table_loading' }
+
+  const body = []
+  const headingRows = []
+  for (const row of table.rows) {
+    if (row.parentElement?.tagName === 'TFOOT' || !visible(row)) continue
+    if (row.parentElement?.tagName === 'THEAD') headingRows.push(row)
+    else body.push(row)
+    if (headingRows.length > 1) return { state: 'unsupported_table' }
+    // In a table without a thead the first body row can be the heading.
+    if (body.length > limits.maxRows + 1) return { state: 'row_limit' }
+  }
+  const firstCells = body[0]?.cells
+  const header = headingRows[0] ?? (firstCells?.length && [...firstCells].every(cell => cell.tagName === 'TH')
+    ? body.shift() : undefined)
+  if (body.length > limits.maxRows) return { state: 'row_limit' }
+  let width
+  let size = 0
+  const matrix = []
+  for (const row of header ? [header, ...body] : body) {
+    const cells = [...row.cells].filter(visible)
+    if (cells.length > limits.maxColumns || cells.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1)) {
+      return { state: 'unsupported_table' }
+    }
+    width ??= cells.length
+    if (cells.length === 0 || cells.length !== width) return { state: 'unsupported_table' }
+    const values = cells.map(cell => (cell.innerText ?? cell.textContent ?? '').trim())
+    size += JSON.stringify(values).length + 1
+    if (size > limits.maxPageChars) return { state: 'output_limit' }
+    matrix.push(values)
+  }
+
+  const control = controls[0]
+  let next = 'ready'
+  if (controls.length > 1) next = 'next_ambiguous'
+  else if (control === undefined) next = 'next_missing'
+  else if (control.matches(':disabled') || control.disabled === true
+    || control.closest('[aria-disabled="true" i]')) next = 'next_disabled'
+  else if (!visible(control) || control.closest('[inert], [aria-hidden="true"]')) next = 'next_unavailable'
+  else {
+    const link = control.closest('a[href]')
+    if (link !== null) {
+      const target = (link.getAttribute('target') ?? document.querySelector('base[target]')?.target ?? '').toLowerCase()
+      let destination
+      try { destination = new URL(link.getAttribute('href'), document.baseURI) } catch {}
+      if (link.hasAttribute('download') || !['', '_self', '_parent', '_top'].includes(target)
+        || destination?.origin !== origin || !['http:', 'https:'].includes(destination?.protocol)) {
+        next = 'next_outside_scope'
+      }
+    }
+  }
+  const headers = header ? matrix.shift() : []
+  const pushButton = (control instanceof HTMLButtonElement || control instanceof HTMLInputElement)
+    && control.type === 'button'
+  const page = {
+    state: 'ready', url: location.href, width: width ?? 0, headers, rows: matrix, next,
+    matchesNext: control === this, activation: pushButton ? 'button' : 'pointer',
+  }
+  if (activation === undefined) return page
+
+  // Recheck and activate a native button in the same document task.
+  const currentKey = JSON.stringify([page.url, page.headers, page.rows, page.next, page.activation])
+  if (!pushButton || next !== 'ready' || !page.matchesNext || currentKey !== activation.pageKey) return false
+  const hit = document.elementFromPoint(activation.x, activation.y)
+  if (!control.contains(hit)) return false
+  HTMLElement.prototype.click.call(control)
+  return true
+}
+
+function paginationPageKey(page) {
+  return JSON.stringify([page.url, page.headers, page.rows, page.next, page.activation])
+}
+
+async function waitForPaginationPage(read, previous, signal) {
+  const deadline = Date.now() + PAGINATION_PAGE_WAIT_MS
+  const waitSignal = signal ?? new AbortController().signal
+  const previousRows = previous === undefined ? undefined : JSON.stringify(previous.rows)
+  const previousHeaders = previous === undefined ? undefined : JSON.stringify(previous.headers)
+  let latest
+  let candidate
+  while (true) {
+    waitSignal.throwIfAborted()
+    try { latest = await read() } catch { latest = { state: 'table_unavailable' } }
+    waitSignal.throwIfAborted()
+    if (['origin_changed', 'invalid_selector', 'row_limit', 'output_limit'].includes(latest.state)) return latest
+    if (latest.state === 'ready' && latest.rows.length > 0
+      && (JSON.stringify(latest.rows) !== previousRows || JSON.stringify(latest.headers) !== previousHeaders)) {
+      const key = paginationPageKey(latest)
+      if (candidate === key) return latest
+      candidate = key
+    } else {
+      candidate = undefined
+    }
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
+    await delay(Math.min(remaining, DEFAULT_ELEMENT_WAIT_POLL_INTERVAL_MS), waitSignal)
+  }
+  if (latest.state !== 'ready') return latest
+  if (latest.rows.length === 0) return previous === undefined ? latest : { state: 'no_row_change' }
+  if (JSON.stringify(latest.rows) === previousRows) {
+    return { state: latest.url === previous.url ? 'no_row_change' : 'repeated_page' }
+  }
+  return { state: 'table_unstable' }
+}
+
+function paginationCsv(headers, rows) {
+  const csvCell = value => {
+    // Keep simple signed amounts numeric and protect formula-like text on import.
+    const formulaLike = /^[=+@-]/u.test(value.normalize('NFKC')) && !/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/u.test(value)
+    const cell = formulaLike ? "'" + value : value
+    return /[",\r\n]/u.test(cell) ? '"' + cell.replaceAll('"', '""') + '"' : cell
+  }
+  return (headers.length > 0 ? [headers, ...rows] : rows)
+    .map(row => row.map(csvCell).join(',')).join('\r\n')
+}
+
+async function extractPaginatedTable({ tabId, tableSelector, nextSelector, maxPages = 5, columns, format = 'json' }, signal, policy) {
+  requireTabId(tabId)
+  requireCssSelector(tableSelector, 'The table selector')
+  requireCssSelector(nextSelector, 'The Next selector')
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 20) throw new Error('maxPages must be between 1 and 20')
+  if (!['json', 'csv'].includes(format)) throw new Error('format must be json or csv')
+  if (columns !== undefined && (!Array.isArray(columns) || columns.length < 1 || columns.length > PAGINATION_LIMITS.maxColumns
+    || columns.some(name => typeof name !== 'string' || name.trim() === '' || name.length > 1_000))) {
+    throw new Error('columns must contain 1 to 30 non-empty heading strings')
+  }
+  const requestedColumns = columns?.map(name => name.trim())
+  if (requestedColumns && new Set(requestedColumns).size !== requestedColumns.length) throw new Error('Column headings must be unique')
+
+  const tab = await chrome.tabs.get(tabId)
+  requireTabDomainAccess(policy, tab)
+  const origin = new URL(httpUrl(tab.url)).origin
+  const args = [tableSelector, nextSelector, origin, PAGINATION_LIMITS]
+  const declaration = readPaginationPage.toString()
+  const expression = '(' + declaration + ')(' + args.map(value => JSON.stringify(value)).join(',') + ')'
+
+  return withDebugger(tabId, async target => {
+    const read = async () => {
+      const response = await debuggerCommand(target, 'Runtime.evaluate', { expression, returnByValue: true })
+      const value = response.result?.value
+      if (response.exceptionDetails !== undefined || !isRecord(value)) throw new Error('The table could not be read')
+      return value
+    }
+
+    const seen = new Set()
+    let rows = []
+    let headers = []
+    let structure
+    let indices
+    const data = (heading, entries) => format === 'csv' ? { csv: paginationCsv(heading, entries) } : { rows: entries }
+    const finish = stopReason => ({
+      tabId, format, pagesRead: seen.size, rowCount: rows.length, headers,
+      stopReason, reachedEnd: stopReason === 'next_disabled', ...data(headers, rows),
+    })
+
+    let page = await waitForPaginationPage(read, undefined, signal)
+    while (page.state === 'ready') {
+      if (page.rows.length === 0) return finish('no_rows')
+      const shape = JSON.stringify([page.width, page.headers])
+      if (structure === undefined) {
+        structure = shape
+        indices = requestedColumns?.map(name => {
+          const first = page.headers.indexOf(name)
+          if (first === -1 || first !== page.headers.lastIndexOf(name)) {
+            throw new Error('Requested column heading is missing or ambiguous: ' + name)
+          }
+          return first
+        })
+      } else if (shape !== structure) return finish('table_structure_changed')
+
+      const rowKey = JSON.stringify(page.rows)
+      if (seen.has(rowKey)) return finish('repeated_page')
+      if (rows.length + page.rows.length > PAGINATION_LIMITS.maxRows) return finish('row_limit')
+      const nextHeaders = requestedColumns ?? page.headers
+      const nextRows = rows.concat(indices ? page.rows.map(row => indices.map(index => row[index])) : page.rows)
+      if (JSON.stringify({ headers: nextHeaders, ...data(nextHeaders, nextRows) }).length > PAGINATION_LIMITS.maxResultChars) {
+        return finish('output_limit')
+      }
+      headers = nextHeaders
+      rows = nextRows
+      seen.add(rowKey)
+
+      if (page.next !== 'ready') return finish(page.next)
+      if (seen.size >= maxPages) return finish('page_limit')
+
+      const pageKey = paginationPageKey(page)
+      const useButton = page.activation === 'button'
+      let attempted = false
+      const tabReady = async () => {
+        const currentTab = await chrome.tabs.get(tabId)
+        requireTabDomainAccess(await getDomainFilter(), currentTab)
+        signal?.throwIfAborted()
+        return !currentTab.pendingUrl
+      }
+      try {
+        const live = await read()
+        signal?.throwIfAborted()
+        if (live.state === 'origin_changed') return finish('origin_changed')
+        if (live.state !== 'ready' || paginationPageKey(live) !== pageKey) return finish('next_changed')
+        const nodeId = await querySelectorNode(target, nextSelector)
+        const { x, y } = await resolveNodeClickPoint(target, nodeId)
+        if (useButton) {
+          if (!await tabReady()) return finish('next_changed')
+          attempted = true
+          const activated = await callNodeFunction(target, nodeId, declaration, [...args, { pageKey, x, y }])
+          if (activated !== true) return finish('next_changed')
+        } else {
+          await dispatchClickAt(target, tabId, x, y, async () => {
+            if (!await tabReady()) return false
+            const fresh = await callNodeFunction(target, nodeId, declaration, args)
+            if (fresh?.state !== 'ready' || fresh.matchesNext !== true || paginationPageKey(fresh) !== pageKey) return false
+            if (await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y]) !== true) return false
+            attempted = true
+            return true
+          })
+        }
+      } catch {
+        signal?.throwIfAborted()
+        return finish(attempted ? 'next_click_unverified' : 'next_unavailable')
+      }
+      if (!attempted) return finish('next_changed')
+      page = await waitForPaginationPage(read, page, signal)
+      if (!useButton && page.state === 'no_row_change') return finish('next_click_unverified')
+    }
+    return finish(page.state)
+  })
 }
 
 function extractPage(params) {

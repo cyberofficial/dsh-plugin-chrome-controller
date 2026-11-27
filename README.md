@@ -16,6 +16,7 @@ Put your DeepSeek Harness agent to work in the Chrome window you already use. Wa
 | Workflow | What it looks like |
 | --- | --- |
 | **Forms and review** | Fill drafts and choose options in searchable dropdowns across tabs. Stage up to four Save or Submit clicks for review in DSH Web. Choose **Approve once**, **Skip**, or **Needs changes** for each tab. |
+| **Paginated tables** | Follow a table's Next control and collect the rows as JSON or CSV. Choose the columns you need and check why the tool stopped. |
 | **Browser dialogs** | When a JavaScript confirmation or prompt interrupts a tab, review the dialog in DSH Web and choose how Chrome should respond. |
 | **Workbooks** | Check the active sheet and select cells or ranges in Excel Online and Google Sheets. In Excel Online, read ranges when the editor exposes a compatible API, or watch the formula bar with cell addresses. |
 | **Notes and click targets** | Attach instructions to an element with **Note Mode**, or mark a place for the agent to click with **Points of Interest**. Browse saved notes and points for the current site or across all sites. |

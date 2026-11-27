@@ -72,6 +72,22 @@ Example for `dsh_browser_evaluate` to verify a current input value by reading th
 {"tabId":42,"expression":"document.querySelector('#request-title')?.value ?? null","timeoutMs":5000}
 ```
 
+### Extract a paginated table
+
+Use `dsh_browser_extract_paginated_table` for a specific HTML table with a known **Next** control. Start on the page you want to read first. Pass a unique `tableSelector` and `nextSelector` in the main document. Check the real control before starting so the tool advances the intended table.
+
+The tool reads the current page, activates the verified Next control, and waits for the rows to settle on each page. It handles in-page updates and same-origin navigation. The first version supports rectangular HTML tables with one heading row or no headings. It reads rendered rows and cells, omits table footers, and leaves the tab at the last page visited.
+
+- Set `maxPages` to 1 through 20, including the initial page. The default is 5. The result keeps complete pages within 1,000 rows and a 50,000-character data limit.
+- Use `format: "json"` for `rows` or `format: "csv"` for CSV text. The result includes `headers`, `pagesRead`, and `rowCount`. Use optional `columns` for the exact headings to return, in the order you want. CSV includes the headings once and prefixes formula-like text with an apostrophe.
+- Check `stopReason` and `reachedEnd`. Only `next_disabled` confirms the end of the traversal. Other reasons include `page_limit`, `repeated_page`, `no_row_change`, and `table_structure_changed`. If a pointer click produces no confirmed page change, the tool reports `next_click_unverified`. Inspect the current page before retrying. Report the pages collected and the reason when the tool stops early.
+
+Example for `dsh_browser_extract_paginated_table` to read up to five invoice pages.
+
+```json
+{"tabId":42,"tableSelector":"#invoices","nextSelector":"#next-page","maxPages":5,"columns":["Invoice","Date","Total"],"format":"csv"}
+```
+
 ### Work inside an iframe
 
 1. Call `dsh_browser_frames` with `tabId` to list script-accessible frames. Match the result by `url`, `origin`, `title`, and `isMainFrame`. The main frame ID is `0`. Nested and cross-origin frames can be listed when the extension has access. Re-list after navigation, reload, or frame replacement. A frame ID can be reused for a different document.

@@ -600,6 +600,198 @@ it('keeps the native select result shape and value', async () => {
   assert.deepEqual(dropdown.clicks, [])
 })
 
+it('passes paginated extraction arguments through the browser tool registry', { timeout: 2_000 }, async t => {
+  const plugin = await mountBrowserTools(t)
+  const input = { tabId: 42, tableSelector: '#invoices', nextSelector: '#next', columns: ['Total', 'Invoice'], format: 'csv' }
+  const pending = plugin.run('extract_paginated_table', input)
+  const command = await plugin.receive('page.extractPaginatedTable')
+  assert.deepEqual(command.params, { ...input, maxPages: 5 })
+  const result = { pagesRead: 1, headers: input.columns, csv: 'Total,Invoice\r\n8.00,INV-1', stopReason: 'next_disabled' }
+  await plugin.respond(command, result)
+  assert.deepEqual(await pending, result)
+  await assert.rejects(plugin.run('extract_paginated_table', { ...input, maxPages: 21 }), /between 1 and 20/u)
+})
+
+/** Runs the browser worker against a table that can change after a Next click. */
+async function paginationFixture(pages, { links = false, stall = false, replaceNext = false, offsite = false, pointer = false, dropPointer = false } = {}) {
+  const origin = 'https://reports.example'
+  let pageIndex = 0
+  let clickCount = 0
+  let now = 0
+  let readyAt = 0
+  const currentUrl = () => origin + '/invoices' + (links ? '?page=' + (pageIndex + 1) : '')
+  const anchor = {
+    getAttribute(name) {
+      return name === 'href' ? (offsite ? 'https://other.example/invoices' : '?page=' + (pageIndex + 2)) : null
+    },
+    hasAttribute() { return false },
+  }
+  const recordClick = () => {
+    clickCount += 1
+    if (!stall) {
+      pageIndex += 1
+      readyAt = now + 450
+    }
+  }
+  class Element {
+    click() {
+      assert.equal(this, next)
+      recordClick()
+    }
+  }
+  class Button extends Element {}
+  const next = {
+    type: 'button',
+    get disabled() { return pageIndex === pages.length - 1 },
+    matches(query) { return query === ':disabled' && this.disabled },
+    getAttribute() { return null },
+    closest(query) { return links && query === 'a[href]' ? anchor : null },
+    checkVisibility() { return true },
+    scrollIntoView() {},
+    getBoundingClientRect() { return { left: 18, right: 22, top: 8, bottom: 12, width: 4, height: 4 } },
+    getRootNode() { return document },
+    contains(node) { return node === this },
+  }
+  if (!links && !pointer) Object.setPrototypeOf(next, Button.prototype)
+  let visibleNext = next
+  class Table {
+    checkVisibility() { return true }
+    closest(query) { return query === '[aria-busy="true"]' && now < readyAt ? this : null }
+    get rows() {
+      const row = (values, parent, tagName) => ({
+        parentElement: { tagName: parent }, checkVisibility: () => true,
+        cells: values.map(innerText => ({ innerText, tagName, checkVisibility: () => true, colSpan: 1, rowSpan: 1 })),
+      })
+      const page = pages[pageIndex]
+      return [
+        row(page.headers ?? ['Invoice', 'Total'], 'THEAD', 'TH'),
+        ...page.rows.map(values => row(values, 'TBODY', 'TD')),
+        row(['Footer', '9999'], 'TFOOT', 'TD'),
+      ]
+    }
+  }
+  const table = new Table()
+  const document = {
+    readyState: 'complete',
+    get baseURI() { return currentUrl() },
+    querySelector() { return null },
+    querySelectorAll(selector) {
+      if (selector === '#invoices') return [table]
+      if (selector === '#next') return [visibleNext]
+      return []
+    },
+    elementFromPoint() { return visibleNext },
+  }
+  const context = createContext({
+    AbortController, AbortSignal, URL, performance, clearTimeout, document,
+    Date: class extends Date { static now() { return now } },
+    setTimeout(callback, ms) { return setTimeout(() => { now += ms; callback() }, 0) },
+    location: { origin, get href() { return currentUrl() } },
+    window: { innerWidth: 800, innerHeight: 600 },
+    HTMLTableElement: Table, HTMLElement: Element, HTMLButtonElement: Button, HTMLInputElement: class {}, ShadowRoot: class {},
+    getComputedStyle: () => ({ pointerEvents: 'auto' }),
+    DOMAIN_FILTER_KEY, domainFilterAllows,
+    chrome: {
+      storage: { onChanged: { addListener() {} }, local: { async setAccessLevel() {}, async get() { return {} } } },
+      tabs: { async get() { return { url: currentUrl() } } },
+      debugger: {
+        async sendCommand(_target, method, params) {
+          switch (method) {
+            case 'Runtime.evaluate': return { result: { value: runInContext(params.expression, context) } }
+            case 'Runtime.callFunctionOn': {
+              const fn = runInContext('(' + params.functionDeclaration + ')', context)
+              if (replaceNext && params.arguments.some(arg => typeof arg.value?.pageKey === 'string')) visibleNext = { ...next }
+              return { result: { value: fn.apply(next, params.arguments.map(arg => arg.value)) } }
+            }
+            case 'DOM.getDocument': return { root: { nodeId: 1 } }
+            case 'DOM.querySelectorAll': return { nodeIds: [2] }
+            case 'DOM.resolveNode': return { object: { objectId: 'next' } }
+            case 'DOM.getBoxModel': return { model: { content: [18, 8, 22, 8, 22, 12, 18, 12] } }
+            case 'Input.dispatchMouseEvent':
+              if (replaceNext && params.type === 'mouseMoved') visibleNext = { ...next }
+              if (params.type === 'mouseReleased' && !dropPointer) recordClick()
+              return {}
+            default: throw new Error('Unexpected debugger command ' + method)
+          }
+        },
+      },
+    },
+  })
+  const worker = await browserWorkerSource()
+  const run = runInContext(worker + '\nactiveDebuggerTargets.set(42, { tabId: 42 })\n;executeBrowserOperation', context)
+  return {
+    async collect(args = {}) {
+      const output = await run('page.extractPaginatedTable', {
+        tabId: 42, tableSelector: '#invoices', nextSelector: '#next', ...args,
+      })
+      return JSON.parse(JSON.stringify(output))
+    },
+    get clicks() { return clickCount },
+  }
+}
+
+it('collects settled pages in the selected column order and honors the page limit', async () => {
+  const fixture = await paginationFixture([
+    { rows: [['INV-1', '8.00']] },
+    { rows: [['INV-2', '8.00']] },
+    { rows: [['INV-3', '12.50']] },
+  ])
+  const result = await fixture.collect({ maxPages: 2, columns: ['Total'] })
+  assert.deepEqual(result, {
+    tabId: 42, format: 'json', pagesRead: 2, rowCount: 2, headers: ['Total'],
+    stopReason: 'page_limit', reachedEnd: false, rows: [['8.00'], ['8.00']],
+  })
+  assert.equal(fixture.clicks, 1)
+})
+
+it('follows same-origin Next links and emits one quoted CSV header', async () => {
+  const fixture = await paginationFixture([
+    { rows: [['Invoice "A", west', '-12.50']] },
+    { rows: [['@reference', '8.00']] },
+  ], { links: true })
+  const result = await fixture.collect({ format: 'csv' })
+  assert.equal(result.stopReason, 'next_disabled')
+  assert.equal(result.reachedEnd, true)
+  assert.equal(result.pagesRead, 2)
+  assert.equal(result.csv, 'Invoice,Total\r\n"Invoice ""A"", west",-12.50\r\n\'@reference,8.00')
+  assert.equal(fixture.clicks, 1)
+})
+
+it('retains collected rows on repeated pages, stalled updates, and heading changes', async () => {
+  const first = { rows: [['INV-1', '8.00']] }
+  const second = { rows: [['INV-2', '9.00']] }
+  const cases = [
+    [[first, second, first], { dropPointer: true }, 'repeated_page', 2, 2],
+    [[first, second], { stall: true, dropPointer: true }, 'no_row_change', 1, 1],
+    [[first, second], { pointer: true, dropPointer: true }, 'next_click_unverified', 1, 0],
+    [[first, { ...first, headers: ['Receipt', 'Amount'] }], {}, 'table_structure_changed', 1, 1],
+  ]
+  for (const [pages, options, reason, pageCount, clicks] of cases) {
+    const fixture = await paginationFixture(pages, options)
+    const result = await fixture.collect()
+    assert.equal(result.stopReason, reason)
+    assert.equal(result.pagesRead, pageCount)
+    assert.equal(result.rowCount, pageCount)
+    assert.equal(result.reachedEnd, false)
+    assert.equal(fixture.clicks, clicks)
+  }
+})
+
+it('avoids a changed Next control and a link outside the table origin', async () => {
+  const pages = [{ rows: [['INV-1', '8.00']] }, { rows: [['INV-2', '9.00']] }]
+  for (const [options, reason] of [
+    [{ replaceNext: true }, 'next_changed'],
+    [{ pointer: true, replaceNext: true }, 'next_changed'],
+    [{ links: true, offsite: true }, 'next_outside_scope'],
+  ]) {
+    const fixture = await paginationFixture(pages, options)
+    const result = await fixture.collect()
+    assert.equal(result.stopReason, reason)
+    assert.equal(result.pagesRead, 1)
+    assert.equal(fixture.clicks, 0)
+  }
+})
+
 describe('BrowserExtensionBridge pairing failure limit', () => {
   let bridge
   beforeEach(() => mock.timers.enable({ apis: ['Date'], now: 1_000_000 }))
